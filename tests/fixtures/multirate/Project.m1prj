@@ -1,0 +1,47 @@
+<?xml version="1.0"?>
+<!-- Synthetic m1-eval multirate fixture. No proprietary MoTeC content. -->
+<!-- Two periodic rate groups plus a startup-only function:               -->
+<!--                                                                       -->
+<!--   100 Hz group:                                                       -->
+<!--     Root.MR.Fast Writer   writes  Root.MR.Fast Shared (= Slow Out + 1)-->
+<!--     Root.MR.Fast Reader   reads   Root.MR.Fast Shared, writes Fast Out-->
+<!--       (same rate: Writer must run before Reader; Writer sorts AFTER   -->
+<!--        Reader by script name, so topo ordering must reorder it)       -->
+<!--                                                                       -->
+<!--   50 Hz group:                                                        -->
+<!--     Root.MR.Slow Writer   writes  Root.MR.Slow Out (= Seed * 2)       -->
+<!--       (Fast Writer reads Slow Out across rates: stale-tolerant, no    -->
+<!--        cross-rate edge is added)                                      -->
+<!--                                                                       -->
+<!--   Startup (no rate):                                                  -->
+<!--     Root.MR.Init          On Startup -> call_rate_hz = None, excluded -->
+<MoTeCM1BuildSession>
+ <Project Name="MultiRate" TargetHardware="ecu120">
+  <ComponentStream><List>
+   <Component Classname="BuiltIn.GroupCompound" Name="Root.MR"/>
+   <Component Classname="BuiltIn.GroupCompound" Name="Root.Events"/>
+   <Component Classname="BuiltIn.EventKernel" Name="Root.Events.On 100Hz"/>
+   <Component Classname="BuiltIn.EventKernel" Name="Root.Events.On 50Hz"/>
+   <Component Classname="BuiltIn.EventKernel" Name="Root.Events.On Startup"/>
+
+   <Component Classname="BuiltIn.Channel" Name="Root.MR.Seed"><Props Type="f32"/></Component>
+   <Component Classname="BuiltIn.Channel" Name="Root.MR.Slow Out"><Props Type="f32"/></Component>
+   <Component Classname="BuiltIn.Channel" Name="Root.MR.Fast Shared"><Props Type="f32"/></Component>
+   <Component Classname="BuiltIn.Channel" Name="Root.MR.Fast Out"><Props Type="f32"/></Component>
+   <Component Classname="BuiltIn.Channel" Name="Root.MR.Started"><Props Type="f32"/></Component>
+
+   <Component Classname="BuiltIn.FuncUser" Filename="MR.Slow Writer.m1scr" Name="Root.MR.Slow Writer">
+    <Props SelectedTrigger="Root.Events.On 50Hz"/>
+   </Component>
+   <Component Classname="BuiltIn.FuncUser" Filename="MR.Fast Writer.m1scr" Name="Root.MR.Fast Writer">
+    <Props SelectedTrigger="Root.Events.On 100Hz"/>
+   </Component>
+   <Component Classname="BuiltIn.FuncUser" Filename="MR.Fast Reader.m1scr" Name="Root.MR.Fast Reader">
+    <Props SelectedTrigger="Root.Events.On 100Hz"/>
+   </Component>
+   <Component Classname="BuiltIn.FuncUser" Filename="MR.Init.m1scr" Name="Root.MR.Init">
+    <Props SelectedTrigger="Root.Events.On Startup"/>
+   </Component>
+  </List></ComponentStream>
+ </Project>
+</MoTeCM1BuildSession>

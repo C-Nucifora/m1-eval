@@ -1,0 +1,5 @@
+// Synthetic m1-eval multirate fixture. No proprietary content.
+// 100 Hz: reads Fast Shared (written by the same-rate Fast Writer) and writes
+// Fast Out = Fast Shared * 10. Sorts BEFORE the writer by script name, so a
+// correct same-rate order must run the writer first regardless.
+Fast Out = Fast Shared * 10.0;

@@ -1,0 +1,4 @@
+// Synthetic m1-eval multirate fixture. No proprietary content.
+// 100 Hz: writes Fast Shared = Slow Out + 1. Reads the 50 Hz Slow Out across
+// rates (no cross-rate edge). Same-rate Fast Reader depends on this writer.
+Fast Shared = Slow Out + 1.0;

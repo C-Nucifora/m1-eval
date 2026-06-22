@@ -517,6 +517,47 @@ mod tests {
             .expect("mini fixture loads")
     }
 
+    fn multirate() -> Loaded {
+        let dir = Path::new(env!("CARGO_MANIFEST_DIR")).join("tests/fixtures/multirate");
+        load(&dir.join("Project.m1prj"), None).expect("multirate fixture loads")
+    }
+
+    #[test]
+    fn enumerate_scheduled_keeps_periodic_excludes_startup() {
+        // The multirate fixture has three periodic functions (one 50 Hz, two
+        // 100 Hz) plus an On-Startup function whose call_rate_hz is None. The
+        // schedule must include exactly the three rated functions and exclude
+        // the startup one.
+        let loaded = multirate();
+        let rated = enumerate_scheduled(&loaded);
+
+        let by_fn: std::collections::HashMap<String, f64> = rated
+            .iter()
+            .map(|r| (r.sched.fn_symbol.clone().unwrap(), r.rate_hz))
+            .collect();
+
+        assert_eq!(by_fn.len(), 3, "exactly three periodic functions: {by_fn:?}");
+        assert_eq!(by_fn.get("Root.MR.Slow Writer"), Some(&50.0));
+        assert_eq!(by_fn.get("Root.MR.Fast Writer"), Some(&100.0));
+        assert_eq!(by_fn.get("Root.MR.Fast Reader"), Some(&100.0));
+        // The On-Startup function (call_rate_hz = None) is excluded entirely.
+        assert!(
+            !by_fn.contains_key("Root.MR.Init"),
+            "startup function must not be scheduled: {by_fn:?}"
+        );
+    }
+
+    #[test]
+    fn enumerate_scheduled_is_rate_sorted_fastest_first() {
+        // The deterministic baseline ordering is fastest-rate-first (the
+        // dependency layer refines within a rate). So both 100 Hz functions
+        // precede the 50 Hz one.
+        let loaded = multirate();
+        let rated = enumerate_scheduled(&loaded);
+        let rates: Vec<f64> = rated.iter().map(|r| r.rate_hz).collect();
+        assert_eq!(rates, vec![100.0, 100.0, 50.0], "fastest-first baseline");
+    }
+
     #[test]
     fn tick_count_spans_half_open_interval() {
         assert_eq!(tick_count(1.0, 100.0), 100);
