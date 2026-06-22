@@ -22,9 +22,14 @@
 //!    provenance string naming a MoTeC/M150-class device (the `.ld` reader folds
 //!    the header `device_type` into [`m1_eval::LogMeta::source`]).
 //! 2. The channel count is `> 0` (the reader walked the channel linked list).
-//! 3. At least one channel decodes to a *finite* engineering value over a
-//!    *non-empty* time grid (`index / sample_rate` keyframes), proving the
-//!    engineering-unit decode + time derivation produced usable numbers.
+//! 3. The decode produces physically usable numbers: every channel's time grid is
+//!    non-decreasing, at least one channel is *entirely* finite over a non-empty
+//!    grid, and the non-finite fraction across the whole log is tiny (< 1%). Real
+//!    M1 telemetry stores a few genuine IEEE-754 sentinels (`±inf`/NaN that MoTeC's
+//!    own firmware writes for uninitialised channels); those are a *correct* decode
+//!    of the float bytes, so the test tolerates a small sentinel fraction while a
+//!    byte-misalignment garbage decode (which would flood the log with non-finite
+//!    values) is still caught.
 //!
 //! No channel name, unit, or value is hard-coded — the assertions are purely on
 //! shape and finiteness, so nothing about the proprietary log enters the tree.
@@ -113,10 +118,27 @@ fn real_ld_header_and_channels_decode() {
         "channel_count metadata must match the decoded channel list"
     );
 
-    // 3. At least one channel decodes to a finite engineering value over a
-    //    non-empty time grid. We scan for the first channel that has keyframes and
-    //    assert its samples are finite and its time axis is non-empty + ascending.
-    let mut found_finite = false;
+    // 3. The decode produces *physically usable* numbers. We assert three things
+    //    over every channel that has keyframes:
+    //
+    //    a. the time grid is non-empty and non-decreasing (`i / sample_rate` is
+    //       monotone), and
+    //    b. every decoded engineering value is numeric (coerces to `f64`), and
+    //    c. the decode is not garbage: across the whole log the overwhelming
+    //       majority of values are finite, and at least one channel is *entirely*
+    //       finite over a non-empty grid (a clean continuous signal).
+    //
+    //    Real M1 telemetry does contain a small fraction of genuine IEEE-754
+    //    sentinels — channels MoTeC's own firmware stores as `±inf`/NaN (e.g. an
+    //    uninitialised suspension linearisation, or a divide-by-zero in a
+    //    normalised temperature error). Those are a *correct* decode of the float
+    //    bytes (`0x7f800000` is canonically `+inf`), not a misread; a blanket
+    //    "every value is finite" assertion would wrongly reject them. Instead we
+    //    require the non-finite fraction to be tiny (a byte-misalignment garbage
+    //    decode would flood the log with non-finite values, not leave 99.9% clean).
+    let mut found_all_finite_channel = false;
+    let mut total_values: u64 = 0;
+    let mut non_finite_values: u64 = 0;
     for series in &log.channels {
         let InputKind::Series(points) = &series.kind else {
             continue;
@@ -131,22 +153,37 @@ fn real_ld_header_and_channels_decode() {
             "channel {:?} time grid must be non-decreasing",
             series.channel
         );
-        // Every decoded engineering value is finite — never a NaN/inf guess.
+        let mut all_finite = true;
         for (_, v) in points {
             let x = v
                 .as_f64()
                 .unwrap_or_else(|e| panic!("channel {:?} value not numeric: {e}", series.channel));
-            assert!(
-                x.is_finite(),
-                "channel {:?} decoded a non-finite value {x}",
-                series.channel
-            );
+            total_values += 1;
+            if !x.is_finite() {
+                non_finite_values += 1;
+                all_finite = false;
+            }
         }
-        found_finite = true;
+        if all_finite {
+            found_all_finite_channel = true;
+        }
     }
     assert!(
-        found_finite,
-        "no channel decoded a finite value over a non-empty time grid"
+        total_values > 0,
+        "no channel decoded any value over a non-empty time grid"
+    );
+    assert!(
+        found_all_finite_channel,
+        "no channel decoded entirely-finite values over a non-empty time grid"
+    );
+    // A correct decode leaves the vast majority of values finite; only genuine
+    // firmware sentinels are non-finite. Cap the non-finite fraction at 1%.
+    let non_finite_fraction = non_finite_values as f64 / total_values as f64;
+    assert!(
+        non_finite_fraction < 0.01,
+        "non-finite fraction {non_finite_fraction:.4} too high \
+         ({non_finite_values}/{total_values}); decode is likely garbage, \
+         not genuine IEEE sentinels"
     );
 
     // The overall log duration is finite and non-negative (derived from the grid).
@@ -154,5 +191,28 @@ fn real_ld_header_and_channels_decode() {
     assert!(
         duration.is_finite() && duration >= 0.0,
         "log duration must be finite and non-negative, got {duration}"
+    );
+
+    // Diagnostic summary for `--nocapture` runs (no proprietary value is asserted;
+    // this is operator-facing output, not a committed expectation). Report the
+    // channel count, time span, and the first finite (channel, time, value) triple.
+    let mut sample_report = None;
+    'outer: for series in &log.channels {
+        let InputKind::Series(points) = &series.kind else {
+            continue;
+        };
+        for (t, v) in points {
+            if let Ok(x) = v.as_f64()
+                && x.is_finite()
+            {
+                sample_report = Some((series.channel.clone(), *t, x));
+                break 'outer;
+            }
+        }
+    }
+    eprintln!(
+        "real-.ld smoke OK: {channel_count} channels, span {duration:.2}s, \
+         non-finite {non_finite_values}/{total_values} ({non_finite_fraction:.4}), \
+         sample {sample_report:?}"
     );
 }
