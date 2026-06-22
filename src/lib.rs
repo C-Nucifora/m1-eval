@@ -33,3 +33,6 @@ pub use stmt::{exec, exec_script};
 
 pub mod scenario;
 pub use scenario::{InputKind, InputSeries, RunMode, Scenario};
+
+pub mod summary;
+pub use summary::{IoSets, io_sets};
