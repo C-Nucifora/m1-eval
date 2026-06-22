@@ -237,6 +237,97 @@ fn unsupported(object: &str, method: &str) -> EvalError {
     }
 }
 
+/// How the engine handles a given builtin `Object.Method`. Drives the `--coverage`
+/// report (Task 28): a method is **supported** when the dispatch table evaluates
+/// it directly, **stubbed** when a Tier-3 IO object returns a documented offline
+/// value (or is scenario-fed), and **unsupported** when no branch implements it
+/// (it would fail loud at runtime).
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum BuiltinSupport {
+    /// Evaluated faithfully by the dispatch table.
+    Supported,
+    /// A Tier-3 IO object handled as a documented/scenario-fed stub.
+    Stubbed,
+    /// Not implemented — fails loud at runtime.
+    Unsupported,
+}
+
+/// Library/object methods implemented faithfully (Tier-1 + Tier-2). Kept in sync
+/// with the dispatch arms above; this is the single source of truth the coverage
+/// report consults so it never disagrees with what `dispatch` actually evaluates.
+const SUPPORTED_METHODS: &[(&str, &str)] = &[
+    // Calculate.* pure math.
+    ("Calculate", "Max"),
+    ("Calculate", "Min"),
+    ("Calculate", "Modulo"),
+    ("Calculate", "Bias"),
+    ("Calculate", "PI"),
+    ("Calculate", "Floor"),
+    ("Calculate", "Ceiling"),
+    ("Calculate", "Power"),
+    ("Calculate", "FastSquareRoot"),
+    ("Calculate", "IsNAN"),
+    ("Calculate", "FastSin"),
+    ("Calculate", "FastCos"),
+    ("Calculate", "FastTan"),
+    ("Calculate", "InverseTan2"),
+    // Calculate.* stateful predicates.
+    ("Calculate", "Stable"),
+    ("Calculate", "Hysteresis"),
+    ("Calculate", "Between"),
+    ("Calculate", "Beyond"),
+    // Limit.* and Convert.*.
+    ("Limit", "Range"),
+    ("Limit", "Max"),
+    ("Limit", "Min"),
+    ("Convert", "ToInteger"),
+    ("Convert", "ToUnsignedInteger"),
+    // Stateful Filter/Integral/Derivative.
+    ("Filter", "FirstOrder"),
+    ("Filter", "Maximum"),
+    ("Filter", "Minimum"),
+    ("Integral", "Normal"),
+    ("Derivative", "Normal"),
+    ("Derivative", "Filtered"),
+    ("Derivative", "Adaptive"),
+    // Delay/Debounce/Change.
+    ("Delay", "Rising"),
+    ("Delay", "Falling"),
+    ("Delay", "Stable"),
+    ("Debounce", "Stable"),
+    ("Debounce", "Fast"),
+    ("Debounce", "Verify"),
+    ("Change", "By"),
+    ("Change", "Up"),
+    ("Change", "Down"),
+    ("Change", "To"),
+    ("Change", "From"),
+    ("Change", "Either"),
+];
+
+/// The Tier-3 IO library objects: their methods are handled as documented/
+/// scenario-fed stubs (flagged externally driven), not faithfully evaluated.
+const STUB_OBJECTS: &[&str] = &["CanComms", "Serial", "System", "Logging"];
+
+/// Classify a builtin `object.method` for the coverage report.
+///
+/// A `Lookup` method on any object is treated as **supported** here — it is the
+/// table-interpolation path, resolved at runtime against a project table symbol
+/// (coverage cannot see the calibration, so it reports the construct as supported
+/// and the runtime fails loud if the specific object is not a table).
+pub fn classify_builtin(object: &str, method: &str) -> BuiltinSupport {
+    if method == "Lookup" {
+        return BuiltinSupport::Supported;
+    }
+    if SUPPORTED_METHODS.contains(&(object, method)) {
+        return BuiltinSupport::Supported;
+    }
+    if STUB_OBJECTS.contains(&object) {
+        return BuiltinSupport::Stubbed;
+    }
+    BuiltinSupport::Unsupported
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
