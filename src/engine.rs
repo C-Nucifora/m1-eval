@@ -22,6 +22,7 @@
 
 use crate::counterfactual::Override;
 use crate::coverage::CoverageReport;
+use crate::diff::{Counterfactual, Diff};
 use crate::error::EvalError;
 use crate::loader::{Loaded, load};
 use crate::log::Log;
@@ -180,6 +181,22 @@ impl Engine {
             duration_s: 0.0,
         };
         run_counterfactual(&self.loaded, log, &self.overrides, &cfg)
+    }
+
+    /// Run the counterfactual replay and diff the result against the logged ground
+    /// truth, returning a [`Counterfactual`] (the recomputed [`Trace`] plus the
+    /// per-channel [`Diff`]). This is the headline Phase-3 output: "override this
+    /// channel; here is the trace and exactly which downstream channels moved, and
+    /// by how much." Requires a log (fails loud via [`Engine::run_counterfactual`]).
+    pub fn run_counterfactual_diff(&self) -> Result<Counterfactual, EvalError> {
+        let trace = self.run_counterfactual()?;
+        // `run_counterfactual` has already established that a log is attached.
+        let log = self
+            .log
+            .as_ref()
+            .expect("run_counterfactual succeeded, so a log is attached");
+        let diff = Diff::between(log, &trace);
+        Ok(Counterfactual { trace, diff })
     }
 
     /// The default base tick rate for a counterfactual run: the project's fastest

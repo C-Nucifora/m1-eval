@@ -40,6 +40,9 @@ pub use log::{Log, LogMeta};
 pub mod counterfactual;
 pub use counterfactual::Override;
 
+pub mod diff;
+pub use diff::{ChannelDiff, Counterfactual, Diff};
+
 pub mod summary;
 pub use summary::{IoSets, io_sets};
 
