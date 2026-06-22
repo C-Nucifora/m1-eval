@@ -62,6 +62,168 @@ pub fn run(loaded: &Loaded, scenario: &Scenario) -> Result<Trace, EvalError> {
             let order = build_cone(loaded, target)?;
             tick_loop(loaded, scenario, &order)
         }
+        RunMode::WholeProject => {
+            // Enumerate every periodically-scheduled function and order it
+            // dependency-then-rate. The rate-gated tick loop (per-function rate
+            // divisors + rate-correct `dt`) lands in P2-B (Task 13); for now the
+            // ordered schedule runs through the shared loop so the mode is
+            // functional and the ordering is exercised end-to-end.
+            let ordered = build_whole_project_schedule(loaded);
+            let plain: Vec<Scheduled> = ordered.into_iter().map(|r| r.sched).collect();
+            tick_loop(loaded, scenario, &plain)
+        }
+    }
+}
+
+/// One scheduled function together with its periodic execution rate in Hz, as
+/// derived from the function symbol's `call_rate_hz`. Only functions with a
+/// resolvable periodic trigger (a `BuiltIn.EventKernel` clock like `On 100Hz`)
+/// appear here; `On Startup` / untriggered functions (rate `None`) are excluded.
+struct ScheduledRated<'a> {
+    /// The scheduled function (script + resolved scope).
+    sched: Scheduled<'a>,
+    /// The function's execution rate in Hz.
+    rate_hz: f64,
+}
+
+/// Build the whole-project schedule: every periodically-scheduled function, in
+/// dependency-then-rate order.
+///
+/// 1. **Enumerate + rate** (Task 11): for each script, the backing function
+///    symbol's `call_rate_hz` gives its periodic rate. Keep only the functions
+///    with `Some(rate)` — exactly the pattern `m1-typecheck`'s `schedule.rs`
+///    uses (`symbols().get(&fn_path).and_then(|s| s.call_rate_hz)`). Startup /
+///    untriggered functions (`None`) are not periodically scheduled, so they are
+///    excluded.
+/// 2. **Dependency-then-rate order** (Task 12): within a single rate group,
+///    writer-before-reader topological order (from [`io_sets`], reusing
+///    [`topo_order`]); groups concatenated fastest-rate-first. There are no
+///    cross-rate edges — a faster reader of a slower writer sees the previous
+///    value (the same same-rate-only dependency rule `m1-typecheck`'s
+///    `schedule.rs` applies).
+fn build_whole_project_schedule(loaded: &Loaded) -> Vec<ScheduledRated<'_>> {
+    let mut rated = enumerate_scheduled(loaded);
+    order_by_dependency_then_rate(loaded, &mut rated);
+    rated
+}
+
+/// Enumerate every periodically-scheduled function with its rate (Task 11).
+///
+/// For each parsed script, resolve its backing function symbol and read that
+/// symbol's `call_rate_hz`; keep only functions with a periodic rate. The result
+/// is sorted by `(rate descending, fn_symbol)` as a deterministic baseline; the
+/// dependency layer (Task 12) refines order *within* each rate group.
+fn enumerate_scheduled(loaded: &Loaded) -> Vec<ScheduledRated<'_>> {
+    let mut rated: Vec<ScheduledRated> = loaded
+        .scripts
+        .iter()
+        .filter_map(|script| {
+            let fn_symbol = loaded.project.function_symbol_for_script(&script.name)?;
+            let rate_hz = loaded
+                .project
+                .symbols()
+                .get(&fn_symbol)
+                .and_then(|s| s.call_rate_hz)?;
+            Some(ScheduledRated {
+                sched: scheduled_for(loaded, script),
+                rate_hz,
+            })
+        })
+        .collect();
+    // Deterministic baseline: fastest rate first, ties broken by function symbol
+    // path (every scheduled function has a `fn_symbol`, so the key is total).
+    rated.sort_by(|a, b| {
+        b.rate_hz
+            .partial_cmp(&a.rate_hz)
+            .unwrap_or(std::cmp::Ordering::Equal)
+            .then_with(|| a.sched.fn_symbol.cmp(&b.sched.fn_symbol))
+    });
+    rated
+}
+
+/// Reorder an already rate-sorted schedule into dependency-then-rate order
+/// (Task 12).
+///
+/// Within each rate group, a writer runs before any reader of its output: build
+/// writer→reader edges from [`io_sets`] (restricted to that rate group) and
+/// [`topo_order`] them. Groups are then concatenated fastest-rate-first — the
+/// conventional ECU order, fast loops before slow within a base tick.
+///
+/// Cross-rate dependencies deliberately add **no** edges: a faster function that
+/// reads a slower function's channel sees the value from the slower function's
+/// previous run (stale between writer ticks). This mirrors `m1-typecheck`'s
+/// `schedule.rs`, whose dependency edges are same-rate only; forcing a fast loop
+/// to wait on a slow one would misrepresent the real ECU schedule.
+///
+/// A dependency cycle within a rate group falls back to discovery order (the
+/// existing [`topo_order`] behaviour) — acceptable, since ordering is best-effort
+/// and values are never guessed.
+fn order_by_dependency_then_rate(loaded: &Loaded, rated: &mut Vec<ScheduledRated<'_>>) {
+    // Group indices by rate, preserving the fastest-first order of the first
+    // appearance of each rate (the input is already rate-sorted descending).
+    let mut groups: Vec<(f64, Vec<usize>)> = Vec::new();
+    for (i, r) in rated.iter().enumerate() {
+        match groups.iter_mut().find(|(rate, _)| *rate == r.rate_hz) {
+            Some((_, idxs)) => idxs.push(i),
+            None => groups.push((r.rate_hz, vec![i])),
+        }
+    }
+
+    // Compute the final order of indices: for each rate group, topo-order its
+    // members writer-before-reader using only that group's writers (no cross-rate
+    // edges), then concatenate the groups fastest-first.
+    let mut final_order: Vec<usize> = Vec::with_capacity(rated.len());
+    for (_rate, idxs) in &groups {
+        // Map each script name in this group to its index, its io sets, and the
+        // group-local writer map (channel -> first script that writes it).
+        let mut name_to_idx: BTreeMap<String, usize> = BTreeMap::new();
+        let mut sets: HashMap<String, crate::summary::IoSets> = HashMap::new();
+        let mut writer: HashMap<String, String> = HashMap::new();
+        let mut nodes: BTreeSet<String> = BTreeSet::new();
+        // Stable per-group ordering by script name for determinism.
+        let mut group_names: Vec<(String, usize)> = idxs
+            .iter()
+            .map(|&i| (rated[i].sched.script.name.clone(), i))
+            .collect();
+        group_names.sort();
+        for (name, i) in &group_names {
+            let script = rated[*i].sched.script;
+            let group = rated[*i].sched.group.as_deref();
+            let io = io_sets(script, &loaded.project, group);
+            for w in &io.writes {
+                writer.entry(w.clone()).or_insert_with(|| name.clone());
+            }
+            sets.insert(name.clone(), io);
+            name_to_idx.insert(name.clone(), *i);
+            nodes.insert(name.clone());
+        }
+
+        // Writer→reader edges, restricted to this rate group (cross-rate reads
+        // intentionally add no edge — see the doc comment).
+        let mut edges: Vec<(String, String)> = Vec::new();
+        for (name, io) in &sets {
+            for r in &io.reads {
+                if let Some(producer) = writer.get(r)
+                    && producer != name
+                {
+                    edges.push((producer.clone(), name.clone()));
+                }
+            }
+        }
+
+        for name in topo_order(&nodes, &edges) {
+            if let Some(&i) = name_to_idx.get(&name) {
+                final_order.push(i);
+            }
+        }
+    }
+
+    // Apply `final_order` by draining `rated` into a lookup and re-pushing.
+    let mut slots: Vec<Option<ScheduledRated>> = rated.drain(..).map(Some).collect();
+    for i in final_order {
+        if let Some(r) = slots[i].take() {
+            rated.push(r);
+        }
     }
 }
 

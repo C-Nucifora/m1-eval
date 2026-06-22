@@ -58,6 +58,11 @@ pub enum RunMode {
     /// Run a target channel plus its upstream dependency cone. The string is the
     /// canonical channel path the user wants computed.
     Cone(String),
+    /// Run *every* periodically-scheduled function (those whose trigger resolves
+    /// to a `call_rate_hz`) each base tick at its own rate, in dependency-then-rate
+    /// order. The faithful mini-ECU: no single target — the runner schedules the
+    /// whole project.
+    WholeProject,
 }
 
 /// One input source the engine is *given* rather than computes.
@@ -268,7 +273,10 @@ fn split_csv_row(line: &str) -> Vec<String> {
 struct RawScenario {
     mode: String,
     /// The target: a function name (function mode) or channel (cone mode).
-    target: String,
+    /// Optional on the wire: `whole-project` mode carries no single target, and
+    /// `function`/`cone` modes get a fail-loud error below when it is missing.
+    #[serde(default)]
+    target: Option<String>,
     duration_s: f64,
     base_rate_hz: f64,
     #[serde(default)]
@@ -312,12 +320,24 @@ impl RawValue {
 
 impl RawScenario {
     fn into_scenario(self) -> Result<Scenario, EvalError> {
+        // `function`/`cone` require a target; `whole-project` ignores it (and so
+        // it is optional only in that mode). Resolving the target here keeps the
+        // fail-loud error attached to the mode that needs it.
+        let require_target = |mode: &str| -> Result<String, EvalError> {
+            self.target.clone().ok_or_else(|| EvalError::UnsupportedConstruct {
+                kind: format!("scenario mode {mode:?} requires a `target`"),
+                at: 0,
+            })
+        };
         let mode = match self.mode.as_str() {
-            "function" => RunMode::Function(self.target),
-            "cone" => RunMode::Cone(self.target),
+            "function" => RunMode::Function(require_target("function")?),
+            "cone" => RunMode::Cone(require_target("cone")?),
+            "whole-project" => RunMode::WholeProject,
             other => {
                 return Err(EvalError::UnsupportedConstruct {
-                    kind: format!("unknown scenario mode {other:?} (expected `function` or `cone`)"),
+                    kind: format!(
+                        "unknown scenario mode {other:?} (expected `function`, `cone`, or `whole-project`)"
+                    ),
                     at: 0,
                 });
             }
@@ -494,9 +514,60 @@ series = [[0.0, 0.0], [0.5, 50.0]]
 
     #[test]
     fn unknown_mode_fails_loud() {
+        // `whole-project` is now a valid mode (Phase 2), so the negative case is
+        // a genuinely unknown mode instead.
+        let toml = r#"
+mode = "galaxy"
+target = "X"
+duration_s = 1.0
+base_rate_hz = 100.0
+"#;
+        match Scenario::from_toml_str(toml) {
+            Err(EvalError::UnsupportedConstruct { .. }) => {}
+            other => panic!("expected UnsupportedConstruct, got {other:?}"),
+        }
+    }
+
+    #[test]
+    fn whole_project_mode_parses_without_target() {
+        // Whole-project mode schedules every periodically-triggered function, so
+        // it carries no single `target`; the field is optional in this mode.
         let toml = r#"
 mode = "whole-project"
-target = "X"
+duration_s = 1.0
+base_rate_hz = 100.0
+
+[[inputs]]
+channel = "Root.Demo.Speed"
+const = 20.0
+"#;
+        let sc = Scenario::from_toml_str(toml).expect("whole-project scenario parses");
+        assert_eq!(sc.mode, RunMode::WholeProject);
+        assert_eq!(sc.duration_s, 1.0);
+        assert_eq!(sc.base_rate_hz, 100.0);
+        assert_eq!(sc.inputs.len(), 1);
+    }
+
+    #[test]
+    fn whole_project_mode_ignores_a_supplied_target() {
+        // A stray `target` in whole-project mode is harmless (ignored), not an
+        // error — the runner schedules every function regardless.
+        let toml = r#"
+mode = "whole-project"
+target = "Root.Demo.Update"
+duration_s = 0.5
+base_rate_hz = 50.0
+"#;
+        let sc = Scenario::from_toml_str(toml).expect("whole-project ignores target");
+        assert_eq!(sc.mode, RunMode::WholeProject);
+    }
+
+    #[test]
+    fn function_mode_without_target_fails_loud() {
+        // `function`/`cone` modes still require a target; omitting it fails loud
+        // rather than silently scheduling nothing.
+        let toml = r#"
+mode = "function"
 duration_s = 1.0
 base_rate_hz = 100.0
 "#;
