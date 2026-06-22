@@ -34,9 +34,16 @@ pub fn call(method: &str, args: &[Value]) -> Result<Option<Value>, EvalError> {
     let v = match method {
         "Max" => binary_minmax(args, true)?,
         "Min" => binary_minmax(args, false)?,
+        "Absolute" => abs(args)?,
+        "Average" => average(args)?,
         "Modulo" => modulo(args)?,
         "Bias" => bias(args)?,
         "PI" => Value::Float(std::f64::consts::PI),
+        "NAN" => Value::Float(f64::NAN),
+        "Infinity" => Value::Float(f64::INFINITY),
+        // The largest representable finite float (paraphrased: the maximum finite
+        // floating-point magnitude the firmware can hold).
+        "MaximumFloat" => Value::Float(f64::MAX),
         "Floor" => Value::Float(unary_f64(args)?.floor()),
         "Ceiling" => Value::Float(unary_f64(args)?.ceil()),
         "Power" => {
@@ -45,9 +52,15 @@ pub fn call(method: &str, args: &[Value]) -> Result<Option<Value>, EvalError> {
         }
         "FastSquareRoot" => Value::Float(unary_f64(args)?.sqrt()),
         "IsNAN" => Value::Bool(unary_f64(args)?.is_nan()),
+        "IsFinite" => Value::Bool(unary_f64(args)?.is_finite()),
         "FastSin" => Value::Float(unary_f64(args)?.sin()),
         "FastCos" => Value::Float(unary_f64(args)?.cos()),
         "FastTan" => Value::Float(unary_f64(args)?.tan()),
+        // The inverse trig functions mirror the `FastSin` paraphrase note: the std
+        // implementation, a documented assumption (radians, principal value).
+        "InverseSin" => Value::Float(unary_f64(args)?.asin()),
+        "InverseCos" => Value::Float(unary_f64(args)?.acos()),
+        "InverseTan" => Value::Float(unary_f64(args)?.atan()),
         "InverseTan2" => {
             let (y, x) = two_f64(args)?;
             Value::Float(y.atan2(x))
@@ -115,6 +128,33 @@ fn bias(args: &[Value]) -> Result<Value, EvalError> {
     let b = args[1].as_f64()?;
     let t = args[2].as_f64()?;
     Ok(Value::Float(a + (b - a) * t))
+}
+
+/// `Absolute(x)` — the magnitude of `x`, preserving integrality the same way
+/// `Max`/`Min` do (the intrinsic signature is `Integer|FloatingPoint`). An
+/// unsigned operand is already non-negative, so it is returned unchanged; a
+/// signed integer or float is negated when below zero. Re-typing under the
+/// operand's own [`ValueType`] keeps `Int`→`Int`, `Uint`→`Uint`, `Float`→`Float`.
+fn abs(args: &[Value]) -> Result<Value, EvalError> {
+    match &args[0] {
+        // An unsigned operand is already non-negative.
+        Value::Uint(x) => Ok(Value::Uint(*x)),
+        Value::Int(x) => Ok(Value::Int(x.abs())),
+        Value::Float(x) => Ok(Value::Float(x.abs())),
+        other => Err(EvalError::TypeError {
+            detail: format!("Calculate.Absolute on non-numeric operand {other:?}"),
+        }),
+    }
+}
+
+/// `Average(a, b)` — the arithmetic mean `(a + b) / 2`. Always a [`Value::Float`]:
+/// the mean of two integers is generally fractional, so we never round it back to
+/// an integer (the intrinsic return tag is `Integer|FloatingPoint`, but a faithful
+/// mean keeps the fractional part — a documented divergence from the raw tag).
+fn average(args: &[Value]) -> Result<Value, EvalError> {
+    let a = args[0].as_f64()?;
+    let b = args[1].as_f64()?;
+    Ok(Value::Float((a + b) / 2.0))
 }
 
 /// Coerce a single argument to `f64` for the float-only functions.
@@ -276,6 +316,75 @@ mod tests {
         assert_eq!(
             ok("InverseTan2", &[Value::Float(1.0), Value::Float(1.0)]),
             Value::Float(std::f64::consts::FRAC_PI_4)
+        );
+    }
+
+    #[test]
+    fn absolute_preserves_integrality() {
+        // Signed integer magnitude stays an Int.
+        assert_eq!(ok("Absolute", &[Value::Int(-3)]), Value::Int(3));
+        assert_eq!(ok("Absolute", &[Value::Int(3)]), Value::Int(3));
+        // Float magnitude stays a Float.
+        assert_eq!(ok("Absolute", &[Value::Float(-2.5)]), Value::Float(2.5));
+        // Unsigned is already non-negative and stays a Uint.
+        assert_eq!(ok("Absolute", &[Value::Uint(7)]), Value::Uint(7));
+    }
+
+    #[test]
+    fn average_is_the_mean_and_always_float() {
+        // (a + b) / 2; fractional even for two integers.
+        assert_eq!(
+            ok("Average", &[Value::Int(2), Value::Int(4)]),
+            Value::Float(3.0)
+        );
+        assert_eq!(
+            ok("Average", &[Value::Int(1), Value::Int(2)]),
+            Value::Float(1.5)
+        );
+        assert_eq!(
+            ok("Average", &[Value::Float(10.0), Value::Float(20.0)]),
+            Value::Float(15.0)
+        );
+    }
+
+    #[test]
+    fn nan_and_infinity_constants() {
+        // NAN() -> a Float that reports as NaN.
+        match ok("NAN", &[]) {
+            Value::Float(x) => assert!(x.is_nan()),
+            other => panic!("expected NaN Float, got {other:?}"),
+        }
+        assert_eq!(ok("Infinity", &[]), Value::Float(f64::INFINITY));
+    }
+
+    #[test]
+    fn is_finite_classifies() {
+        assert_eq!(ok("IsFinite", &[Value::Float(1.0)]), Value::Bool(true));
+        assert_eq!(
+            ok("IsFinite", &[Value::Float(f64::INFINITY)]),
+            Value::Bool(false)
+        );
+        assert_eq!(
+            ok("IsFinite", &[Value::Float(f64::NAN)]),
+            Value::Bool(false)
+        );
+    }
+
+    #[test]
+    fn maximum_float_is_the_largest_finite() {
+        assert_eq!(ok("MaximumFloat", &[]), Value::Float(f64::MAX));
+    }
+
+    #[test]
+    fn inverse_trig_matches_std() {
+        // Principal values in radians (std implementation, documented assumption).
+        assert_eq!(ok("InverseSin", &[Value::Float(0.0)]), Value::Float(0.0_f64.asin()));
+        assert_eq!(ok("InverseCos", &[Value::Float(1.0)]), Value::Float(1.0_f64.acos()));
+        assert_eq!(ok("InverseTan", &[Value::Float(0.0)]), Value::Float(0.0_f64.atan()));
+        // asin(1) = pi/2.
+        assert_eq!(
+            ok("InverseSin", &[Value::Float(1.0)]),
+            Value::Float(std::f64::consts::FRAC_PI_2)
         );
     }
 
