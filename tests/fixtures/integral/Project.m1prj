@@ -1,0 +1,11 @@
+<?xml version="1.0"?>
+<MoTeCM1BuildSession>
+ <Project Name="Integral" TargetHardware="ecu120">
+  <ComponentStream><List>
+   <Component Classname="BuiltIn.GroupCompound" Name="Root.Acc"/>
+   <Component Classname="BuiltIn.Channel" Name="Root.Acc.Rate"><Props Type="f32"/></Component>
+   <Component Classname="BuiltIn.Channel" Name="Root.Acc.Total"><Props Type="f32"/></Component>
+   <Component Classname="BuiltIn.FuncUser" Filename="Acc.Update.m1scr" Name="Root.Acc.Update"/>
+  </List></ComponentStream>
+ </Project>
+</MoTeCM1BuildSession>

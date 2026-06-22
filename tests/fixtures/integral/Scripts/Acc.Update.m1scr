@@ -1,0 +1,3 @@
+// Synthetic M1 script for m1-eval integral runner tests. No proprietary content.
+// Integrates the Rate channel over time, unclamped, writing the running Total.
+Total = Integral.Normal(Rate, -1000000.0, 1000000.0, false, 0.0);

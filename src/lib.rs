@@ -36,3 +36,5 @@ pub use scenario::{InputKind, InputSeries, RunMode, Scenario};
 
 pub mod summary;
 pub use summary::{IoSets, io_sets};
+
+pub mod runner;
