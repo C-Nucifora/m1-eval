@@ -1,4 +1,6 @@
 // Synthetic m1-eval counterfactual fixture. No proprietary content.
-// Stage B: reads Mid (written by stage A), writes Out (= Mid + 1). Depends on
-// A running first this tick.
-Out = Mid + 1.0;
+// Stage B: reads Mid (written by stage A), writes Result (= Mid + 1). Depends on
+// A running first this tick. The output channel is named `Result` (not `Out`),
+// because a bare `Out` is the reserved user-function return-value keyword and
+// would write the frame's return slot rather than a project channel.
+Result = Mid + 1.0;

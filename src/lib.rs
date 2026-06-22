@@ -44,6 +44,7 @@ pub mod summary;
 pub use summary::{IoSets, io_sets};
 
 pub mod runner;
+pub use runner::{CounterfactualCfg, run_counterfactual};
 
 pub mod coverage;
 pub use coverage::{CoverageItem, CoverageReport, ItemKind};

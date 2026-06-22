@@ -38,15 +38,18 @@
 //! functions of `t`, and there is no wall-clock or RNG — the same scenario always
 //! yields the same trace.
 
+use crate::counterfactual::Override;
 use crate::env::{Env, StateStore};
 use crate::error::EvalError;
 use crate::expr::EvalCtx;
 use crate::ident::{Target, classify};
 use crate::loader::Loaded;
+use crate::log::Log;
 use crate::scenario::{InputSeries, RunMode, Scenario};
 use crate::stmt::exec_script;
 use crate::summary::io_sets;
 use crate::trace::Trace;
+use crate::value::Value;
 use m1_typecheck::parsed::ParsedScript;
 use std::collections::{BTreeMap, BTreeSet, HashMap};
 
@@ -665,9 +668,8 @@ fn build_cone<'a>(loaded: &'a Loaded, target: &str) -> Result<Vec<Scheduled<'a>>
 /// Fail loud when **no** function reads any override channel: there is nothing
 /// downstream to recompute, so the override would have no effect. That is a user
 /// error worth surfacing rather than silently returning an empty schedule.
-// Consumed by the counterfactual runner (P3-B Task 6); exercised now by the
-// downstream-cone tests below, hence the allow until that wiring lands.
-#[allow(dead_code)]
+///
+/// Consumed by [`run_counterfactual`] (the headline counterfactual runner).
 fn build_downstream_cone<'a>(
     loaded: &'a Loaded,
     overrides: &[String],
@@ -760,6 +762,324 @@ fn build_downstream_cone<'a>(
         .collect())
 }
 
+// ---- P3-B Task 6: counterfactual replay (log ground truth + cone recompute) ----
+
+/// How a counterfactual run is gridded: the base tick rate and the duration.
+///
+/// `duration_s == 0.0` is the "auto" sentinel — the run then spans the log's own
+/// `duration_s` (its latest keyframe time). The base rate must be positive; a
+/// counterfactual has no schedule to derive a default from.
+pub struct CounterfactualCfg {
+    /// Base tick rate in Hz; the tick step is `dt = 1 / base_rate_hz`.
+    pub base_rate_hz: f64,
+    /// Total run duration in seconds. `0.0` means "use the log's duration".
+    pub duration_s: f64,
+}
+
+/// Replay a recorded [`Log`] as ground truth, applying `overrides` and recomputing
+/// only the **downstream cone** of the overridden channels.
+///
+/// The model (the headline Phase-3 feature): every logged channel is held at its
+/// logged value (zero-order hold) each tick — that is the ground truth. The user
+/// then replaces one or more channels with an [`Override`]; only the functions
+/// **downstream** of those channels (their forward dependency cone, from
+/// [`build_downstream_cone`]) recompute, so the override propagates while every
+/// non-cone channel stays at its logged value. The result is a normal [`Trace`].
+///
+/// **Source precedence (lowest to highest): calibration < log < override.** A
+/// calibration value seeds a tunable; the log overwrites any logged channel with
+/// its recorded value; an override overwrites the channel it targets last of all.
+/// Within a tick the order is: seed every logged channel from the log, then layer
+/// the overrides (a constant directly; an expression evaluated against the
+/// just-seeded *logged* snapshot, so `CH = CH * 1.05` reads the logged `CH`),
+/// then run only the cone functions in writer-before-reader order.
+///
+/// Determinism: the grid and per-tick `dt` are fixed, the log is a pure function
+/// of `t` (zero-order hold), and there is no wall-clock or RNG — the same log and
+/// the same overrides always yield the same trace.
+///
+/// Fails loud: a positive base rate is required; an override whose channel has no
+/// in-project reader has nothing to recompute (propagated from
+/// [`build_downstream_cone`]); an unparsable or non-numeric expression override
+/// surfaces its evaluation error.
+pub fn run_counterfactual(
+    loaded: &Loaded,
+    log: &Log,
+    overrides: &[Override],
+    cfg: &CounterfactualCfg,
+) -> Result<Trace, EvalError> {
+    if cfg.base_rate_hz <= 0.0 {
+        return Err(EvalError::UnsupportedConstruct {
+            kind: format!(
+                "counterfactual base_rate_hz must be positive, got {}",
+                cfg.base_rate_hz
+            ),
+            at: 0,
+        });
+    }
+    let base_rate_hz = cfg.base_rate_hz;
+    let duration_s = if cfg.duration_s > 0.0 {
+        cfg.duration_s
+    } else {
+        log.duration_s()
+    };
+
+    // Build the downstream cone of the override channels: the only functions that
+    // recompute. Fails loud when no function reads any override channel.
+    let override_channels: Vec<String> = overrides.iter().map(|o| o.channel().to_string()).collect();
+    let cone = build_downstream_cone(loaded, &override_channels)?;
+
+    // Canonicalise the log series and each override channel against the project
+    // scope (the cone's first function), so `Sensor` and `Root.CF.Sensor` address
+    // one value-store key — the same canonicalisation the tick loop applies.
+    let scope_group = cone.first().and_then(|s| s.group.as_deref());
+    let scope_fn = cone.first().and_then(|s| s.fn_symbol.as_deref());
+    let log_inputs = canonicalise(&log.channels, loaded, scope_group, scope_fn);
+    let prepared = prepare_overrides(overrides, loaded, scope_group, scope_fn)?;
+
+    // The union of channels the cone writes, so a cone function that does not run
+    // on a tick holds its last value (zero-order hold) — reusing the schedule-write
+    // hold machinery the tick loop already relies on.
+    let rated: Vec<ScheduledRated> = cone
+        .into_iter()
+        .map(|sched| ScheduledRated {
+            sched,
+            rate_hz: base_rate_hz,
+        })
+        .collect();
+    let scheduled_writes = schedule_writes(loaded, &rated);
+
+    let ticks = tick_count(duration_s, base_rate_hz);
+    let mut env = Env::new();
+    let mut state = StateStore::new();
+    let mut trace = Trace::new();
+    // A counterfactual seeds every logged channel as ground truth, so an unseeded
+    // *channel* read still fails loud (like function/cone mode): a cone function
+    // reading a channel the log does not carry is a genuine error, not a guess.
+    env.default_unseeded_channels = false;
+
+    for i in 0..ticks {
+        let t = i as f64 / base_rate_hz;
+
+        // 1. Seed every logged channel from the log (zero-order hold) — the ground
+        //    truth (precedence: log over calibration).
+        for (path, series) in &log_inputs {
+            env.set(path.clone(), series.sample(t));
+        }
+
+        // 2. Layer the overrides on top (precedence: override over log). A constant
+        //    is written directly; an expression is evaluated against the *logged*
+        //    snapshot just seeded (so `CH = CH * k` reads the logged `CH`). Every
+        //    expression is evaluated first, against the same logged snapshot, then
+        //    the results are written together — so two overrides cannot observe one
+        //    another's freshly-written value within the tick.
+        let mut pending: Vec<(String, Value)> = Vec::with_capacity(prepared.len());
+        for ov in &prepared {
+            let value = match ov {
+                PreparedOverride::Const { value, .. } => value.clone(),
+                PreparedOverride::Expr {
+                    wrapped,
+                    group,
+                    fn_symbol,
+                    ..
+                } => {
+                    // Re-parse the (pre-validated) wrapped snippet and evaluate its
+                    // value node — the `Cst` and its borrowed node live together on
+                    // this stack frame, so no self-referential storage is needed.
+                    let cst = m1_core::parse(wrapped);
+                    let value_node = override_value_node(&cst).ok_or_else(|| {
+                        EvalError::UnsupportedConstruct {
+                            kind: format!("override expression {wrapped:?} did not parse"),
+                            at: 0,
+                        }
+                    })?;
+                    let mut ctx = EvalCtx {
+                        project: &loaded.project,
+                        calib: &loaded.calib,
+                        env: &mut env,
+                        state: &mut state,
+                        group: group.as_deref(),
+                        fn_symbol: fn_symbol.as_deref(),
+                        script_name: CF_OVERRIDE_SCRIPT,
+                        dt: 1.0 / base_rate_hz,
+                        scripts: &loaded.scripts,
+                        depth: 0,
+                        trace: None,
+                    };
+                    crate::expr::eval(&value_node, &mut ctx)?
+                }
+            };
+            pending.push((ov.channel().to_string(), value));
+        }
+        for (path, value) in pending {
+            env.set(path, value);
+        }
+
+        // 3. Open the tick.
+        trace.push_tick(t);
+
+        // 4. Run only the cone functions, writer-before-reader. Each recomputes its
+        //    downstream channel from the overridden inputs; everything else holds
+        //    its logged (or overridden) value.
+        for rated in &rated {
+            let sched = &rated.sched;
+            let root = sched.script.cst.root();
+            let mut ctx = EvalCtx {
+                project: &loaded.project,
+                calib: &loaded.calib,
+                env: &mut env,
+                state: &mut state,
+                group: sched.group.as_deref(),
+                fn_symbol: sched.fn_symbol.as_deref(),
+                script_name: &sched.script.name,
+                dt: 1.0 / base_rate_hz,
+                scripts: &loaded.scripts,
+                depth: 0,
+                trace: Some(&mut trace),
+            };
+            exec_script(&root, &mut ctx)?;
+        }
+
+        // 5. Record every channel that did not record this tick by holding its env
+        //    value: the cone's held writes, any channel with a column already, then
+        //    the logged channels and the overrides — so the trace is a dense grid
+        //    with the logged value on every pass-through channel and the recomputed
+        //    value on every cone channel.
+        hold_unwritten_channels(&scheduled_writes, &env, &mut trace);
+        hold_trace_channels(&env, &mut trace);
+        for (path, series) in &log_inputs {
+            let already = trace
+                .channels
+                .get(path)
+                .map(|c| c.len() == trace.time.len())
+                .unwrap_or(false);
+            if !already {
+                let v = env.get(path).cloned().unwrap_or_else(|| series.sample(t));
+                trace.record_channel(path.clone(), v);
+                trace.mark_external(path.clone());
+            }
+        }
+        for ov in &prepared {
+            let path = ov.channel();
+            let already = trace
+                .channels
+                .get(path)
+                .map(|c| c.len() == trace.time.len())
+                .unwrap_or(false);
+            if !already && let Some(v) = env.get(path).cloned() {
+                trace.record_channel(path.to_string(), v);
+                trace.mark_external(path.to_string());
+            }
+        }
+    }
+
+    Ok(trace)
+}
+
+/// The synthetic script-name identity used for the [`CallSite`](crate::env::CallSite)
+/// of an expression override's stateful operators (overrides rarely use stateful
+/// operators, but the call-site key needs a stable, collision-free name).
+const CF_OVERRIDE_SCRIPT: &str = "<counterfactual-override>";
+
+/// A counterfactual override compiled for the tick loop: a canonical channel path
+/// plus either a constant value or a pre-validated expression snippet re-parsed and
+/// evaluated each tick against the logged snapshot.
+enum PreparedOverride {
+    /// A constant pinned every tick.
+    Const { channel: String, value: Value },
+    /// An expression evaluated each tick. `wrapped` is the snippet wrapped as an
+    /// assignment (`__cf__ = <source>;`), validated to parse at preparation time
+    /// and re-parsed per tick (the `Cst` + its borrowed node then live together on
+    /// the tick stack frame — no self-referential storage). `group`/`fn_symbol` are
+    /// the scope the expression resolves names in.
+    Expr {
+        channel: String,
+        wrapped: String,
+        group: Option<String>,
+        fn_symbol: Option<String>,
+    },
+}
+
+impl PreparedOverride {
+    /// The canonical channel path this override writes.
+    fn channel(&self) -> &str {
+        match self {
+            PreparedOverride::Const { channel, .. } | PreparedOverride::Expr { channel, .. } => {
+                channel
+            }
+        }
+    }
+}
+
+/// Compile each [`Override`] for the counterfactual tick loop: canonicalise its
+/// channel against the project scope, and for an expression override wrap the
+/// source as an assignment and validate that it parses (failing loud now rather
+/// than mid-run).
+///
+/// The expression source is wrapped as an assignment (`__cf__ = <source>;`) — the
+/// same re-parse trick [`crate::stmt`]'s expand statement uses — so the existing
+/// assignment-value extraction reaches the bare expression node. The wrapped string
+/// is kept and re-parsed each tick; an expression that does not parse to a single
+/// assignment with a value fails loud here.
+fn prepare_overrides(
+    overrides: &[Override],
+    loaded: &Loaded,
+    group: Option<&str>,
+    fn_symbol: Option<&str>,
+) -> Result<Vec<PreparedOverride>, EvalError> {
+    let no_locals = HashMap::new();
+    overrides
+        .iter()
+        .map(|ov| {
+            let canon = match classify(ov.channel(), group, fn_symbol, &loaded.project, &no_locals)
+            {
+                Target::Symbol(p) => p,
+                _ => ov.channel().to_string(),
+            };
+            match ov {
+                Override::Const { value, .. } => Ok(PreparedOverride::Const {
+                    channel: canon,
+                    value: value.clone(),
+                }),
+                Override::Expr { source, .. } => {
+                    let wrapped = format!("__cf__ = {source};\n");
+                    // Validate at preparation time: a snippet that does not parse to
+                    // an assignment with a value node fails loud now, not mid-run.
+                    let cst = m1_core::parse(&wrapped);
+                    if override_value_node(&cst).is_none() {
+                        return Err(EvalError::UnsupportedConstruct {
+                            kind: format!(
+                                "override expression {source:?} did not parse to an expression"
+                            ),
+                            at: 0,
+                        });
+                    }
+                    Ok(PreparedOverride::Expr {
+                        channel: canon,
+                        wrapped,
+                        group: group.map(str::to_string),
+                        fn_symbol: fn_symbol.map(str::to_string),
+                    })
+                }
+            }
+        })
+        .collect()
+}
+
+/// The value (right-hand-side) node of the single wrapping assignment in a parsed
+/// override snippet, if present. The override source was wrapped as
+/// `__cf__ = <source>;`, so the assignment's `Value` field is the bare expression
+/// to evaluate. Returns `None` when the snippet does not parse to an assignment with
+/// a value (a fail-loud signal for the caller).
+fn override_value_node(cst: &m1_core::Cst) -> Option<m1_core::Node<'_>> {
+    use m1_core::{Field, Kind};
+    cst.root()
+        .children()
+        .into_iter()
+        .find(|c| c.kind() == Kind::AssignmentStatement)
+        .and_then(|stmt| stmt.child_by_field(Field::Value))
+}
+
 /// Topologically order `nodes` by the `edges` (`from` must precede `to`) using
 /// Kahn's algorithm. Ties break by name for determinism. A cycle leaves some
 /// nodes unscheduled; those are appended in sorted order so the run still covers
@@ -812,8 +1132,7 @@ fn topo_order(nodes: &BTreeSet<String>, edges: &[(String, String)]) -> Vec<Strin
 mod tests {
     use super::*;
     use crate::loader::load;
-    use crate::scenario::Scenario;
-    use crate::value::Value;
+    use crate::scenario::{InputKind, Scenario};
     use std::path::Path;
 
     fn mini() -> Loaded {
@@ -1355,11 +1674,11 @@ base_rate_hz = 100.0
 
     #[test]
     fn downstream_cone_of_a_leaf_with_no_reader_fails_loud() {
-        // Out is a leaf: no function in the project reads it, so overriding it has
-        // nothing downstream to recompute. That is a user error worth surfacing —
-        // fail loud rather than return an empty (silently no-op) cone.
+        // Result is a leaf: no function in the project reads it, so overriding it
+        // has nothing downstream to recompute. That is a user error worth surfacing
+        // — fail loud rather than return an empty (silently no-op) cone.
         let loaded = counterfactual();
-        match build_downstream_cone(&loaded, &["Root.CF.Out".to_string()]) {
+        match build_downstream_cone(&loaded, &["Root.CF.Result".to_string()]) {
             Err(EvalError::UnresolvedSymbol { .. }) => {}
             Err(other) => panic!("expected UnresolvedSymbol for a no-reader override, got {other:?}"),
             Ok(cone) => panic!(
@@ -1385,5 +1704,200 @@ base_rate_hz = 100.0
             cone_fn_symbols(&cone),
             vec!["Root.CF.A".to_string(), "Root.CF.B".to_string()],
         );
+    }
+
+    // ---- P3-B Task 6: counterfactual run (log ground truth + cone recompute) ----
+
+    use crate::log::LogMeta;
+
+    /// A synthetic [`Log`] over the counterfactual fixture whose `Sensor`/`Mid`/
+    /// `Result`/`Other` series are *mutually consistent*: `Mid = Sensor*2`,
+    /// `Result = Mid+1`, `Other = 42`. `Sensor` ramps 10 → 20 → 30 across three
+    /// keyframes so a downstream recompute is observably different from the logged
+    /// pass-through. This is the ground truth a counterfactual replays against.
+    fn consistent_log() -> Log {
+        let series = |channel: &str, vals: &[f64]| InputSeries {
+            channel: channel.to_string(),
+            kind: InputKind::Series(
+                vals.iter()
+                    .enumerate()
+                    .map(|(i, v)| (i as f64 * 0.01, Value::Float(*v)))
+                    .collect(),
+            ),
+        };
+        let sensor = [10.0, 20.0, 30.0];
+        let mid: Vec<f64> = sensor.iter().map(|s| s * 2.0).collect();
+        let result: Vec<f64> = mid.iter().map(|m| m + 1.0).collect();
+        let channels = vec![
+            series("Root.CF.Sensor", &sensor),
+            series("Root.CF.Mid", &mid),
+            series("Root.CF.Result", &result),
+            series("Root.CF.Other", &[42.0, 42.0, 42.0]),
+        ];
+        let channel_count = channels.len();
+        Log {
+            channels,
+            meta: LogMeta {
+                source: "synthetic-consistent".to_string(),
+                duration_s: 0.02,
+                channel_count,
+                units: BTreeMap::new(),
+            },
+        }
+    }
+
+    fn floats(trace: &Trace, channel: &str) -> Vec<f64> {
+        trace
+            .channels
+            .get(channel)
+            .unwrap_or_else(|| panic!("channel {channel:?} present"))
+            .iter()
+            .map(|v| match v {
+                Value::Float(x) => *x,
+                other => panic!("expected float in {channel:?}, got {other:?}"),
+            })
+            .collect()
+    }
+
+    #[test]
+    fn counterfactual_const_override_recomputes_cone_and_holds_the_rest() {
+        // Override Sensor to a constant 100. Its downstream cone is [A, B], so
+        // Mid (= Sensor*2) and Result (= Mid+1) recompute from the overridden
+        // Sensor; the unrelated Other and every non-cone logged channel pass
+        // through at their logged values.
+        let loaded = counterfactual();
+        let log = consistent_log();
+        let overrides = vec![Override::parse("Root.CF.Sensor=100.0").expect("parses")];
+        let cfg = CounterfactualCfg {
+            base_rate_hz: 100.0,
+            duration_s: 0.03,
+        };
+        let trace = run_counterfactual(&loaded, &log, &overrides, &cfg).expect("cf runs");
+
+        // (a) the time grid matches the requested duration at the base rate.
+        assert_eq!(trace.time.len(), 3, "0.03 s @ 100 Hz = 3 ticks");
+
+        // (b) Mid and Result are recomputed from the OVERRIDDEN Sensor (100), not
+        //     the logged Mid/Result: Mid = 100*2 = 200, Result = 200+1 = 201 every
+        //     tick — proving the cone recomputes from the override, not the log.
+        assert_eq!(floats(&trace, "Root.CF.Sensor"), vec![100.0, 100.0, 100.0]);
+        assert_eq!(floats(&trace, "Root.CF.Mid"), vec![200.0, 200.0, 200.0]);
+        assert_eq!(floats(&trace, "Root.CF.Result"), vec![201.0, 201.0, 201.0]);
+
+        // (c) Other is unrelated to the override cone: it passes through at its
+        //     logged value (42) — C never runs in the cone.
+        assert_eq!(floats(&trace, "Root.CF.Other"), vec![42.0, 42.0, 42.0]);
+    }
+
+    #[test]
+    fn counterfactual_no_op_const_reproduces_the_logged_cone() {
+        // Pinning Sensor to its first logged value (10) with a consistent log: the
+        // cone recomputes Mid/Result from 10, matching the first logged keyframe.
+        // The load-bearing no-op invariant is exercised in full at the integration
+        // level (Task 9); here we sanity-check that a constant equal to the logged
+        // value reproduces the logged downstream series for the held region.
+        let loaded = counterfactual();
+        let log = consistent_log();
+        // Override Sensor to a constant 10 (its t=0 logged value).
+        let overrides = vec![Override::parse("Root.CF.Sensor=10.0").expect("parses")];
+        let cfg = CounterfactualCfg {
+            base_rate_hz: 100.0,
+            duration_s: 0.01,
+        };
+        let trace = run_counterfactual(&loaded, &log, &overrides, &cfg).expect("cf runs");
+        // At t=0 the logged Sensor is 10, so Mid=20, Result=21 — the logged values.
+        assert_eq!(floats(&trace, "Root.CF.Mid"), vec![20.0]);
+        assert_eq!(floats(&trace, "Root.CF.Result"), vec![21.0]);
+    }
+
+    #[test]
+    fn counterfactual_seeds_non_cone_channels_from_the_log() {
+        // Override the intermediate Mid: its cone is just [B] (Result = Mid+1).
+        // With Mid pinned to 7, Result = 8. Sensor (upstream of the override, NOT
+        // in the cone) and Other both pass through at their logged values — proving
+        // every non-cone logged channel is seeded as ground truth.
+        let loaded = counterfactual();
+        let log = consistent_log();
+        let overrides = vec![Override::parse("Root.CF.Mid=7.0").expect("parses")];
+        let cfg = CounterfactualCfg {
+            base_rate_hz: 100.0,
+            duration_s: 0.01,
+        };
+        let trace = run_counterfactual(&loaded, &log, &overrides, &cfg).expect("cf runs");
+        // Result recomputed from the overridden Mid.
+        assert_eq!(floats(&trace, "Root.CF.Result"), vec![8.0]);
+        // Mid holds the override; Sensor and Other hold their logged t=0 values.
+        assert_eq!(floats(&trace, "Root.CF.Mid"), vec![7.0]);
+        assert_eq!(floats(&trace, "Root.CF.Sensor"), vec![10.0]);
+        assert_eq!(floats(&trace, "Root.CF.Other"), vec![42.0]);
+    }
+
+    #[test]
+    fn counterfactual_default_duration_is_the_log_duration() {
+        // With duration_s = 0 (the "auto" sentinel) the run spans the log's own
+        // duration (0.02 s here -> at 100 Hz, ticks at t = 0.00 and 0.01, i.e. the
+        // half-open [0, 0.02) interval = 2 ticks).
+        let loaded = counterfactual();
+        let log = consistent_log();
+        let overrides = vec![Override::parse("Root.CF.Sensor=5").expect("parses")];
+        let cfg = CounterfactualCfg {
+            base_rate_hz: 100.0,
+            duration_s: 0.0,
+        };
+        let trace = run_counterfactual(&loaded, &log, &overrides, &cfg).expect("cf runs");
+        assert_eq!(trace.time.len(), 2, "default duration = log.duration_s (0.02)");
+    }
+
+    #[test]
+    fn counterfactual_no_reader_override_fails_loud() {
+        // Overriding a leaf channel nothing reads (Result) has no downstream cone
+        // to recompute — the override would have no effect. Fail loud (mirrors the
+        // build_downstream_cone fail-loud).
+        let loaded = counterfactual();
+        let log = consistent_log();
+        let overrides = vec![Override::parse("Root.CF.Result=999.0").expect("parses")];
+        let cfg = CounterfactualCfg {
+            base_rate_hz: 100.0,
+            duration_s: 0.01,
+        };
+        match run_counterfactual(&loaded, &log, &overrides, &cfg) {
+            Err(EvalError::UnresolvedSymbol { .. }) => {}
+            other => panic!("expected fail-loud for a no-reader override, got {other:?}"),
+        }
+    }
+
+    #[test]
+    fn counterfactual_expr_override_reads_the_logged_value() {
+        // An expression override `Sensor = Sensor * 1.05` reads the LOGGED Sensor at
+        // each tick (seeded just before the override is applied), not a circular
+        // reference to the override in progress. At t=0 the logged Sensor is 10, so
+        // the override pins Sensor = 10.5; the cone recomputes Mid = 21, Result = 22.
+        let loaded = counterfactual();
+        let log = consistent_log();
+        let overrides = vec![Override::parse("Root.CF.Sensor=Root.CF.Sensor * 1.05").expect("parses")];
+        let cfg = CounterfactualCfg {
+            base_rate_hz: 100.0,
+            duration_s: 0.01,
+        };
+        let trace = run_counterfactual(&loaded, &log, &overrides, &cfg).expect("expr cf runs");
+        assert_eq!(floats(&trace, "Root.CF.Sensor"), vec![10.5]);
+        assert_eq!(floats(&trace, "Root.CF.Mid"), vec![21.0]);
+        assert_eq!(floats(&trace, "Root.CF.Result"), vec![22.0]);
+    }
+
+    #[test]
+    fn counterfactual_is_deterministic() {
+        // Same log + same overrides -> identical trace (no wall-clock, no RNG).
+        let loaded = counterfactual();
+        let log = consistent_log();
+        let overrides = vec![Override::parse("Root.CF.Sensor=12.5").expect("parses")];
+        let cfg = CounterfactualCfg {
+            base_rate_hz: 100.0,
+            duration_s: 0.03,
+        };
+        let a = run_counterfactual(&loaded, &log, &overrides, &cfg).expect("run a");
+        let b = run_counterfactual(&loaded, &log, &overrides, &cfg).expect("run b");
+        assert_eq!(a.time, b.time);
+        assert_eq!(a.channels, b.channels);
     }
 }

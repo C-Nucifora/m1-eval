@@ -20,11 +20,12 @@
 //! # Ok::<(), m1_eval::EvalError>(())
 //! ```
 
+use crate::counterfactual::Override;
 use crate::coverage::CoverageReport;
 use crate::error::EvalError;
 use crate::loader::{Loaded, load};
 use crate::log::Log;
-use crate::runner::run as run_scenario;
+use crate::runner::{CounterfactualCfg, run as run_scenario, run_counterfactual};
 use crate::scenario::Scenario;
 use crate::trace::Trace;
 use std::path::Path;
@@ -44,6 +45,9 @@ pub struct Engine {
     /// `None` until a log is loaded; a subsequent counterfactual run uses it as the
     /// baseline every logged channel is held at.
     log: Option<Log>,
+    /// Accumulated channel overrides ([`Engine::override_channel`]), layered over
+    /// the log in a [`Engine::run_counterfactual`]. Empty until the first override.
+    overrides: Vec<Override>,
 }
 
 impl Engine {
@@ -55,7 +59,11 @@ impl Engine {
     /// counterfactual log starts unset (`log: None`).
     pub fn load(project: &Path, cfg: Option<&Path>) -> Result<Engine, EvalError> {
         let loaded = load(project, cfg)?;
-        Ok(Engine { loaded, log: None })
+        Ok(Engine {
+            loaded,
+            log: None,
+            overrides: Vec::new(),
+        })
     }
 
     /// Attach a recorded run as the counterfactual ground-truth baseline.
@@ -135,6 +143,67 @@ impl Engine {
     /// [`Engine::load_log`]. `None` until a log is attached.
     pub fn log(&self) -> Option<&Log> {
         self.log.as_ref()
+    }
+
+    /// Register a counterfactual channel override from a `CH=value-or-expression`
+    /// spec (see [`Override::parse`]). Overrides accumulate; each one replaces a
+    /// logged channel with a constant or an expression before the downstream cone
+    /// recomputes. Call repeatedly to override several channels. Fails loud on a
+    /// malformed spec (no `=`, empty channel, empty right-hand side).
+    pub fn override_channel(&mut self, spec: &str) -> Result<(), EvalError> {
+        let ov = Override::parse(spec)?;
+        self.overrides.push(ov);
+        Ok(())
+    }
+
+    /// Run the counterfactual replay: hold every logged channel at its logged value
+    /// (ground truth), layer the accumulated [`Engine::override_channel`] overrides,
+    /// and recompute only the downstream dependency cone of the overridden channels.
+    /// Returns the resulting [`Trace`].
+    ///
+    /// Source precedence is calibration < log < override. Requires a log to have
+    /// been attached with [`Engine::load_log`] first; without one there is no ground
+    /// truth to replay, which fails loud. The base tick rate defaults to the
+    /// project's fastest scheduled call rate (or 100 Hz when the project schedules
+    /// nothing periodically); the duration defaults to the log's own duration.
+    /// Deterministic: the same log and overrides always yield the same trace.
+    ///
+    /// (Milestone P3-C wraps this in a `Counterfactual { trace, diff }`; this
+    /// milestone returns the bare [`Trace`].)
+    pub fn run_counterfactual(&self) -> Result<Trace, EvalError> {
+        let log = self.log.as_ref().ok_or_else(|| EvalError::MissingInput {
+            channel: "counterfactual run needs a log: call load_log first".to_string(),
+        })?;
+        let cfg = CounterfactualCfg {
+            base_rate_hz: self.default_counterfactual_rate(),
+            // 0.0 = "auto" -> the runner uses the log's own duration.
+            duration_s: 0.0,
+        };
+        run_counterfactual(&self.loaded, log, &self.overrides, &cfg)
+    }
+
+    /// The default base tick rate for a counterfactual run: the project's fastest
+    /// periodic call rate, or 100 Hz when no function schedules periodically (so a
+    /// project of purely event/startup functions still grids at a sane rate). A
+    /// counterfactual recomputes only the override cone, but the grid rate governs
+    /// stateful-operator `dt`, so a project-derived default is the faithful choice.
+    fn default_counterfactual_rate(&self) -> f64 {
+        self.loaded
+            .scripts
+            .iter()
+            .filter_map(|script| {
+                let fn_symbol = self
+                    .loaded
+                    .project
+                    .function_symbol_for_script(&script.name)?;
+                self.loaded
+                    .project
+                    .symbols()
+                    .get(&fn_symbol)
+                    .and_then(|s| s.call_rate_hz)
+            })
+            .fold(None::<f64>, |acc, r| Some(acc.map_or(r, |m| m.max(r))))
+            .unwrap_or(100.0)
     }
 
     /// Evaluate a scenario, producing a [`Trace`] of channel/expression values
@@ -363,5 +432,74 @@ const = 6.0
             other => panic!("expected fail-loud `.ld`-without-feature error, got {other:?}"),
         }
         assert!(engine.log().is_none());
+    }
+
+    // ---- P3-B Task 6: counterfactual orchestration through the engine ----
+
+    /// An engine over the counterfactual fixture (Sensor → A → Mid → B → Result,
+    /// plus the unrelated C → Other).
+    fn cf_engine() -> Engine {
+        let dir = Path::new(env!("CARGO_MANIFEST_DIR")).join("tests/fixtures/counterfactual");
+        Engine::load(&dir.join("Project.m1prj"), None).expect("counterfactual fixture loads")
+    }
+
+    /// A synthetic, mutually-consistent counterfactual log CSV: `Mid = Sensor*2`,
+    /// `Result = Mid+1`, `Other = 42`, with Sensor ramping 10 → 20 → 30.
+    const CF_LOG_CSV: &str = "time,Root.CF.Sensor,Root.CF.Mid,Root.CF.Result,Root.CF.Other\n\
+                              0.00,10,20,21,42\n\
+                              0.01,20,40,41,42\n\
+                              0.02,30,60,61,42\n";
+
+    #[test]
+    fn override_channel_accumulates_and_runs_the_cone() {
+        // Attach the log, override Sensor to 100, and run the counterfactual through
+        // the engine. The override's cone [A, B] recomputes Mid (= 200) and Result
+        // (= 201); the unrelated Other holds its logged value 42.
+        let mut engine = cf_engine();
+        let (_dir, path) = temp_log("csv", CF_LOG_CSV);
+        engine.load_log(&path).expect("log attaches");
+        engine.override_channel("Root.CF.Sensor=100.0").expect("override parses");
+
+        let trace = engine.run_counterfactual().expect("counterfactual runs");
+        // Default duration = log duration (0.02 s) at the fallback 100 Hz base =
+        // ticks at t = 0.00, 0.01 (the half-open [0, 0.02) interval) = 2 ticks.
+        assert_eq!(trace.time.len(), 2);
+        let mid = trace.channels.get("Root.CF.Mid").expect("Mid column");
+        let result = trace.channels.get("Root.CF.Result").expect("Result column");
+        let other = trace.channels.get("Root.CF.Other").expect("Other column");
+        assert!(mid.iter().all(|v| *v == Value::Float(200.0)), "{mid:?}");
+        assert!(result.iter().all(|v| *v == Value::Float(201.0)), "{result:?}");
+        // Other is unrelated to the override: it passes through at its logged value.
+        assert!(other.iter().all(|v| *v == Value::Float(42.0)), "{other:?}");
+    }
+
+    #[test]
+    fn run_counterfactual_without_a_log_fails_loud() {
+        // No log attached: there is no ground truth to replay against — fail loud
+        // rather than silently producing an empty or guessed trace.
+        let engine = cf_engine();
+        match engine.run_counterfactual() {
+            Err(EvalError::MissingInput { .. }) => {}
+            other => panic!("expected MissingInput without a log, got {other:?}"),
+        }
+    }
+
+    #[test]
+    fn override_channel_malformed_spec_fails_loud() {
+        // A spec with no `=` is a malformed override — fail loud, accumulate nothing.
+        let mut engine = cf_engine();
+        match engine.override_channel("no-equals-here") {
+            Err(EvalError::UnsupportedConstruct { .. }) => {}
+            other => panic!("expected UnsupportedConstruct for a malformed spec, got {other:?}"),
+        }
+    }
+
+    #[test]
+    fn run_counterfactual_signature_uses_only_crate_types() {
+        // A compile-level assertion that the counterfactual surface takes/returns
+        // only m1-eval types — a toolchain type leaking in would fail to compile.
+        fn _accepts(engine: &Engine) -> Result<Trace, EvalError> {
+            engine.run_counterfactual()
+        }
     }
 }
