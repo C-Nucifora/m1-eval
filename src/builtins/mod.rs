@@ -120,16 +120,31 @@ fn dispatch_object_method(
     object: &str,
     method: &str,
     args: &[Value],
-    site: CallSite,
+    _site: CallSite,
     ctx: &mut EvalCtx,
 ) -> Result<Value, EvalError> {
-    // The Timer object methods (Start/Stop/Reset/Remaining) are stateful — route
-    // them to the stateful engine, which keys the countdown by `site` (one timer
-    // per textual occurrence of the object in this Phase-1 cone model).
-    if let Some(v) = stateful::timer(method, args, site, ctx)? {
+    // The Timer object methods (Start/Stop/Reset/Remaining) are stateful and must
+    // share one countdown across all of an object's method calls — so key the
+    // state by the object *path*, not the individual call site. A canonical path
+    // is preferred (so `This.MyTimer` and `Root.Demo.MyTimer` address the same
+    // timer); fall back to the source spelling if the object does not resolve.
+    let object_key = timer_object_key(object, ctx);
+    if let Some(v) = stateful::timer(method, args, object_key, ctx)? {
         return Ok(v);
     }
     Err(unsupported(object, method))
+}
+
+/// The state key for a Timer object: a [`CallSite`] whose script slot is the
+/// object's canonical path (offset 0), so every method call on the same Timer
+/// shares one countdown. Resolves the object spelling against the project for
+/// path stability; falls back to the raw spelling when unresolved.
+fn timer_object_key(object: &str, ctx: &EvalCtx) -> CallSite {
+    let canon = match classify(object, ctx.group, ctx.fn_symbol, ctx.project, &ctx.env.locals) {
+        Target::Symbol(path) => path,
+        _ => object.to_string(),
+    };
+    CallSite::new(canon, 0)
 }
 
 /// Attempt a table `.Lookup()`. Returns `Ok(Some(value))` when `object` resolves
@@ -348,14 +363,47 @@ mod tests {
     }
 
     #[test]
-    fn stateful_calculate_method_is_unsupported_until_m6() {
+    fn stateful_calculate_method_dispatches_to_state_engine() {
         let mut h = Harness::new();
-        // Calculate.Stable exists in intrinsics (arity 2) but is stateful: not
-        // implemented in M5, so it must fail loud, not no-op.
+        // Calculate.Stable (arity 2) is a stateful predicate: M6 routes it to the
+        // state engine. Its first tick has not yet been stable, so it is false —
+        // a real evaluated value, not a fail-loud error.
         match h.call("Calculate", "Stable", &[Value::Float(1.0), Value::Float(0.1)]) {
+            Ok(Value::Bool(false)) => {}
+            other => panic!("expected Ok(Bool(false)) on first tick, got {other:?}"),
+        }
+    }
+
+    #[test]
+    fn filter_first_order_dispatches_to_state_engine() {
+        let mut h = Harness::new();
+        // A stateful library object routes through dispatch with arity validation;
+        // the first tick of FirstOrder seeds to the input (1.0).
+        match h.call("Filter", "FirstOrder", &[Value::Float(1.0), Value::Float(0.1)]) {
+            Ok(Value::Float(x)) => assert!((x - 1.0).abs() < 1e-9),
+            other => panic!("expected seeded Float(1.0), got {other:?}"),
+        }
+    }
+
+    #[test]
+    fn stateful_wrong_arity_is_bad_call() {
+        let mut h = Harness::new();
+        // Integral.Normal needs five arguments; fewer is a BadCall, not a guess.
+        match h.call("Integral", "Normal", &[Value::Float(1.0)]) {
+            Err(EvalError::BadCall { .. }) => {}
+            other => panic!("expected BadCall, got {other:?}"),
+        }
+    }
+
+    #[test]
+    fn unimplemented_stateful_method_fails_loud() {
+        let mut h = Harness::new();
+        // Delay.Signal15 is a buffered sample delay we do not implement; the
+        // object is recognised but the method falls through to fail loud.
+        match h.call("Delay", "Signal15", &[Value::Float(1.0), Value::Int(3)]) {
             Err(EvalError::UnsupportedBuiltin { object, method }) => {
-                assert_eq!(object, "Calculate");
-                assert_eq!(method, "Stable");
+                assert_eq!(object, "Delay");
+                assert_eq!(method, "Signal15");
             }
             other => panic!("expected UnsupportedBuiltin, got {other:?}"),
         }
