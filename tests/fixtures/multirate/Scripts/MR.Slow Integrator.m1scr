@@ -1,0 +1,5 @@
+// Synthetic m1-eval multirate fixture. No proprietary content.
+// 50 Hz: trapezoidally integrates Seed into Slow Total. The whole-project
+// scheduler must hand this function its OWN period as dt (0.02 s), not the
+// 100 Hz base dt (0.01 s), so the accumulation is rate-correct.
+Slow Total = Integral.Normal(Seed, -1000000.0, 1000000.0, false, 0.0);

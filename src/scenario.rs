@@ -278,6 +278,11 @@ struct RawScenario {
     #[serde(default)]
     target: Option<String>,
     duration_s: f64,
+    /// Base tick rate in Hz. Optional: when omitted (or `0`) in `whole-project`
+    /// mode the runner uses the fastest scheduled rate as the base tick. The
+    /// `function`/`cone` modes still require a positive value (they have no
+    /// schedule to derive a default from).
+    #[serde(default)]
     base_rate_hz: f64,
     #[serde(default)]
     inputs: Vec<RawInput>,
@@ -342,9 +347,22 @@ impl RawScenario {
                 });
             }
         };
-        if self.base_rate_hz <= 0.0 {
+        // `whole-project` accepts a missing/zero base rate (the runner defaults
+        // it to the fastest scheduled rate). Every other mode needs an explicit
+        // positive base tick — there is no schedule to derive one from. A
+        // negative rate is always invalid.
+        if self.base_rate_hz < 0.0 {
             return Err(EvalError::UnsupportedConstruct {
-                kind: format!("base_rate_hz must be positive, got {}", self.base_rate_hz),
+                kind: format!("base_rate_hz must be non-negative, got {}", self.base_rate_hz),
+                at: 0,
+            });
+        }
+        if self.base_rate_hz == 0.0 && !matches!(mode, RunMode::WholeProject) {
+            return Err(EvalError::UnsupportedConstruct {
+                kind: format!(
+                    "base_rate_hz must be positive for {:?} mode (only whole-project may omit it)",
+                    self.mode
+                ),
                 at: 0,
             });
         }
@@ -546,6 +564,35 @@ const = 20.0
         assert_eq!(sc.duration_s, 1.0);
         assert_eq!(sc.base_rate_hz, 100.0);
         assert_eq!(sc.inputs.len(), 1);
+    }
+
+    #[test]
+    fn whole_project_mode_parses_without_base_rate() {
+        // Whole-project mode may omit `base_rate_hz` entirely: the runner then
+        // defaults the base tick to the fastest scheduled rate. The parsed
+        // scenario carries 0.0 as the "auto" sentinel.
+        let toml = r#"
+mode = "whole-project"
+duration_s = 0.5
+"#;
+        let sc = Scenario::from_toml_str(toml).expect("whole-project parses without base rate");
+        assert_eq!(sc.mode, RunMode::WholeProject);
+        assert_eq!(sc.base_rate_hz, 0.0, "0.0 is the auto-base sentinel");
+    }
+
+    #[test]
+    fn function_mode_without_base_rate_fails_loud() {
+        // Only whole-project may omit the base rate; function/cone modes have no
+        // schedule to derive a default from, so omitting it fails loud.
+        let toml = r#"
+mode = "function"
+target = "F"
+duration_s = 0.5
+"#;
+        assert!(
+            Scenario::from_toml_str(toml).is_err(),
+            "function mode requires an explicit base_rate_hz"
+        );
     }
 
     #[test]

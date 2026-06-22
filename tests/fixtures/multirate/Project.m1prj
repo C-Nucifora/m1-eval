@@ -12,6 +12,9 @@
 <!--     Root.MR.Slow Writer   writes  Root.MR.Slow Out (= Seed * 2)       -->
 <!--       (Fast Writer reads Slow Out across rates: stale-tolerant, no    -->
 <!--        cross-rate edge is added)                                      -->
+<!--     Root.MR.Slow Integrator integrates Seed into Slow Total at 50 Hz; -->
+<!--       its stateful Integral.Normal must accumulate with dt = 0.02     -->
+<!--       (its own period), NOT the 0.01 base dt                          -->
 <!--                                                                       -->
 <!--   Startup (no rate):                                                  -->
 <!--     Root.MR.Init          On Startup -> call_rate_hz = None, excluded -->
@@ -26,11 +29,16 @@
 
    <Component Classname="BuiltIn.Channel" Name="Root.MR.Seed"><Props Type="f32"/></Component>
    <Component Classname="BuiltIn.Channel" Name="Root.MR.Slow Out"><Props Type="f32"/></Component>
+   <Component Classname="BuiltIn.Channel" Name="Root.MR.Slow Echo"><Props Type="f32"/></Component>
+   <Component Classname="BuiltIn.Channel" Name="Root.MR.Slow Total"><Props Type="f32"/></Component>
    <Component Classname="BuiltIn.Channel" Name="Root.MR.Fast Shared"><Props Type="f32"/></Component>
    <Component Classname="BuiltIn.Channel" Name="Root.MR.Fast Out"><Props Type="f32"/></Component>
    <Component Classname="BuiltIn.Channel" Name="Root.MR.Started"><Props Type="f32"/></Component>
 
    <Component Classname="BuiltIn.FuncUser" Filename="MR.Slow Writer.m1scr" Name="Root.MR.Slow Writer">
+    <Props SelectedTrigger="Root.Events.On 50Hz"/>
+   </Component>
+   <Component Classname="BuiltIn.FuncUser" Filename="MR.Slow Integrator.m1scr" Name="Root.MR.Slow Integrator">
     <Props SelectedTrigger="Root.Events.On 50Hz"/>
    </Component>
    <Component Classname="BuiltIn.FuncUser" Filename="MR.Fast Writer.m1scr" Name="Root.MR.Fast Writer">

@@ -1,4 +1,7 @@
 // Synthetic m1-eval multirate fixture. No proprietary content.
 // 50 Hz: writes Slow Out = Seed * 2. The 100 Hz Fast Writer reads Slow Out
 // across rates (stale-tolerant: no cross-rate dependency edge is added).
+// Also writes Slow Echo (= Seed * 2) which NOTHING reads — a clean probe for
+// the zero-order-hold test (no cross-rate first-tick read to seed).
 Slow Out = Seed * 2.0;
+Slow Echo = Seed * 2.0;

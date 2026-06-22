@@ -2,27 +2,41 @@
 //! The runners: the deterministic tick loops that drive a [`Scenario`] over a
 //! [`Loaded`] project and produce a [`Trace`].
 //!
-//! Two runners share one core tick loop:
+//! Three runners share one core, **rate-gated** tick loop:
 //!
 //! - **single-function** ([`RunMode::Function`]): one chosen function executes
 //!   each tick;
 //! - **dependency-cone** ([`RunMode::Cone`]): the target channel's upstream cone
-//!   of functions executes each tick, in topological (writer-before-reader) order.
+//!   of functions executes each tick, in topological (writer-before-reader) order;
+//! - **whole-project** ([`RunMode::WholeProject`]): every periodically-scheduled
+//!   function executes at its **own** rate, in dependency-then-rate order — the
+//!   faithful mini-ECU.
 //!
-//! Every tick `i` runs at instant `t = i / base_rate_hz`, with a fixed step
-//! `dt = 1 / base_rate_hz`. The loop, in order, each tick:
+//! The grid advances at `base_rate_hz` (tick step `1 / base_rate_hz`). For the
+//! single-function and cone runners every function shares that base rate, so it
+//! runs every tick with the base step. For the whole-project runner each function
+//! runs only on the base ticks its **rate divisor** (`round(base / rate)`) selects
+//! and is stepped by its **own** period (`dt = 1 / rate`), so a 50 Hz function on
+//! a 100 Hz base runs every other tick and integrates with `dt = 0.02`. Functions
+//! not run on a tick hold their last-written channels (zero-order hold). When the
+//! whole-project scenario pins no `base_rate_hz`, the base defaults to the fastest
+//! scheduled rate.
+//!
+//! The loop, in order, each tick:
 //!
 //! 1. seeds the value store from the scenario inputs (each resampled at `t`),
 //!    then layers the scenario overrides on top — both canonicalised to the
 //!    target function's scope so `Speed` and `Root.Demo.Speed` address one key;
 //! 2. opens the tick in the trace (extends the time axis);
-//! 3. executes the scheduled function(s) through [`crate::stmt::exec_script`];
-//! 4. records the run's externally-driven inputs and any unrecorded channel
-//!    values into the trace so each column stays aligned to the time axis.
+//! 3. executes each scheduled function whose divisor selects this tick, through
+//!    [`crate::stmt::exec_script`];
+//! 4. holds any scheduled-write channel a function did not run by repeating its
+//!    last value, then records the externally-driven inputs and any other
+//!    unrecorded channel values, so each column stays aligned to the time axis.
 //!
-//! Determinism: the grid and `dt` are fixed, inputs are pure functions of `t`,
-//! and there is no wall-clock or RNG — the same scenario always yields the same
-//! trace.
+//! Determinism: the grid and per-function `dt` are fixed, inputs are pure
+//! functions of `t`, and there is no wall-clock or RNG — the same scenario always
+//! yields the same trace.
 
 use crate::env::{Env, StateStore};
 use crate::error::EvalError;
@@ -55,24 +69,78 @@ struct Scheduled<'a> {
 pub fn run(loaded: &Loaded, scenario: &Scenario) -> Result<Trace, EvalError> {
     match &scenario.mode {
         RunMode::Function(name) => {
+            // A single function has no schedule rate of its own; it runs every
+            // base tick (divisor 1) with the base `dt`. Wrap it as a rated
+            // schedule at the scenario's base rate so the one generalised loop
+            // handles all three modes uniformly.
+            let base = require_base_rate(scenario)?;
             let scheduled = resolve_function(loaded, name)?;
-            tick_loop(loaded, scenario, &[scheduled])
+            let rated = vec![ScheduledRated {
+                sched: scheduled,
+                rate_hz: base,
+            }];
+            tick_loop(loaded, scenario, &rated, base)
         }
         RunMode::Cone(target) => {
+            let base = require_base_rate(scenario)?;
             let order = build_cone(loaded, target)?;
-            tick_loop(loaded, scenario, &order)
+            let rated: Vec<ScheduledRated> = order
+                .into_iter()
+                .map(|sched| ScheduledRated {
+                    sched,
+                    rate_hz: base,
+                })
+                .collect();
+            tick_loop(loaded, scenario, &rated, base)
         }
         RunMode::WholeProject => {
-            // Enumerate every periodically-scheduled function and order it
-            // dependency-then-rate. The rate-gated tick loop (per-function rate
-            // divisors + rate-correct `dt`) lands in P2-B (Task 13); for now the
-            // ordered schedule runs through the shared loop so the mode is
-            // functional and the ordering is exercised end-to-end.
+            // Enumerate every periodically-scheduled function, ordered
+            // dependency-then-rate, then drive the rate-gated tick loop: each
+            // function runs only on the base ticks its rate divisor selects, with
+            // its own period as `dt`.
             let ordered = build_whole_project_schedule(loaded);
-            let plain: Vec<Scheduled> = ordered.into_iter().map(|r| r.sched).collect();
-            tick_loop(loaded, scenario, &plain)
+            let base = resolve_base_rate(scenario, &ordered)?;
+            tick_loop(loaded, scenario, &ordered, base)
         }
     }
+}
+
+/// The base tick rate for a mode that pins one explicitly (`function`/`cone`).
+/// These modes carry no schedule to derive a default from, so a positive
+/// `base_rate_hz` is required (the scenario parser already enforces this; this is
+/// a defensive belt-and-braces check).
+fn require_base_rate(scenario: &Scenario) -> Result<f64, EvalError> {
+    if scenario.base_rate_hz > 0.0 {
+        Ok(scenario.base_rate_hz)
+    } else {
+        Err(EvalError::UnsupportedConstruct {
+            kind: format!(
+                "base_rate_hz must be positive, got {}",
+                scenario.base_rate_hz
+            ),
+            at: 0,
+        })
+    }
+}
+
+/// Resolve the whole-project base tick rate. When the scenario pins a positive
+/// `base_rate_hz` it is used verbatim; when it is absent (0.0, the "auto"
+/// sentinel) the base defaults to the **fastest** scheduled rate so every
+/// function divides the base cleanly and the fastest loop runs every tick. An
+/// empty schedule with no pinned base has no rate to derive — fail loud.
+fn resolve_base_rate(scenario: &Scenario, schedule: &[ScheduledRated]) -> Result<f64, EvalError> {
+    if scenario.base_rate_hz > 0.0 {
+        return Ok(scenario.base_rate_hz);
+    }
+    schedule
+        .iter()
+        .map(|r| r.rate_hz)
+        .fold(None::<f64>, |acc, r| Some(acc.map_or(r, |m| m.max(r))))
+        .ok_or_else(|| EvalError::UnsupportedConstruct {
+            kind: "whole-project run has no scheduled functions and no base_rate_hz to default from"
+                .to_string(),
+            at: 0,
+        })
 }
 
 /// One scheduled function together with its periodic execution rate in Hz, as
@@ -227,31 +295,63 @@ fn order_by_dependency_then_rate(loaded: &Loaded, rated: &mut Vec<ScheduledRated
     }
 }
 
-/// The shared deterministic tick loop over an ordered list of scheduled
-/// functions. Single-function mode passes one; cone mode passes the topological
-/// order. Each tick seeds inputs, runs each function in order, and records.
+/// The shared deterministic, **rate-gated** tick loop over an ordered list of
+/// rated scheduled functions.
+///
+/// The grid advances at `base_rate_hz` (tick step `1 / base_rate_hz`). Each
+/// scheduled function runs only on the base ticks its **rate divisor** selects —
+/// `divisor = round(base_rate_hz / rate_hz)` — and when it runs it is handed its
+/// **own** period as `dt = 1 / rate_hz`, the time elapsed since *its* last run,
+/// not the base step. So a 50 Hz function on a 100 Hz base runs every other tick
+/// and its stateful operators (e.g. `Integral.Normal`) integrate with `dt = 0.02`.
+///
+/// Functions not run on a given tick leave their last-written channels untouched
+/// in the shared [`Env`] — a zero-order hold — so the per-tick trace recording
+/// naturally repeats the held value until the function next runs.
+///
+/// Single-function and cone modes pass a schedule whose `rate_hz == base_rate_hz`
+/// (divisor 1, `dt` = the base step), so they fall through this loop unchanged.
 fn tick_loop(
     loaded: &Loaded,
     scenario: &Scenario,
-    schedule: &[Scheduled],
+    schedule: &[ScheduledRated],
+    base_rate_hz: f64,
 ) -> Result<Trace, EvalError> {
-    let dt = 1.0 / scenario.base_rate_hz;
-    let ticks = tick_count(scenario.duration_s, scenario.base_rate_hz);
+    let ticks = tick_count(scenario.duration_s, base_rate_hz);
+
+    // Precompute each function's rate divisor (how many base ticks between runs)
+    // and its per-run dt (its own period). `divisor` is at least 1 — a function
+    // whose rate exceeds the base still runs every tick rather than zero ticks.
+    let plans: Vec<RunPlan> = schedule
+        .iter()
+        .map(|r| {
+            let divisor = (base_rate_hz / r.rate_hz).round().max(1.0) as usize;
+            RunPlan {
+                divisor,
+                dt: 1.0 / r.rate_hz,
+            }
+        })
+        .collect();
 
     let mut env = Env::new();
     let mut state = StateStore::new();
     let mut trace = Trace::new();
 
+    // The union of every channel the schedule writes, computed once: on a tick a
+    // function holds (does not run), we repeat its last value from `env` for these
+    // channels so the trace stays a dense grid (zero-order hold).
+    let scheduled_writes = schedule_writes(loaded, schedule);
+
     // Canonicalise each scenario input/override channel once, against the first
     // scheduled function's scope (all scheduled functions share the project; the
     // group only affects relative names, and inputs are normally absolute).
-    let scope_group = schedule.first().and_then(|s| s.group.as_deref());
-    let scope_fn = schedule.first().and_then(|s| s.fn_symbol.as_deref());
+    let scope_group = schedule.first().and_then(|s| s.sched.group.as_deref());
+    let scope_fn = schedule.first().and_then(|s| s.sched.fn_symbol.as_deref());
     let inputs = canonicalise(&scenario.inputs, loaded, scope_group, scope_fn);
     let overrides = canonicalise(&scenario.overrides, loaded, scope_group, scope_fn);
 
     for i in 0..ticks {
-        let t = i as f64 / scenario.base_rate_hz;
+        let t = i as f64 / base_rate_hz;
 
         // 1. Seed inputs (resampled at t), then layer overrides on top.
         for (path, series) in &inputs {
@@ -264,8 +364,14 @@ fn tick_loop(
         // 2. Open the tick.
         trace.push_tick(t);
 
-        // 3. Run each scheduled function in order, sharing env/state.
-        for sched in schedule {
+        // 3. Run each scheduled function whose divisor selects this tick, in
+        //    dependency-then-rate order, sharing env/state. A function not run
+        //    holds its last-written channels in `env` (zero-order hold).
+        for (rated, plan) in schedule.iter().zip(plans.iter()) {
+            if i % plan.divisor != 0 {
+                continue;
+            }
+            let sched = &rated.sched;
             let root = sched.script.cst.root();
             let mut ctx = EvalCtx {
                 project: &loaded.project,
@@ -275,7 +381,7 @@ fn tick_loop(
                 group: sched.group.as_deref(),
                 fn_symbol: sched.fn_symbol.as_deref(),
                 script_name: &sched.script.name,
-                dt,
+                dt: plan.dt,
                 scripts: &loaded.scripts,
                 depth: 0,
                 trace: Some(&mut trace),
@@ -283,9 +389,11 @@ fn tick_loop(
             exec_script(&root, &mut ctx)?;
         }
 
-        // 4. Record the seeded inputs/overrides into the trace too, so they appear
-        //    as columns aligned to the time axis (the executor only records
-        //    assignment targets). Inputs are externally driven, so flag them.
+        // 4. Record any channel a scheduled function *holds* this tick (it did not
+        //    run, so the executor wrote nothing) by repeating its current env
+        //    value, plus the seeded inputs/overrides. This keeps every column
+        //    aligned to the time axis with the zero-order-hold value.
+        hold_unwritten_channels(&scheduled_writes, &env, &mut trace);
         for (path, series) in inputs.iter().chain(overrides.iter()) {
             // Only record if the executor did not already record this channel this
             // tick (assignment targets are recorded by the statement executor).
@@ -303,6 +411,51 @@ fn tick_loop(
     }
 
     Ok(trace)
+}
+
+/// One function's per-tick execution plan: how many base ticks between runs and
+/// the per-run time step (its own period).
+struct RunPlan {
+    /// `round(base_rate_hz / rate_hz)`, at least 1 — the function runs on every
+    /// base tick `i` where `i % divisor == 0`.
+    divisor: usize,
+    /// `1 / rate_hz` — the time since this function's previous run, handed to its
+    /// stateful operators so accumulation is rate-correct.
+    dt: f64,
+}
+
+/// The union of every channel any scheduled function writes (canonical paths),
+/// from each function's [`io_sets`]. Used to hold a function's output at its last
+/// value on the base ticks it does not run (zero-order hold).
+fn schedule_writes(loaded: &Loaded, schedule: &[ScheduledRated]) -> BTreeSet<String> {
+    let mut writes = BTreeSet::new();
+    for rated in schedule {
+        let io = io_sets(rated.sched.script, &loaded.project, rated.sched.group.as_deref());
+        for w in io.writes {
+            writes.insert(w);
+        }
+    }
+    writes
+}
+
+/// For each scheduled-write channel not already recorded this tick (because the
+/// owning function held rather than ran), repeat its current `env` value so the
+/// trace column stays aligned to the time axis. A channel with no env value yet
+/// (never written) is skipped — it simply has no column until first written.
+fn hold_unwritten_channels(writes: &BTreeSet<String>, env: &Env, trace: &mut Trace) {
+    for path in writes {
+        let already = trace
+            .channels
+            .get(path)
+            .map(|c| c.len() == trace.time.len())
+            .unwrap_or(false);
+        if already {
+            continue;
+        }
+        if let Some(v) = env.get(path).cloned() {
+            trace.record_channel(path.clone(), v);
+        }
+    }
 }
 
 /// The number of ticks spanning `[0, duration_s)` at `base_rate_hz`. A
@@ -524,9 +677,9 @@ mod tests {
 
     #[test]
     fn enumerate_scheduled_keeps_periodic_excludes_startup() {
-        // The multirate fixture has three periodic functions (one 50 Hz, two
+        // The multirate fixture has four periodic functions (two 50 Hz, two
         // 100 Hz) plus an On-Startup function whose call_rate_hz is None. The
-        // schedule must include exactly the three rated functions and exclude
+        // schedule must include exactly the four rated functions and exclude
         // the startup one.
         let loaded = multirate();
         let rated = enumerate_scheduled(&loaded);
@@ -536,8 +689,9 @@ mod tests {
             .map(|r| (r.sched.fn_symbol.clone().unwrap(), r.rate_hz))
             .collect();
 
-        assert_eq!(by_fn.len(), 3, "exactly three periodic functions: {by_fn:?}");
+        assert_eq!(by_fn.len(), 4, "exactly four periodic functions: {by_fn:?}");
         assert_eq!(by_fn.get("Root.MR.Slow Writer"), Some(&50.0));
+        assert_eq!(by_fn.get("Root.MR.Slow Integrator"), Some(&50.0));
         assert_eq!(by_fn.get("Root.MR.Fast Writer"), Some(&100.0));
         assert_eq!(by_fn.get("Root.MR.Fast Reader"), Some(&100.0));
         // The On-Startup function (call_rate_hz = None) is excluded entirely.
@@ -551,11 +705,11 @@ mod tests {
     fn enumerate_scheduled_is_rate_sorted_fastest_first() {
         // The deterministic baseline ordering is fastest-rate-first (the
         // dependency layer refines within a rate). So both 100 Hz functions
-        // precede the 50 Hz one.
+        // precede the two 50 Hz ones.
         let loaded = multirate();
         let rated = enumerate_scheduled(&loaded);
         let rates: Vec<f64> = rated.iter().map(|r| r.rate_hz).collect();
-        assert_eq!(rates, vec![100.0, 100.0, 50.0], "fastest-first baseline");
+        assert_eq!(rates, vec![100.0, 100.0, 50.0, 50.0], "fastest-first baseline");
     }
 
     #[test]
@@ -576,6 +730,9 @@ mod tests {
             vec![
                 "Root.MR.Fast Writer".to_string(),
                 "Root.MR.Fast Reader".to_string(),
+                // 50 Hz group: no inter-dependency, so name order — "Integrator"
+                // sorts before "Writer".
+                "Root.MR.Slow Integrator".to_string(),
                 "Root.MR.Slow Writer".to_string(),
             ],
             "writer-before-reader within rate, fastest group first: {order:?}"
@@ -650,6 +807,151 @@ const = 6.0
         let b = run(&loaded, &scenario).expect("run b");
         assert_eq!(a.time, b.time);
         assert_eq!(a.channels, b.channels);
+    }
+
+    #[test]
+    fn rate_gated_slow_function_updates_on_its_ticks_and_holds_between() {
+        // base_rate = 100 Hz. The 50 Hz Slow Writer has divisor 2, so it runs on
+        // even base ticks (0, 2, 4, …) and holds its outputs between. We observe
+        // `Slow Echo` (= Seed*2) — a channel nothing reads, so there is no
+        // cross-rate first-tick dependency to seed and the column shows the pure
+        // zero-order-hold. Drive Seed with a per-tick-distinct series so a fresh
+        // run produces a fresh value; the held ticks must repeat the previous
+        // run's value.
+        //
+        // Seed series (t in s): 0.00->1, 0.01->2, 0.02->3, 0.03->4, 0.04->5, …
+        // Slow Echo = Seed*2 computed only on even ticks:
+        //   tick 0 (t=0.00, Seed=1): Slow Echo = 2     (run)
+        //   tick 1 (t=0.01):         Slow Echo = 2     (held — NOT 4)
+        //   tick 2 (t=0.02, Seed=3): Slow Echo = 6     (run)
+        //   tick 3 (t=0.03):         Slow Echo = 6     (held — NOT 8)
+        //   tick 4 (t=0.04, Seed=5): Slow Echo = 10    (run)
+        //   tick 5 (t=0.05):         Slow Echo = 10    (held)
+        //
+        // `Slow Out` is seeded to its steady value so the cross-rate Fast Writer
+        // read on tick 0 succeeds (the schedule runs the fast group first); the
+        // seed is constant so it never masks the held-value check on Slow Echo.
+        let loaded = multirate();
+        let toml = r#"
+mode = "whole-project"
+duration_s = 0.06
+base_rate_hz = 100.0
+
+[[inputs]]
+channel = "Root.MR.Seed"
+series = [[0.0, 1.0], [0.01, 2.0], [0.02, 3.0], [0.03, 4.0], [0.04, 5.0], [0.05, 6.0]]
+
+[[inputs]]
+channel = "Root.MR.Slow Out"
+const = 2.0
+"#;
+        let scenario = Scenario::from_toml_str(toml).unwrap();
+        let trace = run(&loaded, &scenario).expect("rate-gated run succeeds");
+
+        assert_eq!(trace.time.len(), 6);
+        let slow = trace.channels.get("Root.MR.Slow Echo").expect("Slow Echo");
+        let got: Vec<f64> = slow
+            .iter()
+            .map(|v| match v {
+                Value::Float(x) => *x,
+                other => panic!("expected float, got {other:?}"),
+            })
+            .collect();
+        assert_eq!(
+            got,
+            vec![2.0, 2.0, 6.0, 6.0, 10.0, 10.0],
+            "50 Hz Slow Echo updates on even ticks and holds between"
+        );
+    }
+
+    #[test]
+    fn rate_gated_integral_accumulates_with_its_own_dt_not_base_dt() {
+        // The 50 Hz Slow Integrator integrates Seed (constant 2.0) into Slow Total.
+        // It runs once every 2 base ticks (divisor 2 at a 100 Hz base) and must
+        // accumulate with dt = 1/50 = 0.02 s — its OWN period — not the 0.01 base
+        // dt. Trapezoidal Integral.Normal with a constant rate r = 2.0 and dt:
+        //   run 0: 0
+        //   run 1: 0 + (2+2)/2 * dt = 2*dt
+        //   run k: 2*dt*k
+        // With the correct dt = 0.02 the accumulator advances by 0.04 each run; a
+        // bug that fed the base dt = 0.01 would advance by 0.02 (half) — the test
+        // distinguishes the two.
+        //
+        // Base ticks (100 Hz) over 0.12 s = 12 ticks. The integrator runs on the
+        // even ticks (0,2,4,6,8,10) = 6 runs, holding Slow Total between:
+        //   tick 0  run0: 0.00
+        //   tick 1  held: 0.00
+        //   tick 2  run1: 0.04
+        //   tick 3  held: 0.04
+        //   tick 4  run2: 0.08
+        //   tick 5  held: 0.08
+        //   tick 6  run3: 0.12
+        //   …
+        let loaded = multirate();
+        let toml = r#"
+mode = "whole-project"
+duration_s = 0.12
+base_rate_hz = 100.0
+
+[[inputs]]
+channel = "Root.MR.Seed"
+const = 2.0
+
+[[inputs]]
+channel = "Root.MR.Slow Out"
+const = 4.0
+"#;
+        let scenario = Scenario::from_toml_str(toml).unwrap();
+        let trace = run(&loaded, &scenario).expect("rate-gated integral run succeeds");
+
+        assert_eq!(trace.time.len(), 12);
+        let total = trace.channels.get("Root.MR.Slow Total").expect("Slow Total");
+        let got: Vec<f64> = total
+            .iter()
+            .map(|v| match v {
+                Value::Float(x) => *x,
+                other => panic!("expected float, got {other:?}"),
+            })
+            .collect();
+        let expected = [
+            0.00, 0.00, 0.04, 0.04, 0.08, 0.08, 0.12, 0.12, 0.16, 0.16, 0.20, 0.20,
+        ];
+        for (g, e) in got.iter().zip(expected.iter()) {
+            assert!(
+                (g - e).abs() < 1e-9,
+                "rate-correct dt=0.02 accumulation: got {got:?}, expected {expected:?}"
+            );
+        }
+    }
+
+    #[test]
+    fn base_rate_defaults_to_fastest_scheduled_rate_when_unset() {
+        // With base_rate_hz omitted (0.0 = "auto"), the whole-project runner uses
+        // the fastest scheduled rate (100 Hz here) as the base tick. So a 0.05 s
+        // run produces 5 ticks (not e.g. 2 or 3 at some slower default), the
+        // 100 Hz functions run every tick, and the 50 Hz ones run every other.
+        let loaded = multirate();
+        let toml = r#"
+mode = "whole-project"
+duration_s = 0.05
+
+[[inputs]]
+channel = "Root.MR.Seed"
+const = 3.0
+
+[[inputs]]
+channel = "Root.MR.Slow Out"
+const = 6.0
+"#;
+        let scenario = Scenario::from_toml_str(toml).unwrap();
+        let trace = run(&loaded, &scenario).expect("auto-base-rate run succeeds");
+
+        // 0.05 s at the auto base of 100 Hz = 5 ticks.
+        assert_eq!(trace.time.len(), 5, "auto base = fastest scheduled rate (100 Hz)");
+        // The fast group ran every tick: Slow Out = Seed*2 = 6 on the even ticks
+        // it ran; Fast Writer reads it (stale-tolerant) and writes Fast Shared.
+        let fast = trace.channels.get("Root.MR.Fast Out").expect("Fast Out");
+        assert_eq!(fast.len(), 5, "fast channel present every tick");
     }
 
     #[test]
