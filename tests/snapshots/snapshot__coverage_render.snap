@@ -1,0 +1,11 @@
+---
+source: tests/snapshot.rs
+expression: report.render()
+---
+Supported:
+  construct assignment_statement
+  construct local_declaration
+Stubbed:
+  (none)
+Unsupported:
+  (none)

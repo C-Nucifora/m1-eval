@@ -1,0 +1,5 @@
+---
+source: tests/snapshot.rs
+expression: trace.to_json()
+---
+{"time":[0,0.01,0.02],"channels":{"Root.Chain.Final":[50,50,50],"Root.Chain.Mid":[5,5,5],"Root.Chain.Raw":[4,4,4]},"external":["Root.Chain.Raw"]}
