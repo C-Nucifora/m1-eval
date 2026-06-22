@@ -593,7 +593,7 @@ fn eval_call(node: &Node, ctx: &mut EvalCtx) -> Result<Value, EvalError> {
 
     // The call site keys stateful operator state across ticks (M6): the script
     // name plus the byte offset of the whole call node.
-    let site = CallSite::new(ctx.script_name, node.byte_range().start);
+    let site = CallSite::of(ctx.script_name, node);
 
     // Evaluate the arguments left to right.
     let mut args = Vec::new();

@@ -26,6 +26,7 @@
 //! by the M6 stateful-builtin milestone; this module provides the keyed slot.
 
 use crate::value::Value;
+use m1_core::Node;
 use std::collections::HashMap;
 
 /// A stable identity for one stateful-operator occurrence in the source: the
@@ -39,6 +40,16 @@ impl CallSite {
     /// node's start. Centralised so callers do not hand-build the tuple.
     pub fn new(script: impl Into<String>, byte_offset: usize) -> CallSite {
         CallSite(script.into(), byte_offset)
+    }
+
+    /// The stable call-site identity of `node` in `script_name`: the script
+    /// basename plus the byte offset of the node's start. For a fixed parse this
+    /// is identical across every tick that re-evaluates the same node, so a
+    /// stateful operator (M6) keeps its per-occurrence state between ticks.
+    /// Identifiers may contain spaces, but a byte offset never does — this key is
+    /// whitespace-agnostic by construction.
+    pub fn of(script_name: &str, node: &Node) -> CallSite {
+        CallSite(script_name.to_string(), node.byte_range().start)
     }
 
     /// The script basename component.
@@ -241,5 +252,53 @@ mod tests {
         // Equality keys on both components.
         assert_eq!(site, CallSite("Demo.Update.m1scr".into(), 7));
         assert_ne!(site, CallSite("Demo.Update.m1scr".into(), 8));
+    }
+
+    #[test]
+    fn callsite_of_node_is_stable_across_evaluations() {
+        use m1_core::{Field, Kind, parse};
+
+        // A script with two distinct calls; locate each CallExpression node and
+        // derive its CallSite from the script name + byte offset.
+        let src = "a = Calculate.Max(1, 2);\nb = Calculate.Min(3, 4);\n";
+
+        // Helper: find the nth CallExpression node (depth-first) in a fresh parse.
+        fn nth_call(src: &str, n: usize) -> (usize, m1_core::Cst) {
+            let cst = parse(src);
+            let mut found = Vec::new();
+            let mut stack: Vec<m1_core::Node> = vec![cst.root()];
+            while let Some(node) = stack.pop() {
+                if node.kind() == Kind::CallExpression {
+                    found.push(node.byte_range().start);
+                }
+                // Push children; order does not matter, we sort offsets after.
+                for child in node.children() {
+                    stack.push(child);
+                }
+            }
+            found.sort_unstable();
+            (found[n], cst)
+        }
+
+        // The same parse evaluated twice yields the same call-site key.
+        let cst1 = parse(src);
+        let first_call = cst1
+            .root()
+            .children()
+            .into_iter()
+            .next()
+            .and_then(|stmt| stmt.child_by_field(Field::Value))
+            .expect("first assignment value is the call");
+        let site_a = CallSite::of("Demo.Update.m1scr", &first_call);
+        let site_b = CallSite::of("Demo.Update.m1scr", &first_call);
+        assert_eq!(site_a, site_b, "same node -> same key");
+
+        // The two distinct calls have distinct keys; a re-parse reproduces them.
+        let (off0, _c0) = nth_call(src, 0);
+        let (off1, _c1) = nth_call(src, 1);
+        assert_ne!(off0, off1, "two calls live at different offsets");
+        let (off0_again, _) = nth_call(src, 0);
+        assert_eq!(off0, off0_again, "byte offset is deterministic per parse");
+        assert_eq!(site_a.offset(), off0);
     }
 }
