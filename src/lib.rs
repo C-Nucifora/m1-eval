@@ -30,3 +30,6 @@ pub mod builtins;
 
 pub mod stmt;
 pub use stmt::{exec, exec_script};
+
+pub mod scenario;
+pub use scenario::{InputKind, InputSeries, RunMode, Scenario};
