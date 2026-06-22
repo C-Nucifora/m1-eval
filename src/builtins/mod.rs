@@ -56,10 +56,10 @@ pub fn dispatch(
 ) -> Result<Value, EvalError> {
     // 1. Table `.Lookup()` — the object is a project table symbol, not a library
     //    object. Classify it against the project; a Table + `Lookup` interpolates.
-    if method == "Lookup" {
-        if let Some(value) = try_table_lookup(object, args, ctx)? {
-            return Ok(value);
-        }
+    if method == "Lookup"
+        && let Some(value) = try_table_lookup(object, args, ctx)?
+    {
+        return Ok(value);
     }
 
     // 2. Pure library objects. Validate arity against the intrinsic signatures
@@ -71,10 +71,10 @@ pub fn dispatch(
             // A stateful `Calculate.*` method (Stable/Hysteresis/Between/Beyond)
             // is a time-domain operator, not a pure one: route it to the stateful
             // engine. The pure `Calculate.*` math stays in its own submodule.
-            if object == "Calculate" {
-                if let Some(v) = stateful::call(object, method, args, site.clone(), ctx)? {
-                    return Ok(v);
-                }
+            if object == "Calculate"
+                && let Some(v) = stateful::call(object, method, args, site.clone(), ctx)?
+            {
+                return Ok(v);
             }
             let result = match object {
                 "Calculate" => calculate::call(method, args)?,

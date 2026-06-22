@@ -167,10 +167,9 @@ fn first_order(args: &[Value], site: CallSite, ctx: &mut EvalCtx) -> Result<Valu
         _ => None,
     };
     // Seed to the input on the first tick or on reset; otherwise blend.
-    let y = if reset || prev.is_none() {
-        x
-    } else {
-        a0 * x + (1.0 - a0) * prev.unwrap()
+    let y = match prev {
+        Some(p) if !reset => a0 * x + (1.0 - a0) * p,
+        _ => x,
     };
     *slot = OpState::Filter { y };
     Ok(Value::Float(y))

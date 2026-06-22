@@ -155,6 +155,11 @@ pub struct Env {
     /// `static local` values, keyed by owning-function path + variable name.
     /// Persist across function entry/exit for the whole run.
     pub statics: HashMap<String, Value>,
+    /// Scenario-fed values for Tier-3 IO calls, keyed by the call spelling
+    /// `"Object.Method"` (e.g. `"CanComms.GetFloat"`). When a key is present the
+    /// IO stub returns it instead of a documented default — this is how a
+    /// scenario externally drives a hardware-backed builtin. Empty by default.
+    pub io_overrides: HashMap<String, Value>,
 }
 
 impl Env {
@@ -193,6 +198,16 @@ impl Env {
     /// Set a `static local` value for the given owning function + variable name.
     pub fn set_static(&mut self, fn_symbol: &str, var: &str, value: Value) {
         self.statics.insert(static_key(fn_symbol, var), value);
+    }
+
+    /// A scenario-fed override for a Tier-3 IO call `"Object.Method"`, if set.
+    pub fn io_override(&self, call: &str) -> Option<&Value> {
+        self.io_overrides.get(call)
+    }
+
+    /// Seed a scenario value for a Tier-3 IO call `"Object.Method"`.
+    pub fn set_io_override(&mut self, call: impl Into<String>, value: Value) {
+        self.io_overrides.insert(call.into(), value);
     }
 
     /// Begin executing a function: start with a fresh, empty local scope. Statics
