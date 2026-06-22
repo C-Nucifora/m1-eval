@@ -108,19 +108,17 @@ impl Engine {
 
     /// Read an `.ld` binary log into a [`Log`] when the `ld` feature is enabled.
     ///
-    /// The clean-room binary reader (`Log::from_ld`, built on the MIT `motec-i2`
-    /// crate) lands in Milestone P3-D. This milestone (P3-A.T3) only establishes
-    /// the feature-gated dispatch: with the feature enabled the arm still fails
-    /// loud — pointing at the P3-D reader — so the build stays green ahead of the
-    /// reader. P3-D replaces this body with the real `Log::from_ld` decode.
+    /// Reads the file as raw bytes and hands them to the clean-room binary reader
+    /// ([`crate::log::ld::from_ld`], built on the MIT `motec-i2` crate), which
+    /// applies the engineering-unit scaling and derives each sample's time from the
+    /// channel sample rate. All `motec-i2` types stay inside that module; only the
+    /// `m1-eval` [`Log`] crosses back here.
     #[cfg(feature = "ld")]
-    fn load_ld(_path: &Path, _source: String) -> Result<Log, EvalError> {
-        Err(EvalError::UnsupportedConstruct {
-            kind: "binary `.ld` import is not available yet (the clean-room \
-                   reader lands in Milestone P3-D); use a `.csv` log for now"
-                .to_string(),
-            at: 0,
-        })
+    fn load_ld(path: &Path, source: String) -> Result<Log, EvalError> {
+        let bytes = std::fs::read(path).map_err(|e| EvalError::MissingInput {
+            channel: format!("{}: {e}", path.display()),
+        })?;
+        crate::log::ld::from_ld(&bytes, source)
     }
 
     /// Fail-loud `.ld` arm when the `ld` feature is *not* enabled.
@@ -465,6 +463,78 @@ const = 6.0
             other => panic!("expected fail-loud `.ld`-without-feature error, got {other:?}"),
         }
         assert!(engine.log().is_none());
+    }
+
+    // Built WITH the `ld` feature, an `.ld` path routes through the clean-room
+    // reader (`Log::from_ld`) and attaches scaled channels as ground truth. The
+    // synthetic `.ld` is written in-memory via the `motec-i2` writer (no
+    // proprietary bytes) to a temp file, then loaded back through `load_log`.
+    #[cfg(feature = "ld")]
+    #[test]
+    fn load_log_ld_with_feature_attaches_scaled_channels() {
+        use motec_i2::{ChannelMetadata, Datatype, Header, LDWriter, Sample};
+        use std::io::Cursor;
+
+        // The writer places the first channel block at this fixed offset; the
+        // header must advertise it so the reader's linked-list walk finds it.
+        let header = Header {
+            channel_meta_ptr: 0x3448,
+            channel_data_ptr: 0,
+            event_ptr: 0,
+            device_serial: 1,
+            device_type: "M1".to_string(),
+            device_version: 1,
+            num_channels: 1,
+            date_string: "23/06/2026".to_string(),
+            time_string: "00:00:00".to_string(),
+            driver: "synthetic".to_string(),
+            vehicleid: "EV25".to_string(),
+            venue: "synthetic".to_string(),
+            session: "synthetic".to_string(),
+            short_comment: "m1-eval synthetic fixture".to_string(),
+        };
+        // I16 @ 10 Hz, scale=1/dec_places=1/mul=1 -> raw * 0.1.
+        let meta = ChannelMetadata {
+            prev_addr: 0,
+            next_addr: 0,
+            data_addr: 0,
+            data_count: 0,
+            datatype: Datatype::I16,
+            sample_rate: 10,
+            offset: 0,
+            mul: 1,
+            scale: 1,
+            dec_places: 1,
+            name: "Sensor".to_string(),
+            short_name: "Sensor".to_string(),
+            unit: "V".to_string(),
+        };
+        let mut cursor = Cursor::new(Vec::new());
+        LDWriter::new(&mut cursor, header)
+            .with_channel(meta, vec![Sample::I16(100), Sample::I16(200)])
+            .write()
+            .expect("synthetic .ld writes");
+        let bytes = cursor.into_inner();
+
+        let dir = tempfile::tempdir().expect("temp dir");
+        let path = dir.path().join("run.ld");
+        std::fs::write(&path, &bytes).expect("write synthetic .ld");
+
+        let mut engine = mini_engine();
+        engine
+            .load_log(&path)
+            .expect(".ld log attaches via from_ld");
+
+        let log = engine.log().expect("log attached after load_log");
+        let names: Vec<&str> = log.channel_names().collect();
+        assert_eq!(names, vec!["Sensor"]);
+        let sensor = log.series_for("Sensor").expect("Sensor present");
+        // Engineering-unit scaling applied: raw 100 -> 10.0 at t=0.0.
+        assert_eq!(sensor.sample(0.0), Value::Float(10.0));
+        // Time grid derived from the 10 Hz rate: second sample at t=0.1 -> 20.0.
+        assert_eq!(sensor.sample(0.1), Value::Float(20.0));
+        // Units rode along into provenance metadata.
+        assert_eq!(log.meta.units.get("Sensor").map(String::as_str), Some("V"));
     }
 
     // ---- P3-B Task 6: counterfactual orchestration through the engine ----
