@@ -38,6 +38,45 @@ dependency-cone runners.
   (`duration_s` + `base_rate_hz`), and input sources (constants or `(t, value)`
   time series), with an optional CSV time-series sidecar.
 
+## What it adds (Phase 2 — the whole-project multi-rate scheduler)
+
+**Phase 2** turns the engine into a faithful **mini-ECU**: instead of running one
+function or one dependency cone, the `whole-project` mode runs *every*
+periodically-scheduled function each tick at its own rate, over a fixed duration,
+producing one deterministic `Trace`. Select it with `mode = "whole-project"` in
+the scenario or the `--whole-project` CLI flag (which overrides the scenario's
+mode and is mutually exclusive with `--function` / `--target`).
+
+The multi-rate model:
+
+- **Schedule from the project.** A function's execution rate is its
+  `.m1prj` trigger — a `BuiltIn.EventKernel` clock such as `On 500Hz` /
+  `On 50Hz` — surfaced by `m1-typecheck` as the symbol's `call_rate_hz`. Every
+  function with a resolvable periodic rate (500 / 200 / 50 / 10 / 2 Hz) is
+  scheduled; an `On Startup` or untriggered function (rate `None`) is **not** run
+  by the scheduler and is flagged *unscheduled* in `--coverage`.
+- **Base tick + rate divisors.** The run advances on one base tick grid
+  (`base_rate_hz`, defaulting to the fastest scheduled rate when unset). Each
+  function runs every `base_rate_hz / rate_hz` ticks: a 100 Hz function on a
+  100 Hz base runs every tick, a 50 Hz function every other tick.
+- **Rate-correct `dt`.** A function's stateful operators (`Integral.Normal`,
+  filters, derivatives, timers) are stepped by *its own* period
+  (`1 / rate_hz`) — a 50 Hz integrator accumulates with `dt = 0.02`, not the
+  base `dt` — so time-domain results are faithful to the real schedule.
+- **Zero-order hold between ticks.** A channel a function did not write this
+  tick keeps its last value (the shared value store carries it forward), so a
+  slow channel holds steady between its updates while fast channels move every
+  tick.
+- **Same-rate dependency ordering, cross-rate stale-tolerance.** Within one
+  rate group, a writer runs before any reader of its output (topological order).
+  Across rates, no ordering edge is added: a faster reader of a slower writer
+  sees the slower function's *previous* value (stale between writer ticks),
+  matching how the real ECU schedule interleaves rate groups. Rate groups are
+  run fastest-first within a base tick.
+- **Externally-driven IO still stubbed, still fail-loud.** CAN/sensor reads
+  fall back to their documented stubs (flagged externally driven in the trace);
+  any genuinely unsupported construct still aborts the run rather than guessing.
+
 ### Determinism & fail-loud
 
 - **Deterministic.** A fixed tick grid and explicit `dt`, no wall-clock and no
@@ -55,6 +94,12 @@ constructs each script uses and whether the engine **supports** them faithfully,
 (would fail loud at runtime). This tells you up front what is trustworthy versus
 externally driven.
 
+The report also prints a **`Schedule:`** section: every script-backed function
+with its execution rate (`@ 500 Hz`, `@ 50 Hz`, …), or *unscheduled* for a
+function with no periodic trigger. This makes a `whole-project` run transparent —
+you see exactly which functions the scheduler will run, at what rate, and which
+are excluded — before you run it.
+
 ## Usage
 
 ```sh
@@ -63,11 +108,15 @@ externally driven.
 m1-eval --project Project.m1prj --config parameters.m1cfg \
         --scenario scenario.toml --out trace.json
 
-# Override the scenario's mode from the CLI.
+# Override the scenario's mode from the CLI (mutually exclusive with each other).
 m1-eval --project Project.m1prj --scenario scenario.toml --function Engine.Update
 m1-eval --project Project.m1prj --scenario scenario.toml --target  Root.Engine.Power
 
-# Static coverage report — what the engine can and cannot evaluate.
+# Whole-project multi-rate run: every scheduled function at its own rate.
+m1-eval --project Project.m1prj --scenario scenario.toml --whole-project --out trace.csv
+
+# Static coverage report — what the engine can and cannot evaluate, plus the
+# per-function execution schedule.
 m1-eval --project Project.m1prj --coverage
 ```
 
@@ -77,15 +126,15 @@ format, and the exit-code contract.
 
 ## Not yet — later phases
 
-`m1-eval` is phased; each phase is independently shippable. The following are
-**not** implemented yet:
+`m1-eval` is phased; each phase is independently shippable. Phase 1 (the core +
+single-function / dependency-cone runners) and Phase 2 (the whole-project
+multi-rate scheduler, above) are built. The following are **not** implemented yet:
 
-- **Phase 2** — the whole-project multi-rate scheduler (the faithful mini-ECU
-  running every scheduled function at its rate).
 - **Phase 3** — **log-driven counterfactual replay**: import a recorded run
   (CSV / `.ld`), treat logged channels as ground truth, override one or more
   channels, re-evaluate only the downstream dependency cone, and diff against the
-  log. This is the headline feature, and it is **not yet** built.
+  log. This is the headline feature, and it is **not yet** built — `.ld` /
+  CSV log import and counterfactual `--override` remain Phase 3.
 - **Phase 4** — LSP hover-to-evaluate and inline value hints, reusing this
   library.
 

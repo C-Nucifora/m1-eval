@@ -7,7 +7,8 @@ into a `Trace` or prints the static coverage report.
 
 ```
 m1-eval [--project P] [--config C]
-        [--scenario S [--function F | --target CH] [--out trace.json|trace.csv]]
+        [--scenario S [--function F | --target CH | --whole-project]
+                     [--out trace.json|trace.csv]]
         [--coverage]
 ```
 
@@ -18,26 +19,33 @@ m1-eval [--project P] [--config C]
 | `--project <PATH>` | The `Project.m1prj`. Defaults to the nearest one upward from the cwd, or `$M1_PROJECT`. |
 | `--config <PATH>` | The calibration file (`.m1cfg`) supplying parameter values and table cells. Required for any run that reads a parameter or does a table `.Lookup()`. |
 | `--scenario <PATH>` | The scenario file (TOML or JSON; parser chosen by extension) describing how to drive the run. |
-| `--function <NAME>` | Override the scenario's mode: run this single function each tick. Mutually exclusive with `--target`. |
-| `--target <CHANNEL>` | Override the scenario's mode: run this target channel plus its upstream dependency cone. Mutually exclusive with `--function`. |
+| `--function <NAME>` | Override the scenario's mode: run this single function each tick. Mutually exclusive with `--target` and `--whole-project`. |
+| `--target <CHANNEL>` | Override the scenario's mode: run this target channel plus its upstream dependency cone. Mutually exclusive with `--function` and `--whole-project`. |
+| `--whole-project` | Override the scenario's mode: run the whole-project multi-rate scheduler (every periodically-scheduled function at its own rate). Mutually exclusive with `--function` and `--target`. |
 | `--out <PATH>` | Where to write the trace. Format follows the extension: `.csv` writes CSV, anything else (including `.json`) writes JSON. Without `--out`, the trace prints to stdout as JSON. |
-| `--coverage` | Print the coverage report (supported / stubbed / unsupported builtins and constructs) instead of, or alongside, a run. |
+| `--coverage` | Print the coverage report (supported / stubbed / unsupported builtins and constructs, plus the per-function execution `Schedule:`) instead of, or alongside, a run. |
 | `--version`, `-V` | Print the version and exit `0`. |
 | `--help`, `-h` | Print usage and exit `0`. |
 
 A run requires either `--scenario` (to evaluate) or `--coverage` (to report);
 with neither, the invocation is incomplete and exits `2`. `--function` /
-`--target` override the `mode`/`target` declared in the scenario file.
+`--target` / `--whole-project` override the `mode`/`target` declared in the
+scenario file; at most one may be given (combining two is a usage error, exit
+`2`).
 
 ## Scenario file
 
 The primary format is TOML; JSON of the same shape is also accepted.
 
 ```toml
-mode = "function"            # or "cone"
-target = "Engine.Update"     # function name (function mode) or channel (cone mode)
+mode = "function"            # "function", "cone", or "whole-project"
+target = "Engine.Update"     # function name (function mode) or channel (cone mode);
+                             # omitted/ignored in whole-project mode
 duration_s = 1.0             # run length in seconds; ticks span [0, duration_s)
-base_rate_hz = 100.0         # tick rate; dt = 1 / base_rate_hz
+base_rate_hz = 100.0         # base tick rate; dt = 1 / base_rate_hz. In
+                             # whole-project mode this is the base grid and each
+                             # function runs every base_rate_hz / rate_hz ticks;
+                             # when 0/absent it defaults to the fastest scheduled rate
 
 # Inputs the engine is *given* rather than computes. Each entry is a constant
 # or a (t_seconds, value) time series sampled by zero-order hold.

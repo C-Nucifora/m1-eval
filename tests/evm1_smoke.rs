@@ -23,7 +23,7 @@
 
 use std::path::{Path, PathBuf};
 
-use m1_eval::Engine;
+use m1_eval::{Engine, Scenario};
 
 /// Resolve the EV-M1 project directory from `M1_EVAL_EVM1_DIR`. Returns `None`
 /// (so the test silently passes as a no-op) when the variable is unset — the
@@ -101,4 +101,73 @@ fn evm1_phase15_categories_are_closed() {
             "user function {user_fn:?} still unsupported; unsupported={unsupported:?}"
         );
     }
+}
+
+/// Phase-2 acceptance gate ([`evm1_whole_project_runs_end_to_end`]).
+///
+/// Loads the real EV-M1 project and runs the **whole-project multi-rate
+/// scheduler** for a short fixed duration. This is the strongest end-to-end check
+/// that Phase 1.5 + Phase 2 together make the real corpus runnable: every
+/// periodically-scheduled function executes at its own rate, the inline
+/// user-function calls evaluate, the enum `.AsInteger` conversions resolve, and
+/// the externally-driven CAN/sensor IO falls back to its documented stubs — all
+/// without a single fail-loud `EvalError`.
+///
+/// External inputs are driven by the IO stubs (Task 7) plus any scenario
+/// `[[inputs]]`; the schedule's CAN reads stub to documented defaults rather than
+/// aborting, so the run completes offline. We assert the trace is non-empty (a
+/// real tick grid over the duration) and that it carries the scheduled control
+/// channels.
+#[test]
+#[ignore = "requires M1_EVAL_EVM1_DIR pointing at the proprietary EV-M1 project"]
+fn evm1_whole_project_runs_end_to_end() {
+    let Some(dir) = evm1_dir() else {
+        eprintln!("M1_EVAL_EVM1_DIR unset; skipping EV-M1 whole-project smoke");
+        return;
+    };
+    let engine = load_evm1(&dir);
+
+    // A short whole-project run. No `target` is needed in whole-project mode; the
+    // base tick is pinned at 500 Hz (the fastest EV-M1 control rate) so every
+    // scheduled rate (500/200/50/10/2 Hz) divides it cleanly. 0.02 s = 10 base
+    // ticks — enough for the slower loops to fire at least once.
+    let scenario = Scenario::from_toml_str(
+        r#"
+mode = "whole-project"
+duration_s = 0.02
+base_rate_hz = 500.0
+"#,
+    )
+    .expect("whole-project scenario parses");
+
+    let trace = engine
+        .run(&scenario)
+        .expect("EV-M1 whole-project run completes without an EvalError");
+
+    // 0.02 s at 500 Hz = 10 base ticks; the trace has a dense time axis.
+    assert_eq!(trace.time.len(), 10, "expected 10 base ticks");
+    assert!(
+        !trace.channels.is_empty(),
+        "whole-project run produced no channel columns"
+    );
+    // Every channel column is dense over the tick grid (zero-order hold fills the
+    // ticks a slow function did not run on).
+    for (name, col) in &trace.channels {
+        assert_eq!(
+            col.len(),
+            trace.time.len(),
+            "channel {name:?} column is not dense over the tick grid"
+        );
+    }
+
+    // The scheduled control channels must appear in the trace. `Control.Drive
+    // State` is written by the drive-state machine; the inverter torque channels
+    // are written by the torque/slip control helpers. We match by suffix so the
+    // canonical `Root.…` prefix does not have to be spelled out.
+    let has_channel = |needle: &str| trace.channels.keys().any(|k| k.contains(needle));
+    assert!(
+        has_channel("Drive State"),
+        "no Drive State control channel in the trace; channels: {:?}",
+        trace.channels.keys().collect::<Vec<_>>()
+    );
 }
