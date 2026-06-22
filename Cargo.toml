@@ -13,11 +13,12 @@ path = "src/bin/m1_eval.rs"
 
 [features]
 # Clean-room binary `.ld` log import, built on the MIT `motec-i2` crate + public
-# format docs (no MoTeC software is reverse-engineered). The reader and its
-# optional dependency land in Milestone P3-D; the feature is declared here so the
-# fail-loud / feature-gated dispatch in `Engine::load_log` is recognised by
-# `--check-cfg`. P3-D extends this to `ld = ["dep:motec-i2"]`.
-ld = []
+# format docs (no MoTeC software is reverse-engineered). Enabling `ld` pulls in
+# the optional `motec-i2` dependency; all `.ld` code is `#[cfg(feature = "ld")]`,
+# so the default build (CSV-only) carries neither the feature nor the dependency.
+# The fail-loud / feature-gated dispatch in `Engine::load_log` keeps the no-feature
+# `.ld` path surfacing a clear "rebuild with --features ld" error.
+ld = ["dep:motec-i2"]
 
 [dependencies]
 clap = { version = "4", features = ["derive"] }
@@ -27,6 +28,12 @@ toml = "0.8"
 roxmltree = "0.20"
 m1-core = { git = "https://github.com/C-Nucifora/m1-core.git", tag = "v0.12.0" }
 m1-typecheck = { git = "https://github.com/C-Nucifora/m1-typecheck.git", tag = "v0.36.0" }
+# MIT, GPL-3.0-compatible, pure-std clean-room `.ld`/`.ldx` file-format
+# reader+writer. Optional: only compiled in under the `ld` feature. We use its
+# reader to import `.ld` telemetry and its writer to generate the tiny synthetic
+# `.ld` CI fixture (no proprietary bytes committed). We never reverse-engineer
+# MoTeC software — only an independently-documented file format.
+motec-i2 = { version = "0.2", optional = true }
 
 [dev-dependencies]
 assert_cmd = "2"

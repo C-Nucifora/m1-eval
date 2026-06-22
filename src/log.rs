@@ -45,6 +45,11 @@ use std::collections::BTreeMap;
 use crate::error::EvalError;
 use crate::scenario::{InputKind, InputSeries, parse_time_series_csv};
 
+// Clean-room binary `.ld` import, behind the `ld` cargo feature. All `motec-i2`
+// types stay inside this submodule; only `Log`/`InputSeries`/`Value` cross out.
+#[cfg(feature = "ld")]
+pub(crate) mod ld;
+
 /// A recorded run as a set of per-channel time series plus provenance metadata.
 ///
 /// Each entry in `channels` is one logged channel, expected to be an
