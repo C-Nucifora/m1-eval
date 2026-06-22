@@ -9,15 +9,22 @@
 //! 1. **Scenario override.** If the scenario seeded a value for this exact call
 //!    (`Env::io_override("Object.Method")`), return it. This is how a scenario or
 //!    a log replay externally drives a hardware-backed builtin.
-//! 2. **Documented stub.** A small set of calls have a determinate offline value
-//!    — e.g. `System.TickPeriod()` is the evaluator's tick step `ctx.dt`, and
-//!    `System.XcpConnected()`/`Logging.Running()` are false because no tuning
-//!    tool or logger is attached offline. The `Void` side-effect calls
+//! 2. **Specific documented stub.** A small set of calls have a *meaningful*
+//!    offline value — e.g. `System.TickPeriod()` is the evaluator's tick step
+//!    `ctx.dt`, and `System.XcpConnected()`/`Logging.Running()` are false because
+//!    no tuning tool or logger is attached offline. The `Void` side-effect calls
 //!    (`System.Debug`, `System.AllowTuning`, …) are no-ops returning a benign
-//!    value. Each stub's meaning is documented below, never copied from MoTeC.
-//! 3. **Fail loud.** Anything else — a CAN/serial *read* whose value we would
-//!    have to fabricate, an un-stubbed `System`/`Logging` call — returns
-//!    [`EvalError::UnsupportedBuiltin`]. We never invent a hardware value.
+//!    value. Each stub's meaning is documented in [`documented_stub`], never
+//!    copied from MoTeC.
+//! 3. **Generic typed stub.** Every *other* method that the intrinsic registry
+//!    lists for the object is a hardware-backed read/write with no meaningful
+//!    offline value, but a determinate *type*. Rather than abort a whole-project
+//!    run on the first CAN read, we return the type-correct zero/false/empty
+//!    default for the overload's declared return type (see [`typed_io_default`]).
+//!    This is the externally-driven default a scenario/log replay would override.
+//! 4. **Fail loud.** A method the registry does *not* list on the object is
+//!    genuinely unknown — we never invent a value for it, so it returns
+//!    [`EvalError::UnsupportedBuiltin`].
 //!
 //! Whenever a value is produced (override or stub), the call is flagged
 //! externally driven in the [`Trace`](crate::trace::Trace) so a consumer knows
@@ -26,6 +33,7 @@
 use crate::error::EvalError;
 use crate::expr::EvalCtx;
 use crate::value::Value;
+use m1_typecheck::intrinsics;
 
 /// Evaluate one Tier-3 IO call. See the module docs for the resolution order.
 pub fn call(
@@ -42,16 +50,64 @@ pub fn call(
         return Ok(v);
     }
 
-    // 2. Documented offline stubs.
+    // 2. Specific documented offline stubs (a *meaningful* offline value).
     if let Some(v) = documented_stub(object, method, args, ctx)? {
         mark_external(ctx, &key);
         return Ok(v);
     }
 
-    // 3. Fail loud — never fabricate a hardware value.
+    // 3. Generic typed stub: any other method the intrinsic registry lists for
+    //    this object is a hardware-backed read/write. It has no meaningful offline
+    //    value, but a determinate return *type* — so return the type-correct
+    //    default rather than abort the run on the first CAN read. The default is
+    //    the externally-driven value a scenario / log replay would override.
+    if let Some(v) = typed_io_default(object, method) {
+        mark_external(ctx, &key);
+        return Ok(v);
+    }
+
+    // 4. Fail loud — the method is not in the registry for this object, so it is
+    //    genuinely unknown. We never fabricate a value for an unknown method.
     Err(EvalError::UnsupportedBuiltin {
         object: object.to_string(),
         method: method.to_string(),
+    })
+}
+
+/// The type-correct externally-driven default for an IO-library `object.method`,
+/// or `None` when the registry lists no such method on the object (so the caller
+/// fails loud).
+///
+/// The value is chosen from the method's declared *return type* in the intrinsic
+/// registry — a zero/false/empty of the right kind, never a guessed reading:
+///
+/// - `Boolean` → `false` (no frame arrived / not connected),
+/// - `FloatingPoint` / `FixedPoint7dps` → `0.0`,
+/// - `Integer` → `0`,
+/// - `UnsignedInteger` → `0`,
+/// - `String` → `""`,
+/// - `Void` → the benign unit (`Bool(true)`) the void side-effect writers use,
+/// - anything else (`Handle`, `Bit`, `Enumeration`, an `Integer|FloatingPoint`
+///   union) → the benign unit `Bool(true)`: a transmit/receive handle or a single
+///   bus bit has no determinate numeric offline value, so we return the unit
+///   rather than invent one.
+///
+/// All overloads of a method declare the same return type in the IO objects, so
+/// the first overload's `returns` fixes the default. An empty overload set means
+/// the method is not a real IO method → `None` (fail loud).
+fn typed_io_default(object: &str, method: &str) -> Option<Value> {
+    let overloads = intrinsics::get().library_overloads(object, method);
+    let returns = &overloads.first()?.returns;
+    Some(match returns.as_str() {
+        "Boolean" => Value::Bool(false),
+        "FloatingPoint" | "FixedPoint7dps" => Value::Float(0.0),
+        "Integer" => Value::Int(0),
+        "UnsignedInteger" => Value::Uint(0),
+        "String" => Value::Str(String::new()),
+        // `Void` writers and any unmappable return (`Handle`, `Bit`,
+        // `Enumeration`, the `Integer|FloatingPoint` union) collapse to the benign
+        // unit value, matching the void side-effect convention used elsewhere.
+        _ => Value::Bool(true),
     })
 }
 
@@ -286,37 +342,126 @@ mod tests {
     }
 
     #[test]
-    fn unstubbed_can_read_fails_loud() {
+    fn can_read_returns_typed_external_stub() {
         let mut h = Harness::new();
-        // No scenario value, no documented stub: must fail loud, never fabricate.
-        match h.io("CanComms", "GetFloat", &[Value::Uint(0), Value::Int(0)]) {
+        // No scenario value, no specific stub: a real CAN read now returns the
+        // type-correct externally-driven default (never a guessed reading).
+        // `CanComms.GetFloat` declares a `FloatingPoint` return, so the stub is 0.0.
+        assert_eq!(
+            h.io("CanComms", "GetFloat", &[Value::Uint(0), Value::Int(0)]).unwrap(),
+            Value::Float(0.0)
+        );
+        // The stub is flagged externally driven.
+        assert!(h.trace.is_external("CanComms.GetFloat"));
+    }
+
+    #[test]
+    fn can_open_handle_returns_unit_external_stub() {
+        let mut h = Harness::new();
+        // `CanComms.RxOpenStandard` declares a `Handle` return — an opaque
+        // receive handle with no determinate offline value — so the typed stub is
+        // the benign unit (`Bool(true)`), externally driven, not a fail-loud abort.
+        assert_eq!(
+            h.io(
+                "CanComms",
+                "RxOpenStandard",
+                &[Value::Uint(0), Value::Uint(0), Value::Uint(0), Value::Uint(0)],
+            )
+            .unwrap(),
+            Value::Bool(true)
+        );
+        assert!(h.trace.is_external("CanComms.RxOpenStandard"));
+    }
+
+    #[test]
+    fn can_void_writer_returns_unit_external_stub() {
+        let mut h = Harness::new();
+        // `CanComms.SetFloat` declares a `Void` return — a bus write that is a
+        // no-op offline — so the typed stub is the benign unit value.
+        assert_eq!(
+            h.io(
+                "CanComms",
+                "SetFloat",
+                &[Value::Uint(0), Value::Int(0), Value::Float(1.0)],
+            )
+            .unwrap(),
+            Value::Bool(true)
+        );
+        assert!(h.trace.is_external("CanComms.SetFloat"));
+    }
+
+    #[test]
+    fn system_call_returns_typed_external_stub() {
+        let mut h = Harness::new();
+        // `System.ElapsedTime` has no *meaningful* offline value, but the registry
+        // lists it with a `FloatingPoint` return, so the typed stub is 0.0 (an
+        // externally-driven default), not a fail-loud abort.
+        assert_eq!(h.io("System", "ElapsedTime", &[]).unwrap(), Value::Float(0.0));
+        assert!(h.trace.is_external("System.ElapsedTime"));
+    }
+
+    #[test]
+    fn per_system_logging_overload_returns_typed_external_stub() {
+        let mut h = Harness::new();
+        // `Logging.Running(system)` (one Integer arg) has no *specific* stub (only
+        // the zero-arg overload does), but it is a real `Boolean` IO method, so the
+        // generic typed stub is false (externally driven), not a fail-loud abort.
+        assert_eq!(
+            h.io("Logging", "Running", &[Value::Int(0)]).unwrap(),
+            Value::Bool(false)
+        );
+        assert!(h.trace.is_external("Logging.Running"));
+    }
+
+    #[test]
+    fn unknown_io_method_fails_loud() {
+        let mut h = Harness::new();
+        // A method the registry does NOT list on the object is genuinely unknown:
+        // we never invent a value for it, so it fails loud.
+        match h.io("CanComms", "NotARealMethod", &[]) {
             Err(EvalError::UnsupportedBuiltin { object, method }) => {
                 assert_eq!(object, "CanComms");
-                assert_eq!(method, "GetFloat");
+                assert_eq!(method, "NotARealMethod");
             }
             other => panic!("expected UnsupportedBuiltin, got {other:?}"),
         }
         // A failed call is not marked external.
-        assert!(!h.trace.is_external("CanComms.GetFloat"));
+        assert!(!h.trace.is_external("CanComms.NotARealMethod"));
     }
 
     #[test]
-    fn unstubbed_system_call_fails_loud() {
+    fn unknown_io_object_method_fails_loud() {
         let mut h = Harness::new();
-        // ElapsedTime has no determinate offline value -> fail loud.
-        match h.io("System", "ElapsedTime", &[]) {
-            Err(EvalError::UnsupportedBuiltin { method, .. }) => assert_eq!(method, "ElapsedTime"),
+        // `Serial` is an IO object, but `Frobnicate` is not a method the registry
+        // lists for it — genuinely unknown, so fail loud rather than fabricate.
+        match h.io("Serial", "Frobnicate", &[]) {
+            Err(EvalError::UnsupportedBuiltin { object, method }) => {
+                assert_eq!(object, "Serial");
+                assert_eq!(method, "Frobnicate");
+            }
             other => panic!("expected UnsupportedBuiltin, got {other:?}"),
         }
     }
 
     #[test]
-    fn per_system_logging_overload_fails_loud() {
-        let mut h = Harness::new();
-        // Logging.Running(system) (one Integer arg) has no offline stub.
-        match h.io("Logging", "Running", &[Value::Int(0)]) {
-            Err(EvalError::UnsupportedBuiltin { .. }) => {}
-            other => panic!("expected UnsupportedBuiltin, got {other:?}"),
-        }
+    fn typed_io_default_maps_each_return_kind() {
+        // The generic fallback maps each registry return type to its zero/unit.
+        // `GetFloat` → FloatingPoint, `GetID` → Integer, `BusRxTotal` →
+        // UnsignedInteger, `RxMessage` → Boolean, `SetFloat` → Void,
+        // `RxOpenStandard` → Handle (unmappable → unit).
+        assert_eq!(typed_io_default("CanComms", "GetFloat"), Some(Value::Float(0.0)));
+        assert_eq!(typed_io_default("CanComms", "GetID"), Some(Value::Int(0)));
+        assert_eq!(
+            typed_io_default("CanComms", "BusRxTotal"),
+            Some(Value::Uint(0))
+        );
+        assert_eq!(typed_io_default("CanComms", "RxMessage"), Some(Value::Bool(false)));
+        assert_eq!(typed_io_default("CanComms", "SetFloat"), Some(Value::Bool(true)));
+        assert_eq!(
+            typed_io_default("CanComms", "RxOpenStandard"),
+            Some(Value::Bool(true))
+        );
+        // A method not in the registry → None (the caller fails loud).
+        assert_eq!(typed_io_default("CanComms", "NotARealMethod"), None);
     }
 }
