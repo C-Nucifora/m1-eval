@@ -9,7 +9,7 @@
 //! not exposed across its public API, so we derive our own here directly from the
 //! CST — exactly the canonical paths the evaluator itself reads and writes:
 //!
-//! - the left-hand side of an [`AssignmentStatement`] is a **write**;
+//! - the left-hand side of an `AssignmentStatement` is a **write**;
 //! - a compound assignment (`+=`, `*=`, …) reads its target first, so a compound
 //!   target is **both** a read and a write;
 //! - every other identifier/member reference on a value-producing position is a
@@ -244,9 +244,12 @@ mod tests {
 
     fn mini_project() -> Project {
         let dir = Path::new(env!("CARGO_MANIFEST_DIR")).join("tests/fixtures/mini");
-        crate::loader::load(&dir.join("Project.m1prj"), Some(&dir.join("parameters.m1cfg")))
-            .expect("mini fixture loads")
-            .project
+        crate::loader::load(
+            &dir.join("Project.m1prj"),
+            Some(&dir.join("parameters.m1cfg")),
+        )
+        .expect("mini fixture loads")
+        .project
     }
 
     /// Parse a synthetic script body under the `Demo.Update.m1scr` name so it

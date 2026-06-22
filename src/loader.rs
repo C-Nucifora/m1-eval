@@ -119,7 +119,11 @@ fn collect_scripts_rec(dir: &Path, out: &mut Vec<(String, String)>) {
         if path.is_dir() {
             collect_scripts_rec(&path, out);
         } else if path.extension().and_then(|e| e.to_str()) == Some("m1scr") {
-            let Some(name) = path.file_name().and_then(|n| n.to_str()).map(str::to_string) else {
+            let Some(name) = path
+                .file_name()
+                .and_then(|n| n.to_str())
+                .map(str::to_string)
+            else {
                 continue;
             };
             let bytes = std::fs::read(&path).unwrap_or_default();

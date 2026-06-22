@@ -99,15 +99,24 @@ mod tests {
     #[test]
     fn limit_range_clamps_both_ends() {
         assert_eq!(
-            ok("Range", &[Value::Float(7.0), Value::Float(0.0), Value::Float(5.0)]),
+            ok(
+                "Range",
+                &[Value::Float(7.0), Value::Float(0.0), Value::Float(5.0)]
+            ),
             Value::Float(5.0)
         );
         assert_eq!(
-            ok("Range", &[Value::Float(-1.0), Value::Float(0.0), Value::Float(5.0)]),
+            ok(
+                "Range",
+                &[Value::Float(-1.0), Value::Float(0.0), Value::Float(5.0)]
+            ),
             Value::Float(0.0)
         );
         assert_eq!(
-            ok("Range", &[Value::Float(3.0), Value::Float(0.0), Value::Float(5.0)]),
+            ok(
+                "Range",
+                &[Value::Float(3.0), Value::Float(0.0), Value::Float(5.0)]
+            ),
             Value::Float(3.0)
         );
         // All-integer range stays integral.

@@ -103,8 +103,8 @@ mod tests {
 
     fn mini_project() -> Project {
         let dir = Path::new(env!("CARGO_MANIFEST_DIR")).join("tests/fixtures/mini");
-        let loaded = crate::loader::load(&dir.join("Project.m1prj"), None)
-            .expect("mini fixture loads");
+        let loaded =
+            crate::loader::load(&dir.join("Project.m1prj"), None).expect("mini fixture loads");
         loaded.project
     }
 

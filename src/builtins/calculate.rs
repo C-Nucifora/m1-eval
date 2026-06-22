@@ -242,10 +242,7 @@ mod tests {
             Value::Float(2.0)
         );
         // Unsigned join stays unsigned.
-        assert_eq!(
-            ok("Max", &[Value::Uint(2), Value::Uint(9)]),
-            Value::Uint(9)
-        );
+        assert_eq!(ok("Max", &[Value::Uint(2), Value::Uint(9)]), Value::Uint(9));
     }
 
     #[test]
@@ -265,15 +262,24 @@ mod tests {
     fn bias_blends_linearly() {
         // t=0 -> a, t=1 -> b, t=0.5 -> midpoint.
         assert_eq!(
-            ok("Bias", &[Value::Float(10.0), Value::Float(20.0), Value::Float(0.0)]),
+            ok(
+                "Bias",
+                &[Value::Float(10.0), Value::Float(20.0), Value::Float(0.0)]
+            ),
             Value::Float(10.0)
         );
         assert_eq!(
-            ok("Bias", &[Value::Float(10.0), Value::Float(20.0), Value::Float(1.0)]),
+            ok(
+                "Bias",
+                &[Value::Float(10.0), Value::Float(20.0), Value::Float(1.0)]
+            ),
             Value::Float(20.0)
         );
         assert_eq!(
-            ok("Bias", &[Value::Float(10.0), Value::Float(20.0), Value::Float(0.25)]),
+            ok(
+                "Bias",
+                &[Value::Float(10.0), Value::Float(20.0), Value::Float(0.25)]
+            ),
             Value::Float(12.5)
         );
     }
@@ -309,9 +315,18 @@ mod tests {
     fn fast_trig_matches_std() {
         // Our fast trig is the std implementation in Phase 1 (documented
         // assumption); exact-match the std result.
-        assert_eq!(ok("FastSin", &[Value::Float(0.0)]), Value::Float(0.0_f64.sin()));
-        assert_eq!(ok("FastCos", &[Value::Float(0.0)]), Value::Float(0.0_f64.cos()));
-        assert_eq!(ok("FastTan", &[Value::Float(0.0)]), Value::Float(0.0_f64.tan()));
+        assert_eq!(
+            ok("FastSin", &[Value::Float(0.0)]),
+            Value::Float(0.0_f64.sin())
+        );
+        assert_eq!(
+            ok("FastCos", &[Value::Float(0.0)]),
+            Value::Float(0.0_f64.cos())
+        );
+        assert_eq!(
+            ok("FastTan", &[Value::Float(0.0)]),
+            Value::Float(0.0_f64.tan())
+        );
         // atan2(1, 1) = pi/4.
         assert_eq!(
             ok("InverseTan2", &[Value::Float(1.0), Value::Float(1.0)]),
@@ -378,9 +393,18 @@ mod tests {
     #[test]
     fn inverse_trig_matches_std() {
         // Principal values in radians (std implementation, documented assumption).
-        assert_eq!(ok("InverseSin", &[Value::Float(0.0)]), Value::Float(0.0_f64.asin()));
-        assert_eq!(ok("InverseCos", &[Value::Float(1.0)]), Value::Float(1.0_f64.acos()));
-        assert_eq!(ok("InverseTan", &[Value::Float(0.0)]), Value::Float(0.0_f64.atan()));
+        assert_eq!(
+            ok("InverseSin", &[Value::Float(0.0)]),
+            Value::Float(0.0_f64.asin())
+        );
+        assert_eq!(
+            ok("InverseCos", &[Value::Float(1.0)]),
+            Value::Float(1.0_f64.acos())
+        );
+        assert_eq!(
+            ok("InverseTan", &[Value::Float(0.0)]),
+            Value::Float(0.0_f64.atan())
+        );
         // asin(1) = pi/2.
         assert_eq!(
             ok("InverseSin", &[Value::Float(1.0)]),
@@ -392,7 +416,11 @@ mod tests {
     fn unimplemented_method_returns_none() {
         // Stateful Calculate methods are not implemented here -> None, so the
         // dispatcher fails loud (UnsupportedBuiltin) until M6.
-        assert!(call("Stable", &[Value::Float(1.0), Value::Float(0.1)]).unwrap().is_none());
+        assert!(
+            call("Stable", &[Value::Float(1.0), Value::Float(0.1)])
+                .unwrap()
+                .is_none()
+        );
         assert!(call("Hysteresis", &[]).unwrap().is_none());
         assert!(call("NotAMethod", &[]).unwrap().is_none());
     }

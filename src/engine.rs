@@ -97,9 +97,7 @@ impl Engine {
             other => {
                 let found = other.unwrap_or("(none)");
                 return Err(EvalError::UnsupportedConstruct {
-                    kind: format!(
-                        "log file extension `.{found}` (expected `.csv` or `.ld`)"
-                    ),
+                    kind: format!("log file extension `.{found}` (expected `.csv` or `.ld`)"),
                     at: 0,
                 });
             }
@@ -247,8 +245,11 @@ mod tests {
 
     fn mini_engine() -> Engine {
         let dir = Path::new(env!("CARGO_MANIFEST_DIR")).join("tests/fixtures/mini");
-        Engine::load(&dir.join("Project.m1prj"), Some(&dir.join("parameters.m1cfg")))
-            .expect("mini fixture loads through the engine")
+        Engine::load(
+            &dir.join("Project.m1prj"),
+            Some(&dir.join("parameters.m1cfg")),
+        )
+        .expect("mini fixture loads through the engine")
     }
 
     #[test]
@@ -305,14 +306,22 @@ channel = "Root.MR.Slow Out"
 const = 6.0
 "#;
         let scenario = Scenario::from_toml_str(toml).unwrap();
-        let trace = engine.run(&scenario).expect("whole-project engine run succeeds");
+        let trace = engine
+            .run(&scenario)
+            .expect("whole-project engine run succeeds");
 
         // 0.04 s at 100 Hz = 4 ticks; every scheduled channel has a dense column.
         assert_eq!(trace.time.len(), 4);
-        let fast = trace.channels.get("Root.MR.Fast Out").expect("Fast Out column");
+        let fast = trace
+            .channels
+            .get("Root.MR.Fast Out")
+            .expect("Fast Out column");
         assert_eq!(fast.len(), 4, "fast channel present every tick");
         // Slow Echo = Seed*2 = 6 on every even tick; held between -> all 6.
-        let echo = trace.channels.get("Root.MR.Slow Echo").expect("Slow Echo column");
+        let echo = trace
+            .channels
+            .get("Root.MR.Slow Echo")
+            .expect("Slow Echo column");
         assert_eq!(echo, &vec![Value::Float(6.0); 4]);
         // The On-Startup function never runs in whole-project mode.
         assert!(!trace.channels.contains_key("Root.MR.Started"));
@@ -375,9 +384,16 @@ const = 6.0
         let names: Vec<&str> = log.channel_names().collect();
         assert_eq!(names, vec!["Engine Speed", "Wheel Speed"]);
         // The units row rode along into the log's provenance metadata.
-        assert_eq!(log.meta.units.get("Engine Speed").map(String::as_str), Some("rpm"));
+        assert_eq!(
+            log.meta.units.get("Engine Speed").map(String::as_str),
+            Some("rpm")
+        );
         // Source records the loaded path's provenance.
-        assert!(log.meta.source.ends_with("run.csv"), "source = {}", log.meta.source);
+        assert!(
+            log.meta.source.ends_with("run.csv"),
+            "source = {}",
+            log.meta.source
+        );
     }
 
     #[test]
@@ -475,7 +491,9 @@ const = 6.0
         let mut engine = cf_engine();
         let (_dir, path) = temp_log("csv", CF_LOG_CSV);
         engine.load_log(&path).expect("log attaches");
-        engine.override_channel("Root.CF.Sensor=100.0").expect("override parses");
+        engine
+            .override_channel("Root.CF.Sensor=100.0")
+            .expect("override parses");
 
         let trace = engine.run_counterfactual().expect("counterfactual runs");
         // Default duration = log duration (0.02 s) at the fallback 100 Hz base =
@@ -485,7 +503,10 @@ const = 6.0
         let result = trace.channels.get("Root.CF.Result").expect("Result column");
         let other = trace.channels.get("Root.CF.Other").expect("Other column");
         assert!(mid.iter().all(|v| *v == Value::Float(200.0)), "{mid:?}");
-        assert!(result.iter().all(|v| *v == Value::Float(201.0)), "{result:?}");
+        assert!(
+            result.iter().all(|v| *v == Value::Float(201.0)),
+            "{result:?}"
+        );
         // Other is unrelated to the override: it passes through at its logged value.
         assert!(other.iter().all(|v| *v == Value::Float(42.0)), "{other:?}");
     }

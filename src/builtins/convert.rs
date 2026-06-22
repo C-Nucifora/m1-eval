@@ -50,7 +50,10 @@ mod tests {
 
     #[test]
     fn to_unsigned_integer_truncates() {
-        assert_eq!(ok("ToUnsignedInteger", &[Value::Float(3.7)]), Value::Uint(3));
+        assert_eq!(
+            ok("ToUnsignedInteger", &[Value::Float(3.7)]),
+            Value::Uint(3)
+        );
         assert_eq!(ok("ToUnsignedInteger", &[Value::Int(9)]), Value::Uint(9));
     }
 

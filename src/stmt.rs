@@ -36,8 +36,8 @@ use crate::expr::{self, EvalCtx, eval};
 use crate::ident::{Target, classify};
 use crate::value::Value;
 use m1_core::{Field, Kind, Node};
-use m1_typecheck::types::declared_local_type;
 use m1_typecheck::types::ValueType;
+use m1_typecheck::types::declared_local_type;
 
 /// Execute one statement node, applying its effect to `ctx`.
 pub fn exec(node: &Node, ctx: &mut EvalCtx) -> Result<(), EvalError> {
@@ -195,7 +195,9 @@ fn resolve_target(target: &Node, ctx: &mut EvalCtx) -> Result<Dest, EvalError> {
             kind: format!("assignment to builtin object {object:?}"),
             at: target.byte_range().start,
         }),
-        Target::Unresolved => Err(EvalError::UnresolvedSymbol { name: path.to_string() }),
+        Target::Unresolved => Err(EvalError::UnresolvedSymbol {
+            name: path.to_string(),
+        }),
     }
 }
 
@@ -220,22 +222,30 @@ fn target_path(target: &Node) -> Result<String, EvalError> {
 /// channel's externally-driven startup default, else fail-loud `MissingInput`.
 fn read_dest(dest: &Dest, ctx: &mut EvalCtx) -> Result<Value, EvalError> {
     match dest {
-        Dest::Local(name) => ctx
-            .env
-            .get_local(name)
-            .cloned()
-            .ok_or_else(|| EvalError::MissingInput { channel: name.clone() }),
-        Dest::Static { fn_symbol, var } => ctx
-            .env
-            .get_static(fn_symbol, var)
-            .cloned()
-            .ok_or_else(|| EvalError::MissingInput { channel: var.clone() }),
+        Dest::Local(name) => {
+            ctx.env
+                .get_local(name)
+                .cloned()
+                .ok_or_else(|| EvalError::MissingInput {
+                    channel: name.clone(),
+                })
+        }
+        Dest::Static { fn_symbol, var } => {
+            ctx.env
+                .get_static(fn_symbol, var)
+                .cloned()
+                .ok_or_else(|| EvalError::MissingInput {
+                    channel: var.clone(),
+                })
+        }
         Dest::Channel(canon) => expr::read_symbol(canon, ctx),
         Dest::Out => ctx
             .env
             .get_out()
             .cloned()
-            .ok_or_else(|| EvalError::MissingInput { channel: "Out".to_string() }),
+            .ok_or_else(|| EvalError::MissingInput {
+                channel: "Out".to_string(),
+            }),
     }
 }
 
@@ -322,7 +332,11 @@ fn exec_if(node: &Node, ctx: &mut EvalCtx) -> Result<(), EvalError> {
     }
 
     // No `else if` matched the boolean: run the else clause if present.
-    if let Some(else_clause) = node.children().into_iter().find(|c| c.kind() == Kind::ElseClause) {
+    if let Some(else_clause) = node
+        .children()
+        .into_iter()
+        .find(|c| c.kind() == Kind::ElseClause)
+    {
         // The else clause wraps either a Block (`else { … }`) or a nested
         // IfStatement (`else if … { … }`). Execute whichever it carries.
         for child in else_clause.children() {
@@ -390,10 +404,17 @@ fn single_pattern_matches(
 ) -> Result<bool, EvalError> {
     // The member-name spelling of the pattern: the last `.`-segment of its text.
     let pattern_text = pattern.text();
-    let member = pattern_text.rsplit('.').next().unwrap_or(pattern_text).trim();
+    let member = pattern_text
+        .rsplit('.')
+        .next()
+        .unwrap_or(pattern_text)
+        .trim();
 
     match subject {
-        Value::Enum { member: subj_member, .. } => Ok(subj_member == member),
+        Value::Enum {
+            member: subj_member,
+            ..
+        } => Ok(subj_member == member),
         Value::Bool(b) => match member {
             "True" | "true" => Ok(*b),
             "False" | "false" => Ok(!*b),
@@ -416,13 +437,13 @@ fn values_equal_loose(a: &Value, b: &Value) -> Result<bool, EvalError> {
     match (a, b) {
         (Value::Bool(x), Value::Bool(y)) => Ok(x == y),
         (Value::Str(x), Value::Str(y)) => Ok(x == y),
-        (
-            Value::Enum { id: i1, member: m1 },
-            Value::Enum { id: i2, member: m2 },
-        ) => Ok(i1 == i2 && m1 == m2),
-        (Value::Int(_) | Value::Uint(_) | Value::Float(_), Value::Int(_) | Value::Uint(_) | Value::Float(_)) => {
-            Ok(a.as_f64()? == b.as_f64()?)
+        (Value::Enum { id: i1, member: m1 }, Value::Enum { id: i2, member: m2 }) => {
+            Ok(i1 == i2 && m1 == m2)
         }
+        (
+            Value::Int(_) | Value::Uint(_) | Value::Float(_),
+            Value::Int(_) | Value::Uint(_) | Value::Float(_),
+        ) => Ok(a.as_f64()? == b.as_f64()?),
         _ => Ok(false),
     }
 }
@@ -541,10 +562,12 @@ fn exec_local_declaration(node: &Node, ctx: &mut EvalCtx) -> Result<(), EvalErro
         // every later tick, so do not re-run the initialiser if it already holds a
         // value. Keyed by the owning function symbol so two functions' statics do
         // not collide.
-        let fn_symbol = ctx.fn_symbol.ok_or_else(|| EvalError::UnsupportedConstruct {
-            kind: "static local outside a function".to_string(),
-            at: node.byte_range().start,
-        })?;
+        let fn_symbol = ctx
+            .fn_symbol
+            .ok_or_else(|| EvalError::UnsupportedConstruct {
+                kind: "static local outside a function".to_string(),
+                at: node.byte_range().start,
+            })?;
         if ctx.env.get_static(fn_symbol, &var).is_none() {
             let init = match node.child_by_field(Field::Value) {
                 Some(v) => coerce_to(eval(&v, ctx)?, declared)?,
@@ -770,9 +793,11 @@ mod tests {
         let mut h = Harness::new();
         // A System.* IO call is a documented stub; as an expression statement it
         // evaluates (for its side effect / value) and is discarded without error.
-        h.run("System.Reset();\n").expect_err("Reset is not stubbed -> fail loud");
+        h.run("System.Reset();\n")
+            .expect_err("Reset is not stubbed -> fail loud");
         // A stubbed System.TickPeriod() call as a statement does not error.
-        h.run("System.TickPeriod();\n").expect("TickPeriod is a documented stub");
+        h.run("System.TickPeriod();\n")
+            .expect("TickPeriod is a documented stub");
     }
 
     // ---- Task 21: if/else ----
@@ -827,7 +852,10 @@ mod tests {
         // Seed the subject as an enum value; the matching is-clause runs.
         h.env.set(
             "Root.Demo.Speed",
-            Value::Enum { id: 1, member: "On".to_string() },
+            Value::Enum {
+                id: 1,
+                member: "On".to_string(),
+            },
         );
         h.run("when (Speed)\n{\n\tis (On)\n\t{\n\t\tOutput = 1.0;\n\t}\n\tis (Off)\n\t{\n\t\tOutput = 2.0;\n\t}\n}\n")
             .unwrap();
@@ -839,7 +867,10 @@ mod tests {
         let mut h = Harness::new();
         h.env.set(
             "Root.Demo.Speed",
-            Value::Enum { id: 1, member: "Off".to_string() },
+            Value::Enum {
+                id: 1,
+                member: "Off".to_string(),
+            },
         );
         // `is (State.Off)` matches by the trailing member segment.
         h.run("when (Speed)\n{\n\tis (State.On)\n\t{\n\t\tOutput = 1.0;\n\t}\n\tis (State.Off)\n\t{\n\t\tOutput = 2.0;\n\t}\n}\n")
@@ -852,7 +883,10 @@ mod tests {
         let mut h = Harness::new();
         h.env.set(
             "Root.Demo.Speed",
-            Value::Enum { id: 1, member: "B".to_string() },
+            Value::Enum {
+                id: 1,
+                member: "B".to_string(),
+            },
         );
         h.run("when (Speed)\n{\n\tis (A or B)\n\t{\n\t\tOutput = 9.0;\n\t}\n\tis (C)\n\t{\n\t\tOutput = 1.0;\n\t}\n}\n")
             .unwrap();
@@ -864,7 +898,10 @@ mod tests {
         let mut h = Harness::new();
         h.env.set(
             "Root.Demo.Speed",
-            Value::Enum { id: 1, member: "Z".to_string() },
+            Value::Enum {
+                id: 1,
+                member: "Z".to_string(),
+            },
         );
         h.run("when (Speed)\n{\n\tis (A)\n\t{\n\t\tOutput = 1.0;\n\t}\n}\n")
             .unwrap();
@@ -877,7 +914,8 @@ mod tests {
     fn expand_loop_binds_interpolation() {
         let mut h = Harness::new();
         // Expand writes to locals named Out1..Out3, each set to its index.
-        h.run("expand (i = 1 to 3)\n{\n\tlocal Out$(i) = i;\n}\n").unwrap();
+        h.run("expand (i = 1 to 3)\n{\n\tlocal Out$(i) = i;\n}\n")
+            .unwrap();
         assert_eq!(h.env.get_local("Out1"), Some(&Value::Int(1)));
         assert_eq!(h.env.get_local("Out2"), Some(&Value::Int(2)));
         assert_eq!(h.env.get_local("Out3"), Some(&Value::Int(3)));
@@ -950,7 +988,8 @@ mod tests {
     #[test]
     fn block_runs_children_in_order() {
         let mut h = Harness::new();
-        h.run("{\n\tlocal a = 1;\n\tlocal b = 2;\n\tOutput = 3.0;\n}\n").unwrap();
+        h.run("{\n\tlocal a = 1;\n\tlocal b = 2;\n\tOutput = 3.0;\n}\n")
+            .unwrap();
         assert_eq!(h.env.get_local("a"), Some(&Value::Int(1)));
         assert_eq!(h.env.get_local("b"), Some(&Value::Int(2)));
         assert_eq!(h.env.get("Root.Demo.Output"), Some(&Value::Float(3.0)));

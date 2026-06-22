@@ -185,7 +185,9 @@ fn main() {
     // A run needs something to do: evaluate a scenario, or print coverage. With
     // neither, the invocation is incomplete — a usage error.
     if args.scenario.is_none() && !args.coverage && args.log.is_none() {
-        eprintln!("m1-eval: nothing to do (pass --scenario or --log to run, or --coverage to report)");
+        eprintln!(
+            "m1-eval: nothing to do (pass --scenario or --log to run, or --coverage to report)"
+        );
         process::exit(2);
     }
 

@@ -13,8 +13,11 @@ use std::path::Path;
 #[test]
 fn single_function_trace_snapshot() {
     let dir = Path::new(env!("CARGO_MANIFEST_DIR")).join("tests/fixtures/mini");
-    let engine = Engine::load(&dir.join("Project.m1prj"), Some(&dir.join("parameters.m1cfg")))
-        .expect("mini fixture loads");
+    let engine = Engine::load(
+        &dir.join("Project.m1prj"),
+        Some(&dir.join("parameters.m1cfg")),
+    )
+    .expect("mini fixture loads");
 
     let toml = r#"
 mode = "function"
@@ -116,8 +119,11 @@ const = 4.0
 #[test]
 fn coverage_render_snapshot() {
     let dir = Path::new(env!("CARGO_MANIFEST_DIR")).join("tests/fixtures/mini");
-    let engine = Engine::load(&dir.join("Project.m1prj"), Some(&dir.join("parameters.m1cfg")))
-        .expect("mini fixture loads");
+    let engine = Engine::load(
+        &dir.join("Project.m1prj"),
+        Some(&dir.join("parameters.m1cfg")),
+    )
+    .expect("mini fixture loads");
     let report = engine.coverage();
     insta::assert_snapshot!("coverage_render", report.render());
 }

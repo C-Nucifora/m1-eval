@@ -18,7 +18,7 @@
 //! [`EvalError::UnresolvedSymbol`] — never a guessed number. A parameter/constant
 //! is a *tunable calibration value*, not a runtime input: an unseeded one (no
 //! `.m1cfg`, no override) defaults to its declared-type zero, flagged externally
-//! driven, like the Tier-3 IO stubs (see [`read_symbol`]).
+//! driven, like the Tier-3 IO stubs (see `read_symbol`).
 //!
 //! Identifier paths may contain spaces (`Cooling Fan`); we only ever split paths
 //! on `.`, never on whitespace.
@@ -59,7 +59,7 @@ pub struct EvalCtx<'a> {
     /// The tick step in seconds (stateful operators advance by this).
     pub dt: f64,
     /// Every parsed script in the project, so an inline user-function call
-    /// ([`crate::builtins::userfn`]) can find the backing [`ParsedScript`] of the
+    /// ([`crate::builtins::userfn`]) can find the backing `ParsedScript` of the
     /// callee symbol (the reverse of `function_symbol_for_script`). Threaded from
     /// the runner; an empty slice in unit tests that never call a user function.
     pub scripts: &'a [m1_typecheck::parsed::ParsedScript],
@@ -252,11 +252,11 @@ fn eval_path(path: &str, node: &Node, ctx: &mut EvalCtx) -> Result<Value, EvalEr
         // member literal used directly as a value (`x eq Universal Switch State.On`,
         // `Drive State.Idle`). Resolve it to the corresponding [`Value::Enum`]
         // before failing loud — these literals are compile-time-constant values.
-        Target::Unresolved => enum_member_literal(path, ctx).ok_or_else(|| {
-            EvalError::UnresolvedSymbol {
+        Target::Unresolved => {
+            enum_member_literal(path, ctx).ok_or_else(|| EvalError::UnresolvedSymbol {
                 name: path.to_string(),
-            }
-        }),
+            })
+        }
     }
 }
 
@@ -285,9 +285,13 @@ fn enum_member_literal(path: &str, ctx: &EvalCtx) -> Option<Value> {
         // is qualified by the value source rather than the bare enum type name. A
         // value-compound (`GroupCompound`) carries its enum on its `.Value` child,
         // so consult that child's type when the symbol itself is untyped.
-        let Target::Symbol(canon) =
-            classify(prefix, ctx.group, ctx.fn_symbol, ctx.project, &ctx.env.locals)
-        else {
+        let Target::Symbol(canon) = classify(
+            prefix,
+            ctx.group,
+            ctx.fn_symbol,
+            ctx.project,
+            &ctx.env.locals,
+        ) else {
             return None;
         };
         let enum_id_of = |path: &str| match symbols.get(path).map(|s| s.value_type) {
@@ -760,7 +764,9 @@ fn values_equal(l: &Value, r: &Value) -> Result<bool, EvalError> {
         (Str(a), Str(b)) => Ok(a == b),
         (Enum { id: i1, member: m1 }, Enum { id: i2, member: m2 }) => Ok(i1 == i2 && m1 == m2),
         // Any numeric pairing compares by f64 value.
-        (Int(_) | Uint(_) | Float(_), Int(_) | Uint(_) | Float(_)) => Ok(l.as_f64()? == r.as_f64()?),
+        (Int(_) | Uint(_) | Float(_), Int(_) | Uint(_) | Float(_)) => {
+            Ok(l.as_f64()? == r.as_f64()?)
+        }
         _ => Err(EvalError::TypeError {
             detail: format!("cannot compare {l:?} with {r:?} for equality"),
         }),
@@ -783,9 +789,7 @@ fn bitwise(op: Kind, l: &Value, r: &Value) -> Result<Value, EvalError> {
             Ok(Value::Int(bit_i64(op, as_i64(l)?, as_i64(r)?)))
         }
         _ => Err(EvalError::TypeError {
-            detail: format!(
-                "bitwise operator requires integral operands, got {l:?} and {r:?}"
-            ),
+            detail: format!("bitwise operator requires integral operands, got {l:?} and {r:?}"),
         }),
     }
 }

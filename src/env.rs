@@ -104,7 +104,11 @@ pub enum OpState {
     },
     /// `Change.{By,Up,Down}`: the previous numeric argument value, plus a timer
     /// and pending flag for the filtered overloads.
-    ChangeBy { prev_x: f64, held: f64, pending: bool },
+    ChangeBy {
+        prev_x: f64,
+        held: f64,
+        pending: bool,
+    },
     /// `Change.{To,From,Either}`: the previous boolean condition, plus a timer
     /// for the filtered overloads.
     ChangeEdge { prev: bool, held: f64 },
@@ -338,8 +342,14 @@ mod tests {
         let mut env = Env::new();
         env.set_static("Root.Demo.Update", "x", Value::Int(1));
         env.set_static("Root.Other.Update", "x", Value::Int(2));
-        assert_eq!(env.get_static("Root.Demo.Update", "x"), Some(&Value::Int(1)));
-        assert_eq!(env.get_static("Root.Other.Update", "x"), Some(&Value::Int(2)));
+        assert_eq!(
+            env.get_static("Root.Demo.Update", "x"),
+            Some(&Value::Int(1))
+        );
+        assert_eq!(
+            env.get_static("Root.Other.Update", "x"),
+            Some(&Value::Int(2))
+        );
     }
 
     #[test]

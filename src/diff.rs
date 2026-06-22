@@ -116,7 +116,11 @@ impl Diff {
             );
         }
 
-        Diff { time, channels, eps }
+        Diff {
+            time,
+            channels,
+            eps,
+        }
     }
 
     /// The channel paths whose counterfactual value diverged from the log by more
@@ -295,11 +299,17 @@ mod tests {
             channels: vec![
                 InputSeries {
                     channel: "Root.CF.Sensor".to_string(),
-                    kind: InputKind::Series(vec![(0.0, Value::Float(10.0)), (1.0, Value::Float(10.0))]),
+                    kind: InputKind::Series(vec![
+                        (0.0, Value::Float(10.0)),
+                        (1.0, Value::Float(10.0)),
+                    ]),
                 },
                 InputSeries {
                     channel: "Root.CF.Mid".to_string(),
-                    kind: InputKind::Series(vec![(0.0, Value::Float(25.0)), (1.0, Value::Float(25.0))]),
+                    kind: InputKind::Series(vec![
+                        (0.0, Value::Float(25.0)),
+                        (1.0, Value::Float(25.0)),
+                    ]),
                 },
             ],
             meta: crate::log::LogMeta::default(),
@@ -326,11 +336,17 @@ mod tests {
         // logged values produces an empty change set.
         let log = two_channel_log();
         let trace = trace_with(
-            &[("Root.CF.Sensor", &[10.0, 10.0]), ("Root.CF.Mid", &[25.0, 25.0])],
+            &[
+                ("Root.CF.Sensor", &[10.0, 10.0]),
+                ("Root.CF.Mid", &[25.0, 25.0]),
+            ],
             &[0.0, 1.0],
         );
         let diff = Diff::between(&log, &trace);
-        assert!(diff.changed_channels().is_empty(), "no-op must not flag changes");
+        assert!(
+            diff.changed_channels().is_empty(),
+            "no-op must not flag changes"
+        );
         assert_eq!(diff.channels["Root.CF.Mid"].max_abs_delta, 0.0);
         assert_eq!(diff.channels["Root.CF.Mid"].delta, vec![0.0, 0.0]);
     }
@@ -340,7 +356,10 @@ mod tests {
         // Mid moved by +5 under the override; Sensor stayed at its logged value.
         let log = two_channel_log();
         let trace = trace_with(
-            &[("Root.CF.Sensor", &[10.0, 10.0]), ("Root.CF.Mid", &[30.0, 30.0])],
+            &[
+                ("Root.CF.Sensor", &[10.0, 10.0]),
+                ("Root.CF.Mid", &[30.0, 30.0]),
+            ],
             &[0.0, 1.0],
         );
         let diff = Diff::between(&log, &trace);

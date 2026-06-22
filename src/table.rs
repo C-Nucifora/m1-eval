@@ -99,7 +99,11 @@ pub fn lookup(t: &CalTable, inputs: &[f64]) -> Result<f64, EvalError> {
             let len = t.axes[k].len();
             // Clamp the upper index so a single-breakpoint axis (len 1) or a
             // top-end clamp can't index past the last cell.
-            let idx = if upper { (lo[k] + 1).min(len - 1) } else { lo[k] };
+            let idx = if upper {
+                (lo[k] + 1).min(len - 1)
+            } else {
+                lo[k]
+            };
             weight *= if upper { frac[k] } else { 1.0 - frac[k] };
             offset += idx * stride[k];
         }

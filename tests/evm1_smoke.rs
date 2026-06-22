@@ -57,11 +57,7 @@ fn evm1_phase15_categories_are_closed() {
 
     // Every Phase-1.5 category must be absent from the Unsupported list. We check
     // by the item *name* spelling so a regression in any one category is pinpointed.
-    let unsupported: Vec<&str> = report
-        .unsupported
-        .iter()
-        .map(|i| i.name.as_str())
-        .collect();
+    let unsupported: Vec<&str> = report.unsupported.iter().map(|i| i.name.as_str()).collect();
 
     // 1. Pure Calculate.* overloads (P15-A).
     let calc: Vec<&&str> = unsupported

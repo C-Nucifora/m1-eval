@@ -150,7 +150,10 @@ fn render_schedule(out: &mut String, schedule: &[(String, Option<f64>)]) {
 /// but keeps the **unscheduled** (`None`) functions too, so the report can flag
 /// them. Sorted `(rate descending, function symbol)` for determinism; empty when
 /// no [`Project`] is available to resolve rates.
-fn build_schedule(scripts: &[ParsedScript], project: Option<&Project>) -> Vec<(String, Option<f64>)> {
+fn build_schedule(
+    scripts: &[ParsedScript],
+    project: Option<&Project>,
+) -> Vec<(String, Option<f64>)> {
     let Some(project) = project else {
         return Vec::new();
     };
@@ -160,7 +163,10 @@ fn build_schedule(scripts: &[ParsedScript], project: Option<&Project>) -> Vec<(S
             // A script without a backing function symbol is not a scheduled
             // function (e.g. a non-function script) — skip it entirely.
             let fn_symbol = project.function_symbol_for_script(&script.name)?;
-            let rate_hz = project.symbols().get(&fn_symbol).and_then(|s| s.call_rate_hz);
+            let rate_hz = project
+                .symbols()
+                .get(&fn_symbol)
+                .and_then(|s| s.call_rate_hz);
             Some((fn_symbol, rate_hz))
         })
         .collect();
@@ -365,17 +371,14 @@ Output = i;
         let src = "Output = Calculate.NoSuchMethod(1);\n";
         let scripts = scripts_from(src);
         let report = CoverageReport::analyse(&scripts);
-        let names: Vec<&str> = report
-            .unsupported
-            .iter()
-            .map(|i| i.name.as_str())
-            .collect();
+        let names: Vec<&str> = report.unsupported.iter().map(|i| i.name.as_str()).collect();
         assert!(names.contains(&"Calculate.NoSuchMethod"), "{names:?}");
     }
 
     #[test]
     fn statement_constructs_are_reported_supported() {
-        let src = "local x = 1;\nif (Speed > 0.0)\n{\n\tOutput = 1.0;\n}\nelse\n{\n\tOutput = 0.0;\n}\n";
+        let src =
+            "local x = 1;\nif (Speed > 0.0)\n{\n\tOutput = 1.0;\n}\nelse\n{\n\tOutput = 0.0;\n}\n";
         let scripts = scripts_from(src);
         let report = CoverageReport::analyse(&scripts);
         let constructs: Vec<&str> = report
@@ -385,9 +388,14 @@ Output = i;
             .map(|i| i.name.as_str())
             .collect();
         // The if-statement and assignment constructs are recognised + supported.
-        assert!(constructs.iter().any(|c| c.contains("if")), "{constructs:?}");
         assert!(
-            constructs.iter().any(|c| c.contains("assignment") || c.contains("Assignment")),
+            constructs.iter().any(|c| c.contains("if")),
+            "{constructs:?}"
+        );
+        assert!(
+            constructs
+                .iter()
+                .any(|c| c.contains("assignment") || c.contains("Assignment")),
             "{constructs:?}"
         );
     }
@@ -399,10 +407,9 @@ Output = i;
         // name (`Update`) collides with the `Service Bits.Update` GroupCompound IO
         // stub. The coverage walk must resolve the callee against the project to
         // disambiguate, mirroring `eval_call` (which tries `userfn::call` first).
-        let dir = std::path::Path::new(env!("CARGO_MANIFEST_DIR"))
-            .join("tests/fixtures/userfn");
-        let loaded = crate::loader::load(&dir.join("Project.m1prj"), None)
-            .expect("userfn fixture loads");
+        let dir = std::path::Path::new(env!("CARGO_MANIFEST_DIR")).join("tests/fixtures/userfn");
+        let loaded =
+            crate::loader::load(&dir.join("Project.m1prj"), None).expect("userfn fixture loads");
         let report = CoverageReport::analyse_in(&loaded.scripts, Some(&loaded.project));
 
         let supported: Vec<&str> = report.supported.iter().map(|i| i.name.as_str()).collect();
@@ -411,17 +418,13 @@ Output = i;
             "Helper.Compute should be Supported, got supported={supported:?}"
         );
         // It must NOT appear in the unsupported or stubbed buckets.
-        let unsupported: Vec<&str> =
-            report.unsupported.iter().map(|i| i.name.as_str()).collect();
+        let unsupported: Vec<&str> = report.unsupported.iter().map(|i| i.name.as_str()).collect();
         let stubbed: Vec<&str> = report.stubbed.iter().map(|i| i.name.as_str()).collect();
         assert!(
             !unsupported.contains(&"Helper.Compute"),
             "unsupported={unsupported:?}"
         );
-        assert!(
-            !stubbed.contains(&"Helper.Compute"),
-            "stubbed={stubbed:?}"
-        );
+        assert!(!stubbed.contains(&"Helper.Compute"), "stubbed={stubbed:?}");
     }
 
     #[test]
@@ -453,10 +456,9 @@ Output = i;
         // each function's `call_rate_hz` (or `None` for an On-Startup function
         // that never runs in whole-project mode). The multirate fixture has four
         // periodic functions (two at 100 Hz, two at 50 Hz) and one startup.
-        let dir =
-            std::path::Path::new(env!("CARGO_MANIFEST_DIR")).join("tests/fixtures/multirate");
-        let loaded = crate::loader::load(&dir.join("Project.m1prj"), None)
-            .expect("multirate fixture loads");
+        let dir = std::path::Path::new(env!("CARGO_MANIFEST_DIR")).join("tests/fixtures/multirate");
+        let loaded =
+            crate::loader::load(&dir.join("Project.m1prj"), None).expect("multirate fixture loads");
         let report = CoverageReport::analyse_in(&loaded.scripts, Some(&loaded.project));
 
         // Look the schedule up by function symbol path.
@@ -479,10 +481,9 @@ Output = i;
         // The `Schedule:` section lists each function with its rate; an
         // unscheduled (`None`) function is flagged so the user sees it will not
         // run in whole-project mode.
-        let dir =
-            std::path::Path::new(env!("CARGO_MANIFEST_DIR")).join("tests/fixtures/multirate");
-        let loaded = crate::loader::load(&dir.join("Project.m1prj"), None)
-            .expect("multirate fixture loads");
+        let dir = std::path::Path::new(env!("CARGO_MANIFEST_DIR")).join("tests/fixtures/multirate");
+        let loaded =
+            crate::loader::load(&dir.join("Project.m1prj"), None).expect("multirate fixture loads");
         let report = CoverageReport::analyse_in(&loaded.scripts, Some(&loaded.project));
         let text = report.render();
 

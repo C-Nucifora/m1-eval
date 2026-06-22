@@ -195,7 +195,9 @@ mod tests {
     fn series_for_preserves_channel_with_space() {
         let log = hand_built_log();
         // A channel path containing a space is matched whole, never split.
-        let s = log.series_for("Engine Speed").expect("Engine Speed present");
+        let s = log
+            .series_for("Engine Speed")
+            .expect("Engine Speed present");
         assert_eq!(s.channel, "Engine Speed");
     }
 
@@ -267,11 +269,19 @@ mod from_csv_tests {
     fn units_row_is_captured_not_a_value_row() {
         let log = Log::from_csv(WITH_UNITS, "run.csv").expect("CSV parses");
         // The units row went into meta.units, keyed by channel name.
-        assert_eq!(log.meta.units.get("Engine Speed").map(String::as_str), Some("rpm"));
-        assert_eq!(log.meta.units.get("Wheel Speed").map(String::as_str), Some("km/h"));
+        assert_eq!(
+            log.meta.units.get("Engine Speed").map(String::as_str),
+            Some("rpm")
+        );
+        assert_eq!(
+            log.meta.units.get("Wheel Speed").map(String::as_str),
+            Some("km/h")
+        );
         // ...and was NOT consumed as a data keyframe: the first real keyframe is
         // at t=0.0 with value 800, so a sample at t=0.0 is 800 (not the units row).
-        let es = log.series_for("Engine Speed").expect("Engine Speed present");
+        let es = log
+            .series_for("Engine Speed")
+            .expect("Engine Speed present");
         assert_eq!(es.sample(0.0), Value::Float(800.0));
         // Three data rows -> three keyframes (the units row added none).
         match &es.kind {
@@ -299,7 +309,9 @@ mod from_csv_tests {
     fn channel_name_with_space_survives_verbatim() {
         let log = Log::from_csv(WITH_UNITS, "run.csv").expect("CSV parses");
         // "Engine Speed" is matched whole; never split on whitespace.
-        let s = log.series_for("Engine Speed").expect("Engine Speed present");
+        let s = log
+            .series_for("Engine Speed")
+            .expect("Engine Speed present");
         assert_eq!(s.channel, "Engine Speed");
     }
 
@@ -366,7 +378,10 @@ mod from_csv_tests {
         let names: Vec<&str> = log.channel_names().collect();
         assert_eq!(names, vec!["Engine Speed"]);
         // The dropped column's unit is gone; the kept channel's unit remains.
-        assert_eq!(log.meta.units.get("Engine Speed").map(String::as_str), Some("rpm"));
+        assert_eq!(
+            log.meta.units.get("Engine Speed").map(String::as_str),
+            Some("rpm")
+        );
         assert!(!log.meta.units.contains_key("Empty Channel"));
     }
 

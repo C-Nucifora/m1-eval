@@ -221,10 +221,12 @@ pub(crate) fn parse_time_series_csv(
     detect_units: bool,
 ) -> Result<ParsedTimeSeriesCsv, EvalError> {
     let mut lines = csv.lines();
-    let header = lines.next().ok_or_else(|| EvalError::UnsupportedConstruct {
-        kind: "empty CSV: no header row".to_string(),
-        at: 0,
-    })?;
+    let header = lines
+        .next()
+        .ok_or_else(|| EvalError::UnsupportedConstruct {
+            kind: "empty CSV: no header row".to_string(),
+            at: 0,
+        })?;
     let cols: Vec<String> = split_csv_row(header);
     if cols.is_empty() || !cols[0].eq_ignore_ascii_case("time") {
         return Err(EvalError::UnsupportedConstruct {
@@ -389,10 +391,12 @@ impl RawScenario {
         // it is optional only in that mode). Resolving the target here keeps the
         // fail-loud error attached to the mode that needs it.
         let require_target = |mode: &str| -> Result<String, EvalError> {
-            self.target.clone().ok_or_else(|| EvalError::UnsupportedConstruct {
-                kind: format!("scenario mode {mode:?} requires a `target`"),
-                at: 0,
-            })
+            self.target
+                .clone()
+                .ok_or_else(|| EvalError::UnsupportedConstruct {
+                    kind: format!("scenario mode {mode:?} requires a `target`"),
+                    at: 0,
+                })
         };
         let mode = match self.mode.as_str() {
             "function" => RunMode::Function(require_target("function")?),
@@ -413,7 +417,10 @@ impl RawScenario {
         // negative rate is always invalid.
         if self.base_rate_hz < 0.0 {
             return Err(EvalError::UnsupportedConstruct {
-                kind: format!("base_rate_hz must be non-negative, got {}", self.base_rate_hz),
+                kind: format!(
+                    "base_rate_hz must be non-negative, got {}",
+                    self.base_rate_hz
+                ),
                 at: 0,
             });
         }
@@ -463,7 +470,12 @@ impl RawInput {
                         at: 0,
                     });
                 }
-                InputKind::Series(points.into_iter().map(|(t, v)| (t, v.into_value())).collect())
+                InputKind::Series(
+                    points
+                        .into_iter()
+                        .map(|(t, v)| (t, v.into_value()))
+                        .collect(),
+                )
             }
             (Some(_), Some(_)) => {
                 return Err(EvalError::UnsupportedConstruct {
@@ -476,10 +488,7 @@ impl RawInput {
             }
             (None, None) => {
                 return Err(EvalError::UnsupportedConstruct {
-                    kind: format!(
-                        "input {:?} sets neither `const` nor `series`",
-                        self.channel
-                    ),
+                    kind: format!("input {:?} sets neither `const` nor `series`", self.channel),
                     at: 0,
                 });
             }

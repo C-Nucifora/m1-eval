@@ -67,7 +67,7 @@ pub fn call(
 /// (`object_key`, a [`CallSite`] with the object path in the script slot and a
 /// zero offset) rather than the individual call site — `Start`/`Remaining`/… on
 /// one Timer all address the same state. The countdown advances by `ctx.dt` each
-/// time [`Remaining`](Timer::Remaining) is read (the documented Phase-1 model: a
+/// time `Remaining` is read (the documented Phase-1 model: a
 /// Timer is read once per tick, so reading advances it one tick), clamped at
 /// zero. `Start(period)` (re)loads the period and runs; `Stop` halts without
 /// clearing; `Reset` clears to zero and halts.
@@ -357,7 +357,11 @@ fn derivative_normal(
 /// `Derivative.Adaptive(x, delta, max_dt)` — recompute the slope only when the
 /// input has moved by `>= delta` or `max_dt` seconds have elapsed since the last
 /// accepted update; otherwise hold the previous derivative.
-fn derivative_adaptive(args: &[Value], site: CallSite, ctx: &mut EvalCtx) -> Result<Value, EvalError> {
+fn derivative_adaptive(
+    args: &[Value],
+    site: CallSite,
+    ctx: &mut EvalCtx,
+) -> Result<Value, EvalError> {
     let x = args[0].as_f64()?;
     let delta = args[1].as_f64()?;
     let max_dt = args[2].as_f64()?;
@@ -382,7 +386,11 @@ fn derivative_adaptive(args: &[Value], site: CallSite, ctx: &mut EvalCtx) -> Res
             let timed_out = max_dt > 0.0 && elapsed >= max_dt;
             if moved_enough || timed_out {
                 // Accept an update: slope over the actual elapsed interval.
-                let d = if elapsed > 0.0 { (x - last_x) / elapsed } else { prev_d };
+                let d = if elapsed > 0.0 {
+                    (x - last_x) / elapsed
+                } else {
+                    prev_d
+                };
                 (d, x, 0.0)
             } else {
                 // Hold the previous derivative; keep accumulating elapsed time.
@@ -486,7 +494,11 @@ fn delay_stable(args: &[Value], site: CallSite, ctx: &mut EvalCtx) -> Result<Val
     let dt = ctx.dt;
     let slot = ctx.state.entry(site);
     let prev = match slot {
-        OpState::ChangeBy { prev_x, held, pending } => Some((*prev_x, *held, *pending)),
+        OpState::ChangeBy {
+            prev_x,
+            held,
+            pending,
+        } => Some((*prev_x, *held, *pending)),
         _ => None,
     };
     let (reference, held, output) = match prev {
@@ -543,7 +555,11 @@ fn debounce_stable(args: &[Value], site: CallSite, ctx: &mut EvalCtx) -> Result<
     let dt = ctx.dt;
     let slot = ctx.state.entry(site);
     let prev = match slot {
-        OpState::Timed { output, candidate, held } => Some((*output, *candidate, *held)),
+        OpState::Timed {
+            output,
+            candidate,
+            held,
+        } => Some((*output, *candidate, *held)),
         _ => None,
     };
     let (output, candidate, held) = match prev {
@@ -561,7 +577,11 @@ fn debounce_stable(args: &[Value], site: CallSite, ctx: &mut EvalCtx) -> Result<
             }
         }
     };
-    *slot = OpState::Timed { output, candidate, held };
+    *slot = OpState::Timed {
+        output,
+        candidate,
+        held,
+    };
     Ok(Value::Bool(output))
 }
 
@@ -665,7 +685,11 @@ fn change_by(
     let dt = ctx.dt;
     let slot = ctx.state.entry(site);
     let prev = match slot {
-        OpState::ChangeBy { prev_x, held, pending } => Some((*prev_x, *held, *pending)),
+        OpState::ChangeBy {
+            prev_x,
+            held,
+            pending,
+        } => Some((*prev_x, *held, *pending)),
         _ => None,
     };
 
@@ -702,7 +726,11 @@ fn change_by(
             }
         }
     };
-    *slot = OpState::ChangeBy { prev_x, held, pending };
+    *slot = OpState::ChangeBy {
+        prev_x,
+        held,
+        pending,
+    };
     Ok(Value::Bool(pulse))
 }
 
@@ -765,7 +793,10 @@ fn change_edge(
             }
         }
     };
-    *slot = OpState::ChangeEdge { prev: prev_out, held };
+    *slot = OpState::ChangeEdge {
+        prev: prev_out,
+        held,
+    };
     Ok(Value::Bool(pulse))
 }
 
@@ -866,7 +897,11 @@ fn calc_hysteresis(args: &[Value], site: CallSite, ctx: &mut EvalCtx) -> Result<
     };
     let slot = ctx.state.entry(site);
     let (mut output, candidate, held) = match slot {
-        OpState::Timed { output, candidate, held } => (*output, *candidate, *held),
+        OpState::Timed {
+            output,
+            candidate,
+            held,
+        } => (*output, *candidate, *held),
         _ => (false, false, 0.0),
     };
     let (candidate, held) = match want {
@@ -889,7 +924,11 @@ fn calc_hysteresis(args: &[Value], site: CallSite, ctx: &mut EvalCtx) -> Result<
             }
         }
     };
-    *slot = OpState::Timed { output, candidate, held };
+    *slot = OpState::Timed {
+        output,
+        candidate,
+        held,
+    };
     Ok(Value::Bool(output))
 }
 
@@ -899,7 +938,9 @@ fn calc_hysteresis(args: &[Value], site: CallSite, ctx: &mut EvalCtx) -> Result<
 fn timed_predicate(cond: bool, filter: f64, dt: f64, ctx: &mut EvalCtx, site: CallSite) -> bool {
     let slot = ctx.state.entry(site);
     let (candidate, held) = match slot {
-        OpState::Timed { candidate, held, .. } => (*candidate, *held),
+        OpState::Timed {
+            candidate, held, ..
+        } => (*candidate, *held),
         _ => (false, 0.0),
     };
     let (output, candidate, held) = if cond != candidate {
@@ -913,7 +954,11 @@ fn timed_predicate(cond: bool, filter: f64, dt: f64, ctx: &mut EvalCtx, site: Ca
         // cond false and stable: output false.
         (false, cond, held + dt)
     };
-    *slot = OpState::Timed { output, candidate, held };
+    *slot = OpState::Timed {
+        output,
+        candidate,
+        held,
+    };
     output
 }
 
@@ -987,13 +1032,33 @@ mod tests {
         let tc = Value::Float(0.1);
 
         // Tick 1: seeds to the first input (0.0). No transient.
-        approx(h.tick("Filter", "FirstOrder", &[Value::Float(0.0), tc.clone()]).as_f64().unwrap(), 0.0);
+        approx(
+            h.tick("Filter", "FirstOrder", &[Value::Float(0.0), tc.clone()])
+                .as_f64()
+                .unwrap(),
+            0.0,
+        );
         // Step the input to 1.0. y = 0.5*1 + 0.5*0 = 0.5.
-        approx(h.tick("Filter", "FirstOrder", &[Value::Float(1.0), tc.clone()]).as_f64().unwrap(), 0.5);
+        approx(
+            h.tick("Filter", "FirstOrder", &[Value::Float(1.0), tc.clone()])
+                .as_f64()
+                .unwrap(),
+            0.5,
+        );
         // Hold at 1.0. y = 0.5*1 + 0.5*0.5 = 0.75.
-        approx(h.tick("Filter", "FirstOrder", &[Value::Float(1.0), tc.clone()]).as_f64().unwrap(), 0.75);
+        approx(
+            h.tick("Filter", "FirstOrder", &[Value::Float(1.0), tc.clone()])
+                .as_f64()
+                .unwrap(),
+            0.75,
+        );
         // Hold. y = 0.5*1 + 0.5*0.75 = 0.875.
-        approx(h.tick("Filter", "FirstOrder", &[Value::Float(1.0), tc]).as_f64().unwrap(), 0.875);
+        approx(
+            h.tick("Filter", "FirstOrder", &[Value::Float(1.0), tc])
+                .as_f64()
+                .unwrap(),
+            0.875,
+        );
     }
 
     #[test]
@@ -1001,14 +1066,26 @@ mod tests {
         // a0 = 0.5 again.
         let mut h = Harness::new(0.1);
         let tc = Value::Float(0.1);
-        h.tick("Filter", "FirstOrder", &[Value::Float(0.0), tc.clone(), Value::Bool(false)]);
+        h.tick(
+            "Filter",
+            "FirstOrder",
+            &[Value::Float(0.0), tc.clone(), Value::Bool(false)],
+        );
         // Build up some state.
-        h.tick("Filter", "FirstOrder", &[Value::Float(10.0), tc.clone(), Value::Bool(false)]);
+        h.tick(
+            "Filter",
+            "FirstOrder",
+            &[Value::Float(10.0), tc.clone(), Value::Bool(false)],
+        );
         // Reset true: output snaps to the current input regardless of history.
         approx(
-            h.tick("Filter", "FirstOrder", &[Value::Float(3.0), tc, Value::Bool(true)])
-                .as_f64()
-                .unwrap(),
+            h.tick(
+                "Filter",
+                "FirstOrder",
+                &[Value::Float(3.0), tc, Value::Bool(true)],
+            )
+            .as_f64()
+            .unwrap(),
             3.0,
         );
     }
@@ -1019,24 +1096,59 @@ mod tests {
         let mut h = Harness::new(0.1);
         let tc = Value::Float(0.1);
         // Seed at 0.
-        approx(h.tick("Filter", "Maximum", &[Value::Float(0.0), tc.clone()]).as_f64().unwrap(), 0.0);
+        approx(
+            h.tick("Filter", "Maximum", &[Value::Float(0.0), tc.clone()])
+                .as_f64()
+                .unwrap(),
+            0.0,
+        );
         // Rise to 5: instant attack -> 5.
-        approx(h.tick("Filter", "Maximum", &[Value::Float(5.0), tc.clone()]).as_f64().unwrap(), 5.0);
+        approx(
+            h.tick("Filter", "Maximum", &[Value::Float(5.0), tc.clone()])
+                .as_f64()
+                .unwrap(),
+            5.0,
+        );
         // Drop to 1: filtered fall -> 0.5*1 + 0.5*5 = 3.0.
-        approx(h.tick("Filter", "Maximum", &[Value::Float(1.0), tc.clone()]).as_f64().unwrap(), 3.0);
+        approx(
+            h.tick("Filter", "Maximum", &[Value::Float(1.0), tc.clone()])
+                .as_f64()
+                .unwrap(),
+            3.0,
+        );
         // A new higher value 4 < 3.0? No, 4 >= 3.0 -> instant -> 4.
-        approx(h.tick("Filter", "Maximum", &[Value::Float(4.0), tc]).as_f64().unwrap(), 4.0);
+        approx(
+            h.tick("Filter", "Maximum", &[Value::Float(4.0), tc])
+                .as_f64()
+                .unwrap(),
+            4.0,
+        );
     }
 
     #[test]
     fn filter_minimum_instant_fall_filtered_rise() {
         let mut h = Harness::new(0.1);
         let tc = Value::Float(0.1);
-        approx(h.tick("Filter", "Minimum", &[Value::Float(10.0), tc.clone()]).as_f64().unwrap(), 10.0);
+        approx(
+            h.tick("Filter", "Minimum", &[Value::Float(10.0), tc.clone()])
+                .as_f64()
+                .unwrap(),
+            10.0,
+        );
         // Drop to 2: instant attack downward -> 2.
-        approx(h.tick("Filter", "Minimum", &[Value::Float(2.0), tc.clone()]).as_f64().unwrap(), 2.0);
+        approx(
+            h.tick("Filter", "Minimum", &[Value::Float(2.0), tc.clone()])
+                .as_f64()
+                .unwrap(),
+            2.0,
+        );
         // Rise to 6: filtered rise -> 0.5*6 + 0.5*2 = 4.0.
-        approx(h.tick("Filter", "Minimum", &[Value::Float(6.0), tc]).as_f64().unwrap(), 4.0);
+        approx(
+            h.tick("Filter", "Minimum", &[Value::Float(6.0), tc])
+                .as_f64()
+                .unwrap(),
+            4.0,
+        );
     }
 
     #[test]
@@ -1060,9 +1172,15 @@ mod tests {
                 depth: 0,
                 trace: None,
             };
-            let v = call("Filter", "FirstOrder", &[Value::Float(seed), tc.clone()], site, &mut ctx)
-                .unwrap()
-                .unwrap();
+            let v = call(
+                "Filter",
+                "FirstOrder",
+                &[Value::Float(seed), tc.clone()],
+                site,
+                &mut ctx,
+            )
+            .unwrap()
+            .unwrap();
             approx(v.as_f64().unwrap(), seed);
         }
         // Two independent slots.
@@ -1086,7 +1204,11 @@ mod tests {
             depth: 0,
             trace: None,
         };
-        assert!(call("NotStateful", "X", &[], site, &mut ctx).unwrap().is_none());
+        assert!(
+            call("NotStateful", "X", &[], site, &mut ctx)
+                .unwrap()
+                .is_none()
+        );
     }
 
     // ---- Task 17: Integral.Normal ----
@@ -1178,13 +1300,7 @@ mod tests {
     fn derivative_adaptive_holds_until_delta_or_timeout() {
         // dt = 0.1, delta = 1.0, max_dt = 0.5.
         let mut h = Harness::new(0.1);
-        let args = |x: f64| {
-            [
-                Value::Float(x),
-                Value::Float(1.0),
-                Value::Float(0.5),
-            ]
-        };
+        let args = |x: f64| [Value::Float(x), Value::Float(1.0), Value::Float(0.5)];
         // First tick: seed at 0.0, output 0.
         approx(deriv(&mut h, "Adaptive", &args(0.0)), 0.0);
         // Move +0.3 (< delta 1.0) and elapsed 0.1 (< 0.5): hold previous (0).
@@ -1208,11 +1324,15 @@ mod tests {
     }
 
     fn delay_rising(h: &mut Harness, cond: bool, delay: f64) -> bool {
-        h.tick("Delay", "Rising", &[b(cond), Value::Float(delay)]).as_bool().unwrap()
+        h.tick("Delay", "Rising", &[b(cond), Value::Float(delay)])
+            .as_bool()
+            .unwrap()
     }
 
     fn delay_falling(h: &mut Harness, cond: bool, delay: f64) -> bool {
-        h.tick("Delay", "Falling", &[b(cond), Value::Float(delay)]).as_bool().unwrap()
+        h.tick("Delay", "Falling", &[b(cond), Value::Float(delay)])
+            .as_bool()
+            .unwrap()
     }
 
     #[test]
@@ -1246,7 +1366,9 @@ mod tests {
         // dt = 0.1, filter = 0.2.
         let mut h = Harness::new(0.1);
         let d = |h: &mut Harness, c: bool| {
-            h.tick("Debounce", "Stable", &[b(c), Value::Float(0.2)]).as_bool().unwrap()
+            h.tick("Debounce", "Stable", &[b(c), Value::Float(0.2)])
+                .as_bool()
+                .unwrap()
         };
         assert!(!d(&mut h, false)); // seed output false
         assert!(!d(&mut h, true)); //  new candidate true, held 0
@@ -1261,7 +1383,9 @@ mod tests {
         // Seeded to the first input (false -> level 0).
         let mut h = Harness::new(0.1);
         let d = |h: &mut Harness, c: bool| {
-            h.tick("Debounce", "Filter", &[b(c), Value::Float(0.1)]).as_bool().unwrap()
+            h.tick("Debounce", "Filter", &[b(c), Value::Float(0.1)])
+                .as_bool()
+                .unwrap()
         };
         assert!(!d(&mut h, false)); // seed level 0, output false
         // level: 0.5, 0.75, 0.875 -> crosses 0.8 on the third true tick.
@@ -1310,7 +1434,9 @@ mod tests {
     fn change_by_pulses_on_magnitude_change() {
         let mut h = Harness::new(0.1);
         let c = |h: &mut Harness, x: f64| {
-            h.tick("Change", "By", &[Value::Float(x), Value::Float(5.0)]).as_bool().unwrap()
+            h.tick("Change", "By", &[Value::Float(x), Value::Float(5.0)])
+                .as_bool()
+                .unwrap()
         };
         assert!(!c(&mut h, 0.0)); // seed
         assert!(!c(&mut h, 2.0)); // delta 2 < 5
@@ -1323,7 +1449,9 @@ mod tests {
     fn change_up_and_down_are_directional() {
         let mut h = Harness::new(0.1);
         let up = |h: &mut Harness, x: f64| {
-            h.tick("Change", "Up", &[Value::Float(x), Value::Float(5.0)]).as_bool().unwrap()
+            h.tick("Change", "Up", &[Value::Float(x), Value::Float(5.0)])
+                .as_bool()
+                .unwrap()
         };
         assert!(!up(&mut h, 0.0)); // seed
         assert!(!up(&mut h, 2.0)); // +2 < 5
@@ -1332,7 +1460,9 @@ mod tests {
 
         let mut h2 = Harness::new(0.1);
         let down = |h: &mut Harness, x: f64| {
-            h.tick("Change", "Down", &[Value::Float(x), Value::Float(5.0)]).as_bool().unwrap()
+            h.tick("Change", "Down", &[Value::Float(x), Value::Float(5.0)])
+                .as_bool()
+                .unwrap()
         };
         assert!(!down(&mut h2, 10.0)); // seed
         assert!(down(&mut h2, 3.0)); //  -7 >= 5
@@ -1345,9 +1475,13 @@ mod tests {
         // pulse.
         let mut h = Harness::new(0.1);
         let c = |h: &mut Harness, x: f64| {
-            h.tick("Change", "By", &[Value::Float(x), Value::Float(5.0), Value::Float(0.2)])
-                .as_bool()
-                .unwrap()
+            h.tick(
+                "Change",
+                "By",
+                &[Value::Float(x), Value::Float(5.0), Value::Float(0.2)],
+            )
+            .as_bool()
+            .unwrap()
         };
         assert!(!c(&mut h, 0.0)); // seed (reference = 0)
         // Jump to 9 (delta 9 >= 5). It stays >= delta vs the held reference 0.
@@ -1421,7 +1555,9 @@ mod tests {
     fn calculate_stable_true_after_unchanged_for_filter() {
         let mut h = Harness::new(0.1);
         let s = |h: &mut Harness, x: f64| {
-            h.tick("Calculate", "Stable", &[Value::Float(x), Value::Float(0.2)]).as_bool().unwrap()
+            h.tick("Calculate", "Stable", &[Value::Float(x), Value::Float(0.2)])
+                .as_bool()
+                .unwrap()
         };
         assert!(!s(&mut h, 5.0)); // seed
         assert!(!s(&mut h, 5.0)); // held 0.1
@@ -1436,7 +1572,12 @@ mod tests {
             h.tick(
                 "Calculate",
                 "Between",
-                &[Value::Float(x), Value::Float(0.0), Value::Float(10.0), Value::Float(0.2)],
+                &[
+                    Value::Float(x),
+                    Value::Float(0.0),
+                    Value::Float(10.0),
+                    Value::Float(0.2),
+                ],
             )
             .as_bool()
             .unwrap()
@@ -1451,7 +1592,12 @@ mod tests {
             h.tick(
                 "Calculate",
                 "Beyond",
-                &[Value::Float(x), Value::Float(0.0), Value::Float(10.0), Value::Float(0.2)],
+                &[
+                    Value::Float(x),
+                    Value::Float(0.0),
+                    Value::Float(10.0),
+                    Value::Float(0.2),
+                ],
             )
             .as_bool()
             .unwrap()
@@ -1469,7 +1615,12 @@ mod tests {
             h.tick(
                 "Calculate",
                 "Hysteresis",
-                &[Value::Float(x), Value::Float(2.0), Value::Float(8.0), Value::Float(0.2)],
+                &[
+                    Value::Float(x),
+                    Value::Float(2.0),
+                    Value::Float(8.0),
+                    Value::Float(0.2),
+                ],
             )
             .as_bool()
             .unwrap()

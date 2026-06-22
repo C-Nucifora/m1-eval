@@ -103,9 +103,7 @@ pub fn dispatch(
             }
         }
         // 4. Tier-3 IO objects: scenario-fed / documented stubs.
-        "CanComms" | "Serial" | "System" | "Logging" => {
-            io_stub::call(object, method, args, ctx)
-        }
+        "CanComms" | "Serial" | "System" | "Logging" => io_stub::call(object, method, args, ctx),
         // 4b. `Math` is a *calibration-only* library object (its functions are
         //     flagged `calibrationOnly` in the intrinsics) and is not, strictly,
         //     valid in ECU `.m1scr` scripts — yet real EV-M1 control scripts
@@ -206,8 +204,13 @@ fn try_channel_set(
     ctx: &mut EvalCtx,
 ) -> Result<Option<Value>, EvalError> {
     // Only a project channel/parameter has an imperative `.Set`.
-    let Target::Symbol(canon) = classify(object, ctx.group, ctx.fn_symbol, ctx.project, &ctx.env.locals)
-    else {
+    let Target::Symbol(canon) = classify(
+        object,
+        ctx.group,
+        ctx.fn_symbol,
+        ctx.project,
+        &ctx.env.locals,
+    ) else {
         return Ok(None);
     };
     let is_writable = ctx
@@ -224,10 +227,7 @@ fn try_channel_set(
     // than guessing which argument to write.
     if args.len() != 1 {
         return Err(EvalError::BadCall {
-            detail: format!(
-                "{object}.Set expects 1 argument, got {}",
-                args.len()
-            ),
+            detail: format!("{object}.Set expects 1 argument, got {}", args.len()),
         });
     }
     // Coerce a numeric value written to an enum-typed channel to its enum member
@@ -255,7 +255,13 @@ fn is_project_object_io_method(method: &str) -> bool {
 /// object appears when no `.m1dbc` is loaded. A library object, a channel, a
 /// table, or a function is *not* an IO-stub object (each has its own route).
 fn is_io_stub_object(object: &str, ctx: &EvalCtx) -> bool {
-    match classify(object, ctx.group, ctx.fn_symbol, ctx.project, &ctx.env.locals) {
+    match classify(
+        object,
+        ctx.group,
+        ctx.fn_symbol,
+        ctx.project,
+        &ctx.env.locals,
+    ) {
         Target::Symbol(canon) => ctx
             .project
             .symbols()
@@ -283,7 +289,13 @@ fn is_io_stub_object(object: &str, ctx: &EvalCtx) -> bool {
 /// shares one countdown. Resolves the object spelling against the project for
 /// path stability; falls back to the raw spelling when unresolved.
 fn timer_object_key(object: &str, ctx: &EvalCtx) -> CallSite {
-    let canon = match classify(object, ctx.group, ctx.fn_symbol, ctx.project, &ctx.env.locals) {
+    let canon = match classify(
+        object,
+        ctx.group,
+        ctx.fn_symbol,
+        ctx.project,
+        &ctx.env.locals,
+    ) {
         Target::Symbol(path) => path,
         _ => object.to_string(),
     };
@@ -301,7 +313,13 @@ fn try_table_lookup(
     ctx: &mut EvalCtx,
 ) -> Result<Option<Value>, EvalError> {
     // Resolve the object spelling to a canonical symbol path in the current scope.
-    let target = classify(object, ctx.group, ctx.fn_symbol, ctx.project, &ctx.env.locals);
+    let target = classify(
+        object,
+        ctx.group,
+        ctx.fn_symbol,
+        ctx.project,
+        &ctx.env.locals,
+    );
     let Target::Symbol(canon) = target else {
         return Ok(None);
     };
@@ -338,7 +356,11 @@ fn try_table_lookup(
             }
             return Ok(Some(Value::Float(0.0)));
         }
-        None => return Err(EvalError::MissingCalibration { path: canon.clone() }),
+        None => {
+            return Err(EvalError::MissingCalibration {
+                path: canon.clone(),
+            });
+        }
     };
 
     // Each lookup coordinate must be numeric; collect them then interpolate.
@@ -546,8 +568,11 @@ mod tests {
     /// table-lookup and resolution-backed tests.
     fn mini_loaded() -> crate::loader::Loaded {
         let dir = Path::new(env!("CARGO_MANIFEST_DIR")).join("tests/fixtures/mini");
-        crate::loader::load(&dir.join("Project.m1prj"), Some(&dir.join("parameters.m1cfg")))
-            .expect("mini fixture loads")
+        crate::loader::load(
+            &dir.join("Project.m1prj"),
+            Some(&dir.join("parameters.m1cfg")),
+        )
+        .expect("mini fixture loads")
     }
 
     /// A harness owning the stores so a fresh `EvalCtx` can be built per call.
@@ -604,7 +629,8 @@ mod tests {
     fn calculate_max_dispatches() {
         let mut h = Harness::new();
         assert_eq!(
-            h.call("Calculate", "Max", &[Value::Int(2), Value::Int(3)]).unwrap(),
+            h.call("Calculate", "Max", &[Value::Int(2), Value::Int(3)])
+                .unwrap(),
             Value::Int(3)
         );
     }
@@ -627,7 +653,8 @@ mod tests {
     fn convert_to_integer_dispatches() {
         let mut h = Harness::new();
         assert_eq!(
-            h.call("Convert", "ToInteger", &[Value::Float(2.9)]).unwrap(),
+            h.call("Convert", "ToInteger", &[Value::Float(2.9)])
+                .unwrap(),
             Value::Int(2)
         );
     }
@@ -667,7 +694,11 @@ mod tests {
         // Calculate.Stable (arity 2) is a stateful predicate: M6 routes it to the
         // state engine. Its first tick has not yet been stable, so it is false —
         // a real evaluated value, not a fail-loud error.
-        match h.call("Calculate", "Stable", &[Value::Float(1.0), Value::Float(0.1)]) {
+        match h.call(
+            "Calculate",
+            "Stable",
+            &[Value::Float(1.0), Value::Float(0.1)],
+        ) {
             Ok(Value::Bool(false)) => {}
             other => panic!("expected Ok(Bool(false)) on first tick, got {other:?}"),
         }
@@ -678,7 +709,11 @@ mod tests {
         let mut h = Harness::new();
         // A stateful library object routes through dispatch with arity validation;
         // the first tick of FirstOrder seeds to the input (1.0).
-        match h.call("Filter", "FirstOrder", &[Value::Float(1.0), Value::Float(0.1)]) {
+        match h.call(
+            "Filter",
+            "FirstOrder",
+            &[Value::Float(1.0), Value::Float(0.1)],
+        ) {
             Ok(Value::Float(x)) => assert!((x - 1.0).abs() < 1e-9),
             other => panic!("expected seeded Float(1.0), got {other:?}"),
         }
@@ -770,21 +805,25 @@ mod tests {
         // The mini fixture's Demo.Map is 2-D: x in {0,100}, y in {0,1}, body
         // (10,20,30,40). Corner and midpoint values come straight from table.rs.
         assert_eq!(
-            h.call("Map", "Lookup", &[Value::Float(0.0), Value::Float(0.0)]).unwrap(),
+            h.call("Map", "Lookup", &[Value::Float(0.0), Value::Float(0.0)])
+                .unwrap(),
             Value::Float(10.0)
         );
         assert_eq!(
-            h.call("Map", "Lookup", &[Value::Float(100.0), Value::Float(1.0)]).unwrap(),
+            h.call("Map", "Lookup", &[Value::Float(100.0), Value::Float(1.0)])
+                .unwrap(),
             Value::Float(40.0)
         );
         // Halfway in x at y=0: between 10 and 30 -> 20.
         assert_eq!(
-            h.call("Map", "Lookup", &[Value::Float(50.0), Value::Float(0.0)]).unwrap(),
+            h.call("Map", "Lookup", &[Value::Float(50.0), Value::Float(0.0)])
+                .unwrap(),
             Value::Float(20.0)
         );
         // Out-of-range inputs clamp.
         assert_eq!(
-            h.call("Map", "Lookup", &[Value::Float(999.0), Value::Float(9.0)]).unwrap(),
+            h.call("Map", "Lookup", &[Value::Float(999.0), Value::Float(9.0)])
+                .unwrap(),
             Value::Float(40.0)
         );
     }
@@ -834,8 +873,8 @@ mod tests {
     impl EnumHarness {
         fn new() -> EnumHarness {
             let dir = Path::new(env!("CARGO_MANIFEST_DIR")).join("tests/fixtures/enums");
-            let loaded = crate::loader::load(&dir.join("Project.m1prj"), None)
-                .expect("enums fixture loads");
+            let loaded =
+                crate::loader::load(&dir.join("Project.m1prj"), None).expect("enums fixture loads");
             EnumHarness {
                 project: loaded.project,
                 calib: Calibration::default(),
@@ -964,8 +1003,8 @@ mod tests {
     impl ProjectObjHarness {
         fn new() -> ProjectObjHarness {
             let dir = Path::new(env!("CARGO_MANIFEST_DIR")).join("tests/fixtures/enums");
-            let loaded = crate::loader::load(&dir.join("Project.m1prj"), None)
-                .expect("enums fixture loads");
+            let loaded =
+                crate::loader::load(&dir.join("Project.m1prj"), None).expect("enums fixture loads");
             ProjectObjHarness {
                 project: loaded.project,
                 calib: Calibration::default(),
@@ -1006,10 +1045,7 @@ mod tests {
             .expect("Channel.Set succeeds");
         assert_eq!(result, Value::Bool(true), "Set returns the unit value");
         // The canonical path now holds the written value.
-        assert_eq!(
-            h.env.get("Root.Demo.Precharge State"),
-            Some(&Value::Int(1))
-        );
+        assert_eq!(h.env.get("Root.Demo.Precharge State"), Some(&Value::Int(1)));
         // And the write was recorded to the trace.
         assert_eq!(
             h.trace.channels.get("Root.Demo.Precharge State"),
@@ -1036,11 +1072,7 @@ mod tests {
             Err(EvalError::BadCall { .. }) => {}
             other => panic!("expected BadCall on zero-arg Set, got {other:?}"),
         }
-        match h.call(
-            "Precharge State",
-            "Set",
-            &[Value::Int(1), Value::Int(2)],
-        ) {
+        match h.call("Precharge State", "Set", &[Value::Int(1), Value::Int(2)]) {
             Err(EvalError::BadCall { .. }) => {}
             other => panic!("expected BadCall on two-arg Set, got {other:?}"),
         }
@@ -1063,10 +1095,7 @@ mod tests {
         let mut h = ProjectObjHarness::new();
         // A CAN message object's `.TxOpen()` cannot be evaluated offline; it
         // returns a documented opaque handle and is flagged externally driven.
-        assert_eq!(
-            h.call("DashVals", "TxOpen", &[]).unwrap(),
-            Value::Uint(0)
-        );
+        assert_eq!(h.call("DashVals", "TxOpen", &[]).unwrap(), Value::Uint(0));
         assert!(h.trace.is_external("DashVals.TxOpen"));
     }
 
@@ -1074,13 +1103,7 @@ mod tests {
     fn dbc_void_writers_return_unit_value() {
         let mut h = ProjectObjHarness::new();
         // The void CAN writers all return the unit value (a no-op offline).
-        for method in [
-            "Tx",
-            "TxInitialise",
-            "Init",
-            "SetBit",
-            "SetUnsignedInteger",
-        ] {
+        for method in ["Tx", "TxInitialise", "Init", "SetBit", "SetUnsignedInteger"] {
             assert_eq!(
                 h.call("DashVals", method, &[]).unwrap(),
                 Value::Bool(true),
@@ -1142,7 +1165,8 @@ mod tests {
         let mut h = ProjectObjHarness::new();
         // `Fan Output.SetState(...)` (a package Output object) is a void writer.
         assert_eq!(
-            h.call("Fan Output", "SetState", &[Value::Bool(true)]).unwrap(),
+            h.call("Fan Output", "SetState", &[Value::Bool(true)])
+                .unwrap(),
             Value::Bool(true)
         );
         assert!(h.trace.is_external("Fan Output.SetState"));
@@ -1229,11 +1253,11 @@ mod tests {
         // runtime — including the `CanComms.*` reads/setup the old design left
         // unstubbed (the EV-M1 whole-project blocker this fix closed).
         let cases = [
-            ("CanComms", "RxOpenStandard"), // Handle -> unit stub
-            ("CanComms", "GetFloat"),       // FloatingPoint -> 0.0
+            ("CanComms", "RxOpenStandard"),     // Handle -> unit stub
+            ("CanComms", "GetFloat"),           // FloatingPoint -> 0.0
             ("CanComms", "GetUnsignedInteger"), // Integer -> 0
-            ("CanComms", "RxMessage"),      // Boolean -> false
-            ("CanComms", "SetFloat"),       // Void -> unit
+            ("CanComms", "RxMessage"),          // Boolean -> false
+            ("CanComms", "SetFloat"),           // Void -> unit
             ("Serial", "GetFloat"),
             ("System", "ElapsedTime"),
             ("System", "TickPeriod"),

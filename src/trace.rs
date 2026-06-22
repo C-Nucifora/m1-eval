@@ -11,7 +11,7 @@
 //! ## Per-expression sink
 //!
 //! Beyond channel columns, the engine records the value of individual
-//! expressions keyed by their [`CallSite`]-style identity `(script, byte_offset)`
+//! expressions keyed by their `CallSite`-style identity `(script, byte_offset)`
 //! (the visualiser/LSP overlay needs per-node values). The expr evaluator pushes
 //! into [`Trace::exprs`] when a sink is active.
 //!
@@ -84,7 +84,7 @@ impl Trace {
 
     /// Serialise the channel columns + time axis to JSON. The shape is
     /// `{ "time": [...], "channels": { path: [...] }, "external": [...] }`,
-    /// values rendered by [`value_json`]. Deterministic ordering (BTree maps).
+    /// values rendered by `value_json`. Deterministic ordering (BTree maps).
     pub fn to_json(&self) -> String {
         let mut out = String::from("{\"time\":[");
         out.push_str(&join(self.time.iter().map(|t| fmt_f64(*t))));

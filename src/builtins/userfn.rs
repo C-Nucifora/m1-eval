@@ -18,7 +18,7 @@
 //! Calling a user function is a real frame switch:
 //!
 //! 1. **Save** the caller frame: a snapshot of `env.locals` and the `Out` slot.
-//! 2. **Enter** a fresh local frame ([`Env::enter_function`]) and bind each
+//! 2. **Enter** a fresh local frame (`Env::enter_function`) and bind each
 //!    declared parameter `(name, _)` as the local `In.<name>` (exactly the key
 //!    `m1-typecheck`'s `resolve` hands `In.<Param>` references, and that
 //!    `ident::classify` maps to `Target::Local("In.<param>")`).
@@ -41,7 +41,7 @@
 //!
 //! A static cycle check is an upstream concern (T097), but the evaluator must
 //! still never infinite-loop on a runtime cycle. [`call`] increments
-//! `ctx.depth` per nested entry and fails loud past [`MAX_CALL_DEPTH`] rather than
+//! `ctx.depth` per nested entry and fails loud past `MAX_CALL_DEPTH` rather than
 //! overflowing the stack.
 
 use crate::error::EvalError;
@@ -83,9 +83,13 @@ pub fn call(
     // The callee must resolve to a project `Function`/`Method` symbol. Anything
     // else (a channel, a library object, an unresolved name) is not a user-function
     // call — fall through.
-    let Target::Symbol(canon) =
-        classify(callee_path, ctx.group, ctx.fn_symbol, ctx.project, &ctx.env.locals)
-    else {
+    let Target::Symbol(canon) = classify(
+        callee_path,
+        ctx.group,
+        ctx.fn_symbol,
+        ctx.project,
+        &ctx.env.locals,
+    ) else {
         return Ok(None);
     };
     let Some(symbol) = ctx.project.symbols().get(&canon) else {
@@ -129,7 +133,10 @@ pub fn call(
     // fails loud instead of overflowing the stack.
     if ctx.depth >= MAX_CALL_DEPTH {
         return Err(EvalError::UnsupportedConstruct {
-            kind: format!("recursive user-function call (depth {} exceeded) into {canon:?}", MAX_CALL_DEPTH),
+            kind: format!(
+                "recursive user-function call (depth {} exceeded) into {canon:?}",
+                MAX_CALL_DEPTH
+            ),
             at: 0,
         });
     }
@@ -196,9 +203,9 @@ fn backing_script<'a>(
     scripts: &'a [ParsedScript],
     ctx: &EvalCtx,
 ) -> Option<&'a ParsedScript> {
-    scripts.iter().find(|s| {
-        ctx.project.function_symbol_for_script(&s.name).as_deref() == Some(callee_path)
-    })
+    scripts
+        .iter()
+        .find(|s| ctx.project.function_symbol_for_script(&s.name).as_deref() == Some(callee_path))
 }
 
 #[cfg(test)]

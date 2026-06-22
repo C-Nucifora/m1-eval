@@ -140,8 +140,9 @@ fn resolve_base_rate(scenario: &Scenario, schedule: &[ScheduledRated]) -> Result
         .map(|r| r.rate_hz)
         .fold(None::<f64>, |acc, r| Some(acc.map_or(r, |m| m.max(r))))
         .ok_or_else(|| EvalError::UnsupportedConstruct {
-            kind: "whole-project run has no scheduled functions and no base_rate_hz to default from"
-                .to_string(),
+            kind:
+                "whole-project run has no scheduled functions and no base_rate_hz to default from"
+                    .to_string(),
             at: 0,
         })
 }
@@ -451,7 +452,11 @@ struct RunPlan {
 fn schedule_writes(loaded: &Loaded, schedule: &[ScheduledRated]) -> BTreeSet<String> {
     let mut writes = BTreeSet::new();
     for rated in schedule {
-        let io = io_sets(rated.sched.script, &loaded.project, rated.sched.group.as_deref());
+        let io = io_sets(
+            rated.sched.script,
+            &loaded.project,
+            rated.sched.group.as_deref(),
+        );
         for w in io.writes {
             writes.insert(w);
         }
@@ -592,11 +597,10 @@ fn scheduled_for<'a>(loaded: &'a Loaded, script: &'a ParsedScript) -> Scheduled<
 fn build_cone<'a>(loaded: &'a Loaded, target: &str) -> Result<Vec<Scheduled<'a>>, EvalError> {
     // Canonicalise the target channel against the project (no scope: absolute).
     let no_locals = HashMap::new();
-    let target_canon =
-        match classify(target, None, None, &loaded.project, &no_locals) {
-            Target::Symbol(p) => p,
-            _ => target.to_string(),
-        };
+    let target_canon = match classify(target, None, None, &loaded.project, &no_locals) {
+        Target::Symbol(p) => p,
+        _ => target.to_string(),
+    };
 
     // Per-script io sets, plus the writer map: channel -> script that writes it.
     // A script's group is resolved for relative-name canonicalisation.
@@ -607,7 +611,9 @@ fn build_cone<'a>(loaded: &'a Loaded, target: &str) -> Result<Vec<Scheduled<'a>>
         let io = io_sets(script, &loaded.project, group.as_deref());
         for w in &io.writes {
             // First writer wins for determinism; scripts are in sorted order.
-            writer.entry(w.clone()).or_insert_with(|| script.name.clone());
+            writer
+                .entry(w.clone())
+                .or_insert_with(|| script.name.clone());
         }
         sets.insert(script.name.clone(), io);
     }
@@ -697,10 +703,15 @@ fn build_downstream_cone<'a>(
         let group = loaded.project.group_for_script(&script.name);
         let io = io_sets(script, &loaded.project, group.as_deref());
         for w in &io.writes {
-            writer.entry(w.clone()).or_insert_with(|| script.name.clone());
+            writer
+                .entry(w.clone())
+                .or_insert_with(|| script.name.clone());
         }
         for r in &io.reads {
-            readers.entry(r.clone()).or_default().push(script.name.clone());
+            readers
+                .entry(r.clone())
+                .or_default()
+                .push(script.name.clone());
         }
         sets.insert(script.name.clone(), io);
     }
@@ -783,7 +794,7 @@ pub struct CounterfactualCfg {
 /// logged value (zero-order hold) each tick — that is the ground truth. The user
 /// then replaces one or more channels with an [`Override`]; only the functions
 /// **downstream** of those channels (their forward dependency cone, from
-/// [`build_downstream_cone`]) recompute, so the override propagates while every
+/// `build_downstream_cone`) recompute, so the override propagates while every
 /// non-cone channel stays at its logged value. The result is a normal [`Trace`].
 ///
 /// **Source precedence (lowest to highest): calibration < log < override.** A
@@ -800,7 +811,7 @@ pub struct CounterfactualCfg {
 ///
 /// Fails loud: a positive base rate is required; an override whose channel has no
 /// in-project reader has nothing to recompute (propagated from
-/// [`build_downstream_cone`]); an unparsable or non-numeric expression override
+/// `build_downstream_cone`); an unparsable or non-numeric expression override
 /// surfaces its evaluation error.
 pub fn run_counterfactual(
     loaded: &Loaded,
@@ -826,7 +837,8 @@ pub fn run_counterfactual(
 
     // Build the downstream cone of the override channels: the only functions that
     // recompute. Fails loud when no function reads any override channel.
-    let override_channels: Vec<String> = overrides.iter().map(|o| o.channel().to_string()).collect();
+    let override_channels: Vec<String> =
+        overrides.iter().map(|o| o.channel().to_string()).collect();
     let cone = build_downstream_cone(loaded, &override_channels)?;
 
     // Canonicalise the log series and each override channel against the project
@@ -1137,8 +1149,11 @@ mod tests {
 
     fn mini() -> Loaded {
         let dir = Path::new(env!("CARGO_MANIFEST_DIR")).join("tests/fixtures/mini");
-        load(&dir.join("Project.m1prj"), Some(&dir.join("parameters.m1cfg")))
-            .expect("mini fixture loads")
+        load(
+            &dir.join("Project.m1prj"),
+            Some(&dir.join("parameters.m1cfg")),
+        )
+        .expect("mini fixture loads")
     }
 
     fn multirate() -> Loaded {
@@ -1180,7 +1195,11 @@ mod tests {
         let loaded = multirate();
         let rated = enumerate_scheduled(&loaded);
         let rates: Vec<f64> = rated.iter().map(|r| r.rate_hz).collect();
-        assert_eq!(rates, vec![100.0, 100.0, 50.0, 50.0], "fastest-first baseline");
+        assert_eq!(
+            rates,
+            vec![100.0, 100.0, 50.0, 50.0],
+            "fastest-first baseline"
+        );
     }
 
     #[test]
@@ -1241,7 +1260,10 @@ const = 6.0
 
         assert_eq!(trace.time.len(), 5);
         let slow = trace.channels.get("Root.MR.Slow Out").expect("Slow Out");
-        let shared = trace.channels.get("Root.MR.Fast Shared").expect("Fast Shared");
+        let shared = trace
+            .channels
+            .get("Root.MR.Fast Shared")
+            .expect("Fast Shared");
         let fast = trace.channels.get("Root.MR.Fast Out").expect("Fast Out");
         assert!(slow.iter().all(|v| *v == Value::Float(6.0)), "{slow:?}");
         assert!(shared.iter().all(|v| *v == Value::Float(7.0)), "{shared:?}");
@@ -1376,7 +1398,10 @@ const = 4.0
         let trace = run(&loaded, &scenario).expect("rate-gated integral run succeeds");
 
         assert_eq!(trace.time.len(), 12);
-        let total = trace.channels.get("Root.MR.Slow Total").expect("Slow Total");
+        let total = trace
+            .channels
+            .get("Root.MR.Slow Total")
+            .expect("Slow Total");
         let got: Vec<f64> = total
             .iter()
             .map(|v| match v {
@@ -1418,7 +1443,11 @@ const = 6.0
         let trace = run(&loaded, &scenario).expect("auto-base-rate run succeeds");
 
         // 0.05 s at the auto base of 100 Hz = 5 ticks.
-        assert_eq!(trace.time.len(), 5, "auto base = fastest scheduled rate (100 Hz)");
+        assert_eq!(
+            trace.time.len(),
+            5,
+            "auto base = fastest scheduled rate (100 Hz)"
+        );
         // The fast group ran every tick: Slow Out = Seed*2 = 6 on the even ticks
         // it ran; Fast Writer reads it (stale-tolerant) and writes Fast Shared.
         let fast = trace.channels.get("Root.MR.Fast Out").expect("Fast Out");
@@ -1559,7 +1588,10 @@ const = 4.0
             .channels
             .get("Root.Chain.Final")
             .expect("Final recorded");
-        assert!(final_col.iter().all(|v| *v == Value::Float(50.0)), "{final_col:?}");
+        assert!(
+            final_col.iter().all(|v| *v == Value::Float(50.0)),
+            "{final_col:?}"
+        );
         // The intermediate channel is computed and recorded too.
         let mid = trace.channels.get("Root.Chain.Mid").expect("Mid recorded");
         assert!(mid.iter().all(|v| *v == Value::Float(5.0)), "{mid:?}");
@@ -1680,7 +1712,9 @@ base_rate_hz = 100.0
         let loaded = counterfactual();
         match build_downstream_cone(&loaded, &["Root.CF.Result".to_string()]) {
             Err(EvalError::UnresolvedSymbol { .. }) => {}
-            Err(other) => panic!("expected UnresolvedSymbol for a no-reader override, got {other:?}"),
+            Err(other) => {
+                panic!("expected UnresolvedSymbol for a no-reader override, got {other:?}")
+            }
             Ok(cone) => panic!(
                 "expected fail-loud for a no-reader override, got cone {:?}",
                 cone_fn_symbols(&cone)
@@ -1845,7 +1879,11 @@ base_rate_hz = 100.0
             duration_s: 0.0,
         };
         let trace = run_counterfactual(&loaded, &log, &overrides, &cfg).expect("cf runs");
-        assert_eq!(trace.time.len(), 2, "default duration = log.duration_s (0.02)");
+        assert_eq!(
+            trace.time.len(),
+            2,
+            "default duration = log.duration_s (0.02)"
+        );
     }
 
     #[test]
@@ -1874,7 +1912,8 @@ base_rate_hz = 100.0
         // the override pins Sensor = 10.5; the cone recomputes Mid = 21, Result = 22.
         let loaded = counterfactual();
         let log = consistent_log();
-        let overrides = vec![Override::parse("Root.CF.Sensor=Root.CF.Sensor * 1.05").expect("parses")];
+        let overrides =
+            vec![Override::parse("Root.CF.Sensor=Root.CF.Sensor * 1.05").expect("parses")];
         let cfg = CounterfactualCfg {
             base_rate_hz: 100.0,
             duration_s: 0.01,

@@ -63,7 +63,13 @@ pub fn as_integer(object: &str, ctx: &mut EvalCtx) -> Result<Option<Value>, Eval
     }
 
     // Form 2: a value-holding source. Classify the object against the project.
-    let target = classify(object, ctx.group, ctx.fn_symbol, ctx.project, &ctx.env.locals);
+    let target = classify(
+        object,
+        ctx.group,
+        ctx.fn_symbol,
+        ctx.project,
+        &ctx.env.locals,
+    );
     let Target::Symbol(canon) = target else {
         // Not an enum literal and not a resolvable project symbol: let the caller
         // fall through to other dispatch.
@@ -75,9 +81,7 @@ pub fn as_integer(object: &str, ctx: &mut EvalCtx) -> Result<Option<Value>, Eval
 
     match kind {
         // An enum-typed channel (or parameter): read its current enum value.
-        SymbolKind::Channel | SymbolKind::Parameter => {
-            convert_value_at(&canon, ctx).map(Some)
-        }
+        SymbolKind::Channel | SymbolKind::Parameter => convert_value_at(&canon, ctx).map(Some),
         // A value-compound: the enum value lives on its `.Value` child.
         SymbolKind::Group => {
             let value_path = format!("{canon}.Value");
@@ -124,8 +128,8 @@ mod tests {
     impl Harness {
         fn new() -> Harness {
             let dir = Path::new(env!("CARGO_MANIFEST_DIR")).join("tests/fixtures/enums");
-            let loaded = crate::loader::load(&dir.join("Project.m1prj"), None)
-                .expect("enums fixture loads");
+            let loaded =
+                crate::loader::load(&dir.join("Project.m1prj"), None).expect("enums fixture loads");
             Harness {
                 project: loaded.project,
                 calib: Calibration::default(),

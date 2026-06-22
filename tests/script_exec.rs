@@ -26,8 +26,11 @@ use std::path::Path;
 #[test]
 fn demo_update_script_computes_output() {
     let dir = Path::new(env!("CARGO_MANIFEST_DIR")).join("tests/fixtures/mini");
-    let loaded = m1_eval::load(&dir.join("Project.m1prj"), Some(&dir.join("parameters.m1cfg")))
-        .expect("mini fixture loads");
+    let loaded = m1_eval::load(
+        &dir.join("Project.m1prj"),
+        Some(&dir.join("parameters.m1cfg")),
+    )
+    .expect("mini fixture loads");
 
     // The one discovered script is the demo updater.
     let script = loaded
@@ -73,8 +76,11 @@ fn demo_update_script_computes_output() {
 #[test]
 fn demo_update_is_deterministic_in_inputs() {
     let dir = Path::new(env!("CARGO_MANIFEST_DIR")).join("tests/fixtures/mini");
-    let loaded = m1_eval::load(&dir.join("Project.m1prj"), Some(&dir.join("parameters.m1cfg")))
-        .expect("mini fixture loads");
+    let loaded = m1_eval::load(
+        &dir.join("Project.m1prj"),
+        Some(&dir.join("parameters.m1cfg")),
+    )
+    .expect("mini fixture loads");
     let script = &loaded.scripts[0];
     let root = script.cst.root();
 

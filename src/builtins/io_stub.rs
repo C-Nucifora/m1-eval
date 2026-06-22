@@ -14,13 +14,13 @@
 //!    `ctx.dt`, and `System.XcpConnected()`/`Logging.Running()` are false because
 //!    no tuning tool or logger is attached offline. The `Void` side-effect calls
 //!    (`System.Debug`, `System.AllowTuning`, …) are no-ops returning a benign
-//!    value. Each stub's meaning is documented in [`documented_stub`], never
+//!    value. Each stub's meaning is documented in `documented_stub`, never
 //!    copied from MoTeC.
 //! 3. **Generic typed stub.** Every *other* method that the intrinsic registry
 //!    lists for the object is a hardware-backed read/write with no meaningful
 //!    offline value, but a determinate *type*. Rather than abort a whole-project
 //!    run on the first CAN read, we return the type-correct zero/false/empty
-//!    default for the overload's declared return type (see [`typed_io_default`]).
+//!    default for the overload's declared return type (see `typed_io_default`).
 //!    This is the externally-driven default a scenario/log replay would override.
 //! 4. **Fail loud.** A method the registry does *not* list on the object is
 //!    genuinely unknown — we never invent a value for it, so it returns
@@ -298,7 +298,10 @@ mod tests {
     #[test]
     fn system_tick_period_is_dt() {
         let mut h = Harness::new();
-        assert_eq!(h.io("System", "TickPeriod", &[]).unwrap(), Value::Float(0.02));
+        assert_eq!(
+            h.io("System", "TickPeriod", &[]).unwrap(),
+            Value::Float(0.02)
+        );
         // The call is flagged externally driven.
         assert!(h.trace.is_external("System.TickPeriod"));
     }
@@ -306,14 +309,18 @@ mod tests {
     #[test]
     fn system_xcp_connected_is_false_offline() {
         let mut h = Harness::new();
-        assert_eq!(h.io("System", "XcpConnected", &[]).unwrap(), Value::Bool(false));
+        assert_eq!(
+            h.io("System", "XcpConnected", &[]).unwrap(),
+            Value::Bool(false)
+        );
     }
 
     #[test]
     fn system_void_side_effects_are_noops() {
         let mut h = Harness::new();
         assert_eq!(
-            h.io("System", "Debug", &[Value::Str("hello".into())]).unwrap(),
+            h.io("System", "Debug", &[Value::Str("hello".into())])
+                .unwrap(),
             Value::Bool(true)
         );
         assert_eq!(
@@ -326,16 +333,21 @@ mod tests {
     fn logging_running_is_false_offline() {
         let mut h = Harness::new();
         assert_eq!(h.io("Logging", "Running", &[]).unwrap(), Value::Bool(false));
-        assert_eq!(h.io("Logging", "Unloading", &[]).unwrap(), Value::Bool(false));
+        assert_eq!(
+            h.io("Logging", "Unloading", &[]).unwrap(),
+            Value::Bool(false)
+        );
     }
 
     #[test]
     fn scenario_override_wins_over_stub_and_failure() {
         let mut h = Harness::new();
         // Seed a scenario value for a CAN read that would otherwise fail loud.
-        h.env.set_io_override("CanComms.GetFloat", Value::Float(12.5));
+        h.env
+            .set_io_override("CanComms.GetFloat", Value::Float(12.5));
         assert_eq!(
-            h.io("CanComms", "GetFloat", &[Value::Uint(0), Value::Int(0)]).unwrap(),
+            h.io("CanComms", "GetFloat", &[Value::Uint(0), Value::Int(0)])
+                .unwrap(),
             Value::Float(12.5)
         );
         assert!(h.trace.is_external("CanComms.GetFloat"));
@@ -348,7 +360,8 @@ mod tests {
         // type-correct externally-driven default (never a guessed reading).
         // `CanComms.GetFloat` declares a `FloatingPoint` return, so the stub is 0.0.
         assert_eq!(
-            h.io("CanComms", "GetFloat", &[Value::Uint(0), Value::Int(0)]).unwrap(),
+            h.io("CanComms", "GetFloat", &[Value::Uint(0), Value::Int(0)])
+                .unwrap(),
             Value::Float(0.0)
         );
         // The stub is flagged externally driven.
@@ -365,7 +378,12 @@ mod tests {
             h.io(
                 "CanComms",
                 "RxOpenStandard",
-                &[Value::Uint(0), Value::Uint(0), Value::Uint(0), Value::Uint(0)],
+                &[
+                    Value::Uint(0),
+                    Value::Uint(0),
+                    Value::Uint(0),
+                    Value::Uint(0)
+                ],
             )
             .unwrap(),
             Value::Bool(true)
@@ -396,7 +414,10 @@ mod tests {
         // `System.ElapsedTime` has no *meaningful* offline value, but the registry
         // lists it with a `FloatingPoint` return, so the typed stub is 0.0 (an
         // externally-driven default), not a fail-loud abort.
-        assert_eq!(h.io("System", "ElapsedTime", &[]).unwrap(), Value::Float(0.0));
+        assert_eq!(
+            h.io("System", "ElapsedTime", &[]).unwrap(),
+            Value::Float(0.0)
+        );
         assert!(h.trace.is_external("System.ElapsedTime"));
     }
 
@@ -449,14 +470,23 @@ mod tests {
         // `GetFloat` → FloatingPoint, `GetID` → Integer, `BusRxTotal` →
         // UnsignedInteger, `RxMessage` → Boolean, `SetFloat` → Void,
         // `RxOpenStandard` → Handle (unmappable → unit).
-        assert_eq!(typed_io_default("CanComms", "GetFloat"), Some(Value::Float(0.0)));
+        assert_eq!(
+            typed_io_default("CanComms", "GetFloat"),
+            Some(Value::Float(0.0))
+        );
         assert_eq!(typed_io_default("CanComms", "GetID"), Some(Value::Int(0)));
         assert_eq!(
             typed_io_default("CanComms", "BusRxTotal"),
             Some(Value::Uint(0))
         );
-        assert_eq!(typed_io_default("CanComms", "RxMessage"), Some(Value::Bool(false)));
-        assert_eq!(typed_io_default("CanComms", "SetFloat"), Some(Value::Bool(true)));
+        assert_eq!(
+            typed_io_default("CanComms", "RxMessage"),
+            Some(Value::Bool(false))
+        );
+        assert_eq!(
+            typed_io_default("CanComms", "SetFloat"),
+            Some(Value::Bool(true))
+        );
         assert_eq!(
             typed_io_default("CanComms", "RxOpenStandard"),
             Some(Value::Bool(true))

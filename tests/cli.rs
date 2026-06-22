@@ -96,7 +96,10 @@ fn counterfactual_override_writes_trace_and_diff() {
     // Overriding Sensor (3 -> 5) recomputes Mid and Result downstream; Other is
     // unrelated and stays at its logged value.
     let diff_body = std::fs::read_to_string(&diff).expect("diff file written");
-    assert!(diff_body.contains("Root.CF.Mid"), "diff missing Mid: {diff_body}");
+    assert!(
+        diff_body.contains("Root.CF.Mid"),
+        "diff missing Mid: {diff_body}"
+    );
     assert!(diff_body.contains("Root.CF.Result"), "diff missing Result");
     assert!(
         diff_body.contains("\"changed\":true"),
@@ -145,7 +148,10 @@ fn ok_run_writes_trace_with_output_channel() {
         trace.contains("Root.Demo.Output"),
         "trace missing output channel: {trace}"
     );
-    assert!(trace.contains("50"), "trace missing computed value: {trace}");
+    assert!(
+        trace.contains("50"),
+        "trace missing computed value: {trace}"
+    );
 }
 
 #[test]
