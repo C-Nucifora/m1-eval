@@ -11,6 +11,14 @@ publish = false
 name = "m1-eval"
 path = "src/bin/m1_eval.rs"
 
+[features]
+# Clean-room binary `.ld` log import, built on the MIT `motec-i2` crate + public
+# format docs (no MoTeC software is reverse-engineered). The reader and its
+# optional dependency land in Milestone P3-D; the feature is declared here so the
+# fail-loud / feature-gated dispatch in `Engine::load_log` is recognised by
+# `--check-cfg`. P3-D extends this to `ld = ["dep:motec-i2"]`.
+ld = []
+
 [dependencies]
 clap = { version = "4", features = ["derive"] }
 serde = { version = "1", features = ["derive"] }
