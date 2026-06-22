@@ -37,6 +37,9 @@ pub use scenario::{InputKind, InputSeries, RunMode, Scenario};
 pub mod log;
 pub use log::{Log, LogMeta};
 
+pub mod counterfactual;
+pub use counterfactual::Override;
+
 pub mod summary;
 pub use summary::{IoSets, io_sets};
 
