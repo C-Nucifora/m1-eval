@@ -1,0 +1,4 @@
+// Synthetic m1-eval cone fixture. No proprietary content.
+// Producer stage: reads Raw, writes Mid (= Raw + 1). Sorts AFTER the consumer
+// by filename, so a correct cone run must reorder it to run first.
+Mid = Raw + 1.0;

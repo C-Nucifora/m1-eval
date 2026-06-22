@@ -1,0 +1,4 @@
+// Synthetic m1-eval cone fixture. No proprietary content.
+// Consumer stage: reads Mid, writes Final (= Mid * 10). Depends on the producer
+// above writing Mid first this tick.
+Final = Mid * 10.0;

@@ -431,6 +431,86 @@ const = 2.0
     }
 
     #[test]
+    fn cone_runs_upstream_chain_in_topological_order() {
+        // Cone fixture: Producer (Z.Producer.m1scr) writes Mid = Raw + 1; Consumer
+        // (B.Consumer.m1scr) writes Final = Mid * 10. Targeting Final must pull in
+        // both and run the producer first — even though it sorts AFTER the consumer
+        // by filename. With Raw = 4: Mid = 5, Final = 50.
+        let dir = Path::new(env!("CARGO_MANIFEST_DIR")).join("tests/fixtures/cone");
+        let loaded = load(&dir.join("Project.m1prj"), None).expect("cone fixture loads");
+
+        let toml = r#"
+mode = "cone"
+target = "Root.Chain.Final"
+duration_s = 0.02
+base_rate_hz = 100.0
+
+[[inputs]]
+channel = "Root.Chain.Raw"
+const = 4.0
+"#;
+        let scenario = Scenario::from_toml_str(toml).unwrap();
+        let trace = run(&loaded, &scenario).expect("cone run succeeds");
+
+        assert_eq!(trace.time.len(), 2);
+        let final_col = trace
+            .channels
+            .get("Root.Chain.Final")
+            .expect("Final recorded");
+        assert!(final_col.iter().all(|v| *v == Value::Float(50.0)), "{final_col:?}");
+        // The intermediate channel is computed and recorded too.
+        let mid = trace.channels.get("Root.Chain.Mid").expect("Mid recorded");
+        assert!(mid.iter().all(|v| *v == Value::Float(5.0)), "{mid:?}");
+    }
+
+    #[test]
+    fn cone_target_with_no_writer_fails_loud() {
+        // Raw has no in-project writer; targeting it as a computed channel must
+        // fail loud rather than silently produce an empty schedule.
+        let dir = Path::new(env!("CARGO_MANIFEST_DIR")).join("tests/fixtures/cone");
+        let loaded = load(&dir.join("Project.m1prj"), None).expect("cone fixture loads");
+        let toml = r#"
+mode = "cone"
+target = "Root.Chain.Raw"
+duration_s = 0.01
+base_rate_hz = 100.0
+"#;
+        let scenario = Scenario::from_toml_str(toml).unwrap();
+        match run(&loaded, &scenario) {
+            Err(EvalError::UnresolvedSymbol { .. }) => {}
+            other => panic!("expected UnresolvedSymbol, got {other:?}"),
+        }
+    }
+
+    #[test]
+    fn topo_order_orders_dependency_before_dependent() {
+        let mut nodes = BTreeSet::new();
+        nodes.insert("consumer".to_string());
+        nodes.insert("producer".to_string());
+        // producer must precede consumer.
+        let edges = vec![("producer".to_string(), "consumer".to_string())];
+        let order = topo_order(&nodes, &edges);
+        assert_eq!(order, vec!["producer".to_string(), "consumer".to_string()]);
+    }
+
+    #[test]
+    fn topo_order_handles_a_cycle_by_appending_unscheduled() {
+        let mut nodes = BTreeSet::new();
+        nodes.insert("a".to_string());
+        nodes.insert("b".to_string());
+        // a -> b and b -> a: a true cycle, nothing has indegree 0.
+        let edges = vec![
+            ("a".to_string(), "b".to_string()),
+            ("b".to_string(), "a".to_string()),
+        ];
+        let order = topo_order(&nodes, &edges);
+        // Both still appear (best-effort ordering, fail-soft), in sorted order.
+        assert_eq!(order.len(), 2);
+        assert!(order.contains(&"a".to_string()));
+        assert!(order.contains(&"b".to_string()));
+    }
+
+    #[test]
     fn unknown_function_target_fails_loud() {
         let loaded = mini();
         let toml = r#"

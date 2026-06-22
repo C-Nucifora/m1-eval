@@ -1,0 +1,13 @@
+<?xml version="1.0"?>
+<MoTeCM1BuildSession>
+ <Project Name="Cone" TargetHardware="ecu120">
+  <ComponentStream><List>
+   <Component Classname="BuiltIn.GroupCompound" Name="Root.Chain"/>
+   <Component Classname="BuiltIn.Channel" Name="Root.Chain.Raw"><Props Type="f32"/></Component>
+   <Component Classname="BuiltIn.Channel" Name="Root.Chain.Mid"><Props Type="f32"/></Component>
+   <Component Classname="BuiltIn.Channel" Name="Root.Chain.Final"><Props Type="f32"/></Component>
+   <Component Classname="BuiltIn.FuncUser" Filename="Z.Producer.m1scr" Name="Root.Chain.Producer"/>
+   <Component Classname="BuiltIn.FuncUser" Filename="B.Consumer.m1scr" Name="Root.Chain.Consumer"/>
+  </List></ComponentStream>
+ </Project>
+</MoTeCM1BuildSession>
