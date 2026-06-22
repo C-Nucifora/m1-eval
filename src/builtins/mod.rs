@@ -225,6 +225,7 @@ mod tests {
                 fn_symbol: Some("Root.Demo.Update"),
                 script_name: "Demo.Update.m1scr",
                 dt: 0.01,
+                trace: None,
             }
         }
 

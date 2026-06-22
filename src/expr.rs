@@ -55,6 +55,11 @@ pub struct EvalCtx<'a> {
     pub script_name: &'a str,
     /// The tick step in seconds (stateful operators advance by this).
     pub dt: f64,
+    /// Optional per-expression / external-channel sink. When present, the call
+    /// evaluator records each builtin call's result value at its [`CallSite`],
+    /// and Tier-3 IO stubs flag the channels they externally drive. `None` in
+    /// unit tests that only want the returned value.
+    pub trace: Option<&'a mut crate::trace::Trace>,
 }
 
 /// Evaluate an expression node to a [`Value`].
@@ -623,7 +628,12 @@ fn eval_call(node: &Node, ctx: &mut EvalCtx) -> Result<Value, EvalError> {
                 Kind::MemberExpression => flatten_member(&object_node)?,
                 _ => object_node.text().to_string(),
             };
-            crate::builtins::dispatch(&object, method, &args, site, ctx)
+            let result = crate::builtins::dispatch(&object, method, &args, site.clone(), ctx)?;
+            // Record the call's value at its call site for the value overlay.
+            if let Some(trace) = ctx.trace.as_deref_mut() {
+                trace.record_expr((site.script().to_string(), site.offset()), result.clone());
+            }
+            Ok(result)
         }
         // A bare-identifier callee is a user-function call — out of the M4 cone.
         _ => Err(EvalError::UnsupportedConstruct {
@@ -683,6 +693,7 @@ mod tests {
                 fn_symbol: Some("Root.Demo.Update"),
                 script_name: "Demo.Update.m1scr",
                 dt: 0.01,
+                trace: None,
             }
         }
     }
