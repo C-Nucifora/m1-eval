@@ -1,0 +1,15 @@
+<?xml version="1.0"?>
+<MoTeCM1BuildSession>
+ <Project Name="CF" TargetHardware="ecu120">
+  <ComponentStream><List>
+   <Component Classname="BuiltIn.GroupCompound" Name="Root.CF"/>
+   <Component Classname="BuiltIn.Channel" Name="Root.CF.Sensor"><Props Type="f32"/></Component>
+   <Component Classname="BuiltIn.Channel" Name="Root.CF.Mid"><Props Type="f32"/></Component>
+   <Component Classname="BuiltIn.Channel" Name="Root.CF.Out"><Props Type="f32"/></Component>
+   <Component Classname="BuiltIn.Channel" Name="Root.CF.Other"><Props Type="f32"/></Component>
+   <Component Classname="BuiltIn.FuncUser" Filename="Z.A.m1scr" Name="Root.CF.A"/>
+   <Component Classname="BuiltIn.FuncUser" Filename="B.B.m1scr" Name="Root.CF.B"/>
+   <Component Classname="BuiltIn.FuncUser" Filename="C.C.m1scr" Name="Root.CF.C"/>
+  </List></ComponentStream>
+ </Project>
+</MoTeCM1BuildSession>

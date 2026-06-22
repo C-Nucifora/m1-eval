@@ -1,0 +1,4 @@
+// Synthetic m1-eval counterfactual fixture. No proprietary content.
+// Stage B: reads Mid (written by stage A), writes Out (= Mid + 1). Depends on
+// A running first this tick.
+Out = Mid + 1.0;

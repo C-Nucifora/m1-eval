@@ -1,0 +1,5 @@
+// Synthetic m1-eval counterfactual fixture. No proprietary content.
+// Stage A: reads Sensor (logged/external), writes Mid (= Sensor * 2). Its
+// filename (Z.A) sorts AFTER stage B (B.B) so a correct downstream cone must
+// still order A before B (A writes Mid, which B reads).
+Mid = Sensor * 2.0;

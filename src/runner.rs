@@ -649,6 +649,117 @@ fn build_cone<'a>(loaded: &'a Loaded, target: &str) -> Result<Vec<Scheduled<'a>>
         .collect())
 }
 
+/// Build the **downstream** dependency cone for a set of override channels: the
+/// set of functions that must be recomputed when those channels change, in
+/// topological (writer-before-reader) order.
+///
+/// This is the forward mirror of [`build_cone`]. Where `build_cone` walks the
+/// writer map *backward* (target channel → its writer → that writer's reads →
+/// their writers, transitively) to gather everything needed to *produce* a
+/// channel, `build_downstream_cone` walks *forward*: from each override channel,
+/// find every function that **reads** it; each such function's **writes** are now
+/// dirty, so every function reading *those* channels must recompute too,
+/// transitively. The same [`io_sets`] and [`topo_order`] are reused — opposite
+/// direction.
+///
+/// Fail loud when **no** function reads any override channel: there is nothing
+/// downstream to recompute, so the override would have no effect. That is a user
+/// error worth surfacing rather than silently returning an empty schedule.
+// Consumed by the counterfactual runner (P3-B Task 6); exercised now by the
+// downstream-cone tests below, hence the allow until that wiring lands.
+#[allow(dead_code)]
+fn build_downstream_cone<'a>(
+    loaded: &'a Loaded,
+    overrides: &[String],
+) -> Result<Vec<Scheduled<'a>>, EvalError> {
+    // Canonicalise each override channel against the project (no scope: absolute).
+    let no_locals = HashMap::new();
+    let override_canon: BTreeSet<String> = overrides
+        .iter()
+        .map(
+            |ch| match classify(ch, None, None, &loaded.project, &no_locals) {
+                Target::Symbol(p) => p,
+                _ => ch.clone(),
+            },
+        )
+        .collect();
+
+    // Per-script io sets, plus two indices over the writer/reader relation:
+    //   writer:  channel -> the script that writes it (first writer wins, for
+    //            determinism — scripts are iterated in sorted order);
+    //   readers: channel -> every script that reads it (the forward edge we walk).
+    let mut sets: HashMap<String, crate::summary::IoSets> = HashMap::new();
+    let mut writer: HashMap<String, String> = HashMap::new();
+    let mut readers: HashMap<String, Vec<String>> = HashMap::new();
+    for script in &loaded.scripts {
+        let group = loaded.project.group_for_script(&script.name);
+        let io = io_sets(script, &loaded.project, group.as_deref());
+        for w in &io.writes {
+            writer.entry(w.clone()).or_insert_with(|| script.name.clone());
+        }
+        for r in &io.reads {
+            readers.entry(r.clone()).or_default().push(script.name.clone());
+        }
+        sets.insert(script.name.clone(), io);
+    }
+
+    // Seed the work-stack with every function that reads any override channel —
+    // the first generation of the forward walk. If none read any override channel
+    // there is nothing downstream to recompute: fail loud.
+    let mut stack: Vec<String> = Vec::new();
+    for ch in &override_canon {
+        if let Some(rs) = readers.get(ch) {
+            stack.extend(rs.iter().cloned());
+        }
+    }
+    if stack.is_empty() {
+        let chans: Vec<&str> = override_canon.iter().map(String::as_str).collect();
+        return Err(EvalError::UnresolvedSymbol {
+            name: format!("no function reads override channel(s) {chans:?}"),
+        });
+    }
+
+    // Walk forward, collecting the dirty function set and the dependency edges
+    // (writer -> reader) for the topological sort. For each dirty function, every
+    // channel it writes is now dirty, so every reader of those channels joins the
+    // cone — transitively. We deliberately do NOT cross the override channels
+    // themselves: a function that writes an overridden channel is *not* pulled in
+    // (its output is being replaced), only readers downstream of the override.
+    let mut needed: BTreeSet<String> = BTreeSet::new();
+    let mut edges: Vec<(String, String)> = Vec::new();
+    while let Some(script_name) = stack.pop() {
+        if !needed.insert(script_name.clone()) {
+            continue;
+        }
+        let Some(io) = sets.get(&script_name) else {
+            continue;
+        };
+        for w in &io.writes {
+            // The override channels are ground truth; do not chase readers through
+            // a channel that is itself being overridden (its writer was excluded).
+            if override_canon.contains(w) {
+                continue;
+            }
+            if let Some(rs) = readers.get(w) {
+                for reader in rs {
+                    if reader != &script_name {
+                        // script_name (writes w) must run before reader (reads w).
+                        edges.push((script_name.clone(), reader.clone()));
+                        stack.push(reader.clone());
+                    }
+                }
+            }
+        }
+    }
+
+    let ordered = topo_order(&needed, &edges);
+    Ok(ordered
+        .iter()
+        .filter_map(|name| loaded.scripts.iter().find(|s| &s.name == name))
+        .map(|s| scheduled_for(loaded, s))
+        .collect())
+}
+
 /// Topologically order `nodes` by the `edges` (`from` must precede `to`) using
 /// Kahn's algorithm. Ties break by name for determinism. A cycle leaves some
 /// nodes unscheduled; those are appended in sorted order so the run still covers
@@ -1196,5 +1307,83 @@ base_rate_hz = 100.0
             Err(EvalError::UnresolvedSymbol { .. }) => {}
             other => panic!("expected UnresolvedSymbol, got {other:?}"),
         }
+    }
+
+    fn counterfactual() -> Loaded {
+        let dir = Path::new(env!("CARGO_MANIFEST_DIR")).join("tests/fixtures/counterfactual");
+        load(&dir.join("Project.m1prj"), None).expect("counterfactual fixture loads")
+    }
+
+    /// The `fn_symbol` path of each scheduled function in a cone, in order — the
+    /// load-bearing observable for the downstream-cone tests.
+    fn cone_fn_symbols(cone: &[Scheduled<'_>]) -> Vec<String> {
+        cone.iter()
+            .map(|s| s.fn_symbol.clone().expect("scheduled fn has a symbol"))
+            .collect()
+    }
+
+    #[test]
+    fn downstream_cone_from_sensor_recomputes_a_then_b_excludes_unrelated() {
+        // Override Sensor: stage A reads Sensor (writes Mid), stage B reads Mid
+        // (writes Out). The forward cone is therefore [A, B] in that order — even
+        // though A's filename (Z.A) sorts AFTER B's (B.B). The unrelated stage C
+        // (writes Other, reads nothing in the chain) is excluded.
+        let loaded = counterfactual();
+        let cone =
+            build_downstream_cone(&loaded, &["Root.CF.Sensor".to_string()]).expect("cone builds");
+        assert_eq!(
+            cone_fn_symbols(&cone),
+            vec!["Root.CF.A".to_string(), "Root.CF.B".to_string()],
+            "Sensor override recomputes A then B, never C",
+        );
+    }
+
+    #[test]
+    fn downstream_cone_from_mid_recomputes_only_b() {
+        // Overriding the intermediate channel Mid recomputes only its readers'
+        // chain: B (reads Mid) and nothing further. A (which *writes* Mid) is not
+        // in the cone — its output is being overridden, so it must not run.
+        let loaded = counterfactual();
+        let cone =
+            build_downstream_cone(&loaded, &["Root.CF.Mid".to_string()]).expect("cone builds");
+        assert_eq!(
+            cone_fn_symbols(&cone),
+            vec!["Root.CF.B".to_string()],
+            "Mid override recomputes only B",
+        );
+    }
+
+    #[test]
+    fn downstream_cone_of_a_leaf_with_no_reader_fails_loud() {
+        // Out is a leaf: no function in the project reads it, so overriding it has
+        // nothing downstream to recompute. That is a user error worth surfacing —
+        // fail loud rather than return an empty (silently no-op) cone.
+        let loaded = counterfactual();
+        match build_downstream_cone(&loaded, &["Root.CF.Out".to_string()]) {
+            Err(EvalError::UnresolvedSymbol { .. }) => {}
+            Err(other) => panic!("expected UnresolvedSymbol for a no-reader override, got {other:?}"),
+            Ok(cone) => panic!(
+                "expected fail-loud for a no-reader override, got cone {:?}",
+                cone_fn_symbols(&cone)
+            ),
+        }
+    }
+
+    #[test]
+    fn downstream_cone_multiple_overrides_union_their_readers() {
+        // Two overrides at once (Sensor and the unrelated Other). Sensor pulls in
+        // A then B; Other has a writer (C) but no in-project reader, so it
+        // contributes nothing — the union is still exactly [A, B], proving the
+        // multi-override seed unions readers without spuriously dragging in C.
+        let loaded = counterfactual();
+        let cone = build_downstream_cone(
+            &loaded,
+            &["Root.CF.Sensor".to_string(), "Root.CF.Other".to_string()],
+        )
+        .expect("cone builds");
+        assert_eq!(
+            cone_fn_symbols(&cone),
+            vec!["Root.CF.A".to_string(), "Root.CF.B".to_string()],
+        );
     }
 }

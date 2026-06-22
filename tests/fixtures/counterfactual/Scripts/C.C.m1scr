@@ -1,0 +1,4 @@
+// Synthetic m1-eval counterfactual fixture. No proprietary content.
+// Stage C: unrelated. Reads nothing from the Sensor->Mid->Out chain; writes
+// Other (= constant). Overriding Sensor must NOT recompute C.
+Other = 42.0;
