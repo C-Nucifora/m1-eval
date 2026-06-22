@@ -7,6 +7,10 @@ description = "Evaluator/interpreter for the MoTeC M1 scripting language"
 license = "GPL-3.0-or-later"
 publish = false
 
+[[bin]]
+name = "m1-eval"
+path = "src/bin/m1_eval.rs"
+
 [dependencies]
 clap = { version = "4", features = ["derive"] }
 serde = { version = "1", features = ["derive"] }
