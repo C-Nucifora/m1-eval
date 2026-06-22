@@ -93,16 +93,13 @@ pub fn as_integer(object: &str, ctx: &mut EvalCtx) -> Result<Option<Value>, Eval
 }
 
 /// Read the current value at a canonical channel path and convert it to its enum
-/// integer. The value must already be a [`Value::Enum`] in the env (seeded as a
-/// scenario input or written by an earlier statement); an unset channel is a
-/// fail-loud [`EvalError::MissingInput`] and a non-enum value a `TypeError`.
-fn convert_value_at(canon: &str, ctx: &EvalCtx) -> Result<Value, EvalError> {
-    let value = ctx
-        .env
-        .get(canon)
-        .ok_or_else(|| EvalError::MissingInput {
-            channel: canon.to_string(),
-        })?;
+/// integer. Reads through [`crate::expr::read_symbol`] so the value resolves with
+/// the same semantics as a plain read: a written/seeded value, else (in
+/// whole-project mode) the channel's externally-driven enum startup default, else
+/// — in single-function/cone mode — a fail-loud [`EvalError::MissingInput`]. A
+/// non-enum value is a `TypeError` (never a guessed integer).
+fn convert_value_at(canon: &str, ctx: &mut EvalCtx) -> Result<Value, EvalError> {
+    let value = crate::expr::read_symbol(canon, ctx)?;
     Ok(Value::Int(value.as_enum_int(ctx.project)?))
 }
 

@@ -166,6 +166,21 @@ pub struct Env {
     /// (whose `Out =` statements write here), reads the result, then restores the
     /// caller's slot. `None` means the current function has not assigned `Out`.
     pub out: Option<Value>,
+    /// Whether an unseeded *channel* read returns its type-correct external
+    /// default instead of failing loud [`crate::error::EvalError::MissingInput`].
+    ///
+    /// `false` by default (the single-function / cone modes): the scenario must
+    /// drive every input channel a function reads, and an unprovided input is a
+    /// fail-loud error so a missing input is never silently a guessed value.
+    ///
+    /// The **whole-project runner** sets it `true`: there is no scenario driving
+    /// the sensor/CAN inputs, so an unseeded channel read (a hardware input, a
+    /// table output the auto-`Lookup` would compute, a state channel before its
+    /// writer's first run) falls back to its determinate startup default, flagged
+    /// externally driven — the channel-side analogue of the Tier-3 IO stubs. This
+    /// is what lets a whole-project run complete offline without a calibration or
+    /// a log. It propagates to inline user-function callees, which share this env.
+    pub default_unseeded_channels: bool,
 }
 
 impl Env {

@@ -230,7 +230,10 @@ fn try_channel_set(
             ),
         });
     }
-    let value = args[0].clone();
+    // Coerce a numeric value written to an enum-typed channel to its enum member
+    // (M1 enum channels store an integer; `Precharge State.Set(0)` writes the
+    // member with that declared value), so the channel holds a typed enum value.
+    let value = crate::expr::coerce_for_channel(&canon, args[0].clone(), ctx.project);
     ctx.env.set(canon.clone(), value.clone());
     if let Some(trace) = ctx.trace.as_deref_mut() {
         trace.record_channel(canon, value.clone());
@@ -317,11 +320,26 @@ fn try_table_lookup(
     // Real exports omit the implicit leading `Root.` group prefix, so try the
     // canonical path first, then the `Root.`-stripped form (mirrors parameter
     // lookup in the expression evaluator).
-    let table = ctx
+    let table = match ctx
         .calib
         .table(&canon)
         .or_else(|| canon.strip_prefix("Root.").and_then(|p| ctx.calib.table(p)))
-        .ok_or_else(|| EvalError::MissingCalibration { path: canon.clone() })?;
+    {
+        Some(table) => table,
+        // No calibration cells for this table. In whole-project mode (no `.m1cfg`)
+        // the table is an unseeded externally-driven output, like a tunable
+        // parameter: it falls back to the documented float default (its `.Value`
+        // output type), flagged externally driven, rather than aborting the run. In
+        // single-function / cone mode a `.Lookup` with no cells is still fail-loud
+        // `MissingCalibration` — the user must supply the calibration.
+        None if ctx.env.default_unseeded_channels => {
+            if let Some(trace) = ctx.trace.as_deref_mut() {
+                trace.mark_external(canon.clone());
+            }
+            return Ok(Some(Value::Float(0.0)));
+        }
+        None => return Err(EvalError::MissingCalibration { path: canon.clone() }),
+    };
 
     // Each lookup coordinate must be numeric; collect them then interpolate.
     let mut inputs = Vec::with_capacity(args.len());
@@ -1199,6 +1217,33 @@ mod tests {
                 classify_builtin("DashVals", method),
                 BuiltinSupport::Stubbed,
                 "{method} should be a stub"
+            );
+        }
+    }
+
+    #[test]
+    fn io_library_methods_are_classified_stubbed() {
+        // Every method on a Tier-3 IO *library* object (CanComms/Serial/System/
+        // Logging) the generic typed-default stub now handles must classify as
+        // Stubbed, so coverage stays consistent with what the IO stub returns at
+        // runtime — including the `CanComms.*` reads/setup the old design left
+        // unstubbed (the EV-M1 whole-project blocker this fix closed).
+        let cases = [
+            ("CanComms", "RxOpenStandard"), // Handle -> unit stub
+            ("CanComms", "GetFloat"),       // FloatingPoint -> 0.0
+            ("CanComms", "GetUnsignedInteger"), // Integer -> 0
+            ("CanComms", "RxMessage"),      // Boolean -> false
+            ("CanComms", "SetFloat"),       // Void -> unit
+            ("Serial", "GetFloat"),
+            ("System", "ElapsedTime"),
+            ("System", "TickPeriod"),
+            ("Logging", "Running"),
+        ];
+        for (object, method) in cases {
+            assert_eq!(
+                classify_builtin(object, method),
+                BuiltinSupport::Stubbed,
+                "{object}.{method} should be a stub"
             );
         }
     }

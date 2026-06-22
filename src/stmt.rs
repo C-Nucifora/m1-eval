@@ -116,7 +116,8 @@ fn exec_assignment(node: &Node, ctx: &mut EvalCtx) -> Result<(), EvalError> {
     // first, applies the corresponding binary operator, then writes the result.
     let final_value = if m1_core::is_compound_assign(op.kind()) {
         let current = read_dest(&dest, ctx)?;
-        apply_compound(op.kind(), &current, &rhs)?
+        let div_by_zero_yields_zero = ctx.env.default_unseeded_channels;
+        apply_compound(op.kind(), &current, &rhs, div_by_zero_yields_zero)?
     } else {
         rhs
     };
@@ -212,9 +213,12 @@ fn target_path(target: &Node) -> Result<String, EvalError> {
 }
 
 /// Read the current value at a destination (for compound assignment). A local /
-/// static / channel that has no current value is a fail-loud error — a compound
-/// assignment that reads an unset slot cannot proceed.
-fn read_dest(dest: &Dest, ctx: &EvalCtx) -> Result<Value, EvalError> {
+/// static / `Out` slot that has no current value is a fail-loud error — a compound
+/// assignment that reads an unset slot cannot proceed. A channel reads through
+/// [`expr::read_symbol`] so its read-back honours the same semantics as any other
+/// channel read: a written/seeded value, else (in whole-project mode) the
+/// channel's externally-driven startup default, else fail-loud `MissingInput`.
+fn read_dest(dest: &Dest, ctx: &mut EvalCtx) -> Result<Value, EvalError> {
     match dest {
         Dest::Local(name) => ctx
             .env
@@ -226,11 +230,7 @@ fn read_dest(dest: &Dest, ctx: &EvalCtx) -> Result<Value, EvalError> {
             .get_static(fn_symbol, var)
             .cloned()
             .ok_or_else(|| EvalError::MissingInput { channel: var.clone() }),
-        Dest::Channel(canon) => ctx
-            .env
-            .get(canon)
-            .cloned()
-            .ok_or_else(|| EvalError::MissingInput { channel: canon.clone() }),
+        Dest::Channel(canon) => expr::read_symbol(canon, ctx),
         Dest::Out => ctx
             .env
             .get_out()
@@ -245,6 +245,10 @@ fn write_dest(dest: &Dest, value: Value, ctx: &mut EvalCtx) {
         Dest::Local(name) => ctx.env.set_local(name.clone(), value),
         Dest::Static { fn_symbol, var } => ctx.env.set_static(fn_symbol, var, value),
         Dest::Channel(canon) => {
+            // Coerce a numeric write to an enum-typed channel to its enum member,
+            // so an enum channel assigned an integer holds a typed enum value (the
+            // same implicit int→enum conversion M1 applies on assignment).
+            let value = expr::coerce_for_channel(canon, value, ctx.project);
             ctx.env.set(canon.clone(), value.clone());
             if let Some(trace) = ctx.trace.as_deref_mut() {
                 trace.record_channel(canon.clone(), value);
@@ -258,10 +262,15 @@ fn write_dest(dest: &Dest, value: Value, ctx: &mut EvalCtx) {
 /// Apply a compound-assignment operator to the current value and the rhs. The
 /// arithmetic/bitwise semantics match the expression evaluator's binary
 /// operators (delegated through a fresh binary-op evaluation).
-fn apply_compound(op: Kind, current: &Value, rhs: &Value) -> Result<Value, EvalError> {
+fn apply_compound(
+    op: Kind,
+    current: &Value,
+    rhs: &Value,
+    div_by_zero_yields_zero: bool,
+) -> Result<Value, EvalError> {
     // Map each compound operator to its underlying binary operator, then reuse the
     // expression evaluator's binary semantics so the result typing/coercions stay
-    // consistent (`numeric_join`, integral-only bitwise, fail-loud div-by-zero).
+    // consistent (`numeric_join`, integral-only bitwise, div-by-zero handling).
     let binop = match op {
         Kind::PlusEq => Kind::Plus,
         Kind::MinusEq => Kind::Minus,
@@ -280,7 +289,7 @@ fn apply_compound(op: Kind, current: &Value, rhs: &Value) -> Result<Value, EvalE
             });
         }
     };
-    expr::apply_binary_values(binop, current, rhs)
+    expr::apply_binary_values(binop, current, rhs, div_by_zero_yields_zero)
 }
 
 // ---- Task 21: if/else, when/is, expand/to, local/static local, block ----

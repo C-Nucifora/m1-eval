@@ -13,9 +13,12 @@
 //! - the ternary `c ? a : b`,
 //! - and the call-dispatch entry point for `Object.Method(args)` builtins.
 //!
-//! Value reads are **fail-loud**: an unset channel is a [`EvalError::MissingInput`],
-//! a missing parameter/constant value a [`EvalError::MissingCalibration`], and an
-//! unresolved name a [`EvalError::UnresolvedSymbol`] — never a guessed number.
+//! Value reads are **fail-loud** for true runtime inputs: an unset channel is a
+//! [`EvalError::MissingInput`] and an unresolved name a
+//! [`EvalError::UnresolvedSymbol`] — never a guessed number. A parameter/constant
+//! is a *tunable calibration value*, not a runtime input: an unseeded one (no
+//! `.m1cfg`, no override) defaults to its declared-type zero, flagged externally
+//! driven, like the Tier-3 IO stubs (see [`read_symbol`]).
 //!
 //! Identifier paths may contain spaces (`Cooling Fan`); we only ever split paths
 //! on `.`, never on whitespace.
@@ -245,17 +248,76 @@ fn eval_path(path: &str, node: &Node, ctx: &mut EvalCtx) -> Result<Value, EvalEr
             kind: format!("builtin object {object:?} used as a value"),
             at: node.byte_range().start,
         }),
-        Target::Unresolved => Err(EvalError::UnresolvedSymbol {
-            name: path.to_string(),
+        // Not a project symbol/local/builtin: it may be an enum-type-qualified
+        // member literal used directly as a value (`x eq Universal Switch State.On`,
+        // `Drive State.Idle`). Resolve it to the corresponding [`Value::Enum`]
+        // before failing loud — these literals are compile-time-constant values.
+        Target::Unresolved => enum_member_literal(path, ctx).ok_or_else(|| {
+            EvalError::UnresolvedSymbol {
+                name: path.to_string(),
+            }
         }),
     }
+}
+
+/// If `path` is an enum-member literal, the corresponding [`Value::Enum`];
+/// otherwise `None`. Two qualifier forms appear in real scripts, both split on the
+/// **rightmost** `.` only (enum type, member, and symbol names all contain spaces):
+///
+/// 1. **Enum-type-qualified** `<EnumTypeName>.<Member>` (`Universal Switch State
+///    .On`, `Drive State.Idle`): the prefix names an enum type directly.
+/// 2. **Value-source-qualified** `<EnumValuedSymbol>.<Member>` (`This.Drive State
+///    .Ready To Drive`, where `This.Drive State` is an enum-valued value-compound):
+///    the prefix resolves to a project symbol whose `value_type` is that enum, and
+///    `<Member>` is one of its members. M1 lets the author qualify a member by the
+///    compound/channel that holds the enum, not just by the bare type name.
+///
+/// A prefix that is a real enum source but whose leaf is not one of its members is
+/// *not* a literal (returns `None` → the caller fails loud as unresolved), as a
+/// non-member would be an undefined name.
+fn enum_member_literal(path: &str, ctx: &EvalCtx) -> Option<Value> {
+    let (prefix, leaf) = path.rsplit_once('.')?;
+    let symbols = ctx.project.symbols();
+
+    // Form 1: the prefix is an enum type name.
+    let id = symbols.enum_by_name(prefix).or_else(|| {
+        // Form 2: the prefix resolves to an enum-valued project symbol; the member
+        // is qualified by the value source rather than the bare enum type name. A
+        // value-compound (`GroupCompound`) carries its enum on its `.Value` child,
+        // so consult that child's type when the symbol itself is untyped.
+        let Target::Symbol(canon) =
+            classify(prefix, ctx.group, ctx.fn_symbol, ctx.project, &ctx.env.locals)
+        else {
+            return None;
+        };
+        let enum_id_of = |path: &str| match symbols.get(path).map(|s| s.value_type) {
+            Some(ValueType::Enum(id)) => Some(id),
+            _ => None,
+        };
+        enum_id_of(&canon).or_else(|| enum_id_of(&format!("{canon}.Value")))
+    })?;
+
+    symbols.enum_has_member(id, leaf).then(|| Value::Enum {
+        id,
+        member: leaf.to_string(),
+    })
 }
 
 /// Read a resolved project symbol's current value. The store depends on the
 /// symbol kind: channels come from the value store (fail loud if unset), while
 /// parameters/constants come from calibration (with an `Env` override taking
 /// precedence). A table or group has no scalar value.
-fn read_symbol(canon: &str, ctx: &mut EvalCtx) -> Result<Value, EvalError> {
+///
+/// A parameter/constant is a *tunable calibration value*: its real value lives in
+/// a `.m1cfg` export, not the `.m1prj` (which declares no defaults). When neither
+/// an `Env` override nor a loaded calibration supplies one, it is an unseeded
+/// externally-driven input — like a CAN read — so it resolves to the type-correct
+/// default for its declared type (flagged externally driven in the trace), not a
+/// fail-loud abort. A real calibration or a scenario override always wins. This is
+/// the calibration-side analogue of the Tier-3 IO stubs (see
+/// [`crate::builtins::io_stub`]); it never invents a *meaningful* number, only the
+/// determinate zero/false/empty of the parameter's type.
+pub(crate) fn read_symbol(canon: &str, ctx: &mut EvalCtx) -> Result<Value, EvalError> {
     // An explicit `Env` override (a pinned channel, a previously written value)
     // always wins — that is how computed channels read back what an earlier
     // statement wrote, and how scenario inputs are seeded.
@@ -263,17 +325,85 @@ fn read_symbol(canon: &str, ctx: &mut EvalCtx) -> Result<Value, EvalError> {
         return Ok(v.clone());
     }
 
-    let kind = ctx.project.symbols().get(canon).map(|s| s.kind);
+    let symbol = ctx.project.symbols().get(canon);
+    let kind = symbol.map(|s| s.kind);
     match kind {
         Some(SymbolKind::Parameter | SymbolKind::Constant) => {
-            calib_param(canon, ctx.calib).ok_or_else(|| EvalError::MissingCalibration {
-                path: canon.to_string(),
-            })
+            // A loaded calibration value wins; otherwise default to the parameter's
+            // declared-type zero (externally driven), so a no-calibration run does
+            // not abort on the first tunable read. An *enum*-typed parameter (e.g.
+            // a `Universal Switch State` calibration switch) defaults to its enum's
+            // initial member, so an `eq <Enum>.<Member>` comparison is type-correct.
+            if let Some(v) = calib_param(canon, ctx.calib) {
+                return Ok(v);
+            }
+            let value_type = symbol.map(|s| s.value_type).unwrap_or(ValueType::Unknown);
+            let default = typed_io_input_default(value_type, ctx.project);
+            if let Some(trace) = ctx.trace.as_deref_mut() {
+                trace.mark_external(canon);
+            }
+            Ok(default)
         }
-        Some(SymbolKind::Channel) => Err(EvalError::MissingInput {
-            channel: canon.to_string(),
-        }),
-        // Tables/groups/functions/objects are not scalar values.
+        Some(SymbolKind::Channel) => {
+            // An unseeded channel is a missing runtime input. In single-function /
+            // cone mode the scenario must drive it, so this is fail-loud. In
+            // whole-project mode (no scenario), it is an externally-driven input
+            // (sensor/CAN/table-output/state channel) that falls back to its
+            // type-correct startup default, flagged externally driven — never a
+            // guessed *meaningful* value, only the determinate zero of its type.
+            if ctx.env.default_unseeded_channels {
+                let value_type = symbol.map(|s| s.value_type).unwrap_or(ValueType::Unknown);
+                let default = typed_io_input_default(value_type, ctx.project);
+                if let Some(trace) = ctx.trace.as_deref_mut() {
+                    trace.mark_external(canon);
+                }
+                Ok(default)
+            } else {
+                Err(EvalError::MissingInput {
+                    channel: canon.to_string(),
+                })
+            }
+        }
+        // A package *object* read directly as a value — a hardware IO input device
+        // (`_IOMethod.av_switch` switch read `Driver.AUX Switch eq …`) whose value
+        // is a documented state enum. The typechecker assigns it that enum type
+        // (#173); offline it is an unseeded externally-driven hardware input, so it
+        // resolves to that enum's initial state (`Off`/first member), flagged
+        // externally driven — never a fail-loud abort. An object with no determinate
+        // value type (a CAN message, a bare group) still has no scalar value.
+        Some(SymbolKind::Object | SymbolKind::Reference | SymbolKind::Other)
+            if symbol.map(|s| s.value_type.is_known()).unwrap_or(false) =>
+        {
+            let value_type = symbol.map(|s| s.value_type).unwrap_or(ValueType::Unknown);
+            let default = typed_io_input_default(value_type, ctx.project);
+            if let Some(trace) = ctx.trace.as_deref_mut() {
+                trace.mark_external(canon);
+            }
+            Ok(default)
+        }
+        // A symbol read directly by name whose value lives on its auto-created
+        // `.Value` child: a `GroupCompound` value-compound (`Driveline.Accumulator
+        // .Maximum Cell Temp`, marked `DefValue="This.Value"`), a `Table`
+        // (`Control.Rear Torque Bias`, whose generated `Table.Lookup` writes
+        // `.Value`), or a sensor/package `Object` (`Throttle Position.Tracking
+        // .Discrete`, a `MoTeC Input.Sensor` whose reading is its `.Value`
+        // channel). Reading the symbol reads through to that `.Value` child (the
+        // same convention `enum_conv` uses for `.AsInteger`). This is reached only
+        // after the typed-value Object arm above, so an enum-valued switch object
+        // (read as its enum directly) is not diverted here. Recurse on
+        // `<canon>.Value` when that child exists; a symbol with no `.Value` child
+        // has no scalar value.
+        Some(SymbolKind::Group | SymbolKind::Table | SymbolKind::Object)
+            if ctx
+                .project
+                .symbols()
+                .get(&format!("{canon}.Value"))
+                .is_some() =>
+        {
+            let value_path = format!("{canon}.Value");
+            read_symbol(&value_path, ctx)
+        }
+        // Tables/groups/untyped objects/functions are not scalar values.
         Some(_) => Err(EvalError::TypeError {
             detail: format!("symbol {canon:?} has no scalar value"),
         }),
@@ -282,6 +412,85 @@ fn read_symbol(canon: &str, ctx: &mut EvalCtx) -> Result<Value, EvalError> {
         None => Err(EvalError::UnresolvedSymbol {
             name: canon.to_string(),
         }),
+    }
+}
+
+/// The type-correct externally-driven default for an unseeded parameter/constant
+/// of declared type `value_type`. A determinate zero/false/empty — never a guessed
+/// reading. An `Unknown`/`Enum`-typed tunable (no determinate scalar zero) falls
+/// back to `Float(0.0)`, the numeric default real calibration cells take.
+fn typed_param_default(value_type: ValueType) -> Value {
+    match value_type {
+        ValueType::Boolean => Value::Bool(false),
+        ValueType::Integer => Value::Int(0),
+        ValueType::Unsigned => Value::Uint(0),
+        ValueType::Float => Value::Float(0.0),
+        ValueType::String => Value::Str(String::new()),
+        // An enum-typed or untyped tunable has no determinate scalar zero; a
+        // calibration cell is numeric, so default to the float zero.
+        ValueType::Enum(_) | ValueType::Unknown => Value::Float(0.0),
+    }
+}
+
+/// The type-correct initial value for an unseeded externally-driven IO-input
+/// object (a hardware switch/sensor object read directly). Unlike a numeric
+/// tunable, an enum-typed hardware input resolves to a proper [`Value::Enum`] of
+/// its enum's initial state (the declared `default` member, else the first
+/// member), so an `eq <Enum>.<Member>` comparison is type-correct. Scalar types
+/// reuse [`typed_param_default`].
+fn typed_io_input_default(value_type: ValueType, project: &Project) -> Value {
+    match value_type {
+        ValueType::Enum(id) => {
+            let enum_type = project.symbols().enum_type(id);
+            let member = enum_type
+                .default
+                .clone()
+                .or_else(|| enum_type.members.first().map(|(name, _)| name.clone()));
+            match member {
+                Some(member) => Value::Enum { id, member },
+                // A member-less (open firmware) enum has no determinate offline
+                // member; fall back to the numeric zero rather than invent one.
+                None => Value::Float(0.0),
+            }
+        }
+        other => typed_param_default(other),
+    }
+}
+
+/// Coerce a value being written to channel/parameter `canon` to that symbol's
+/// declared type, for the one case M1 implicitly converts on assignment: writing a
+/// **numeric** value to an **enum**-typed channel. M1 enum channels store an
+/// integer, so `Precharge State.Set(Convert.ToInteger(...))` and `… .Set(0)` write
+/// an integer the firmware interprets as the enum member with that declared value.
+/// We mirror that by resolving the integer to its [`Value::Enum`] member, so the
+/// channel holds a typed enum value and an `eq <Enum>.<Member>` comparison is
+/// type-correct. A numeric value with no matching member, or any non-enum target,
+/// is returned unchanged (the write is stored as-is — never a guessed member).
+pub(crate) fn coerce_for_channel(canon: &str, value: Value, project: &Project) -> Value {
+    // Only a numeric value written to an enum-typed symbol is coerced.
+    let n = match &value {
+        Value::Int(_) | Value::Uint(_) | Value::Float(_) => value.as_f64().ok(),
+        _ => None,
+    };
+    let Some(n) = n else { return value };
+    let Some(symbol) = project.symbols().get(canon) else {
+        return value;
+    };
+    let ValueType::Enum(id) = symbol.value_type else {
+        return value;
+    };
+    // The member whose declared integer equals the written number (exactly — a
+    // fractional value matches no member and is left as-is).
+    let member = project
+        .symbols()
+        .enum_type(id)
+        .members
+        .iter()
+        .find(|(_, decl)| (*decl as f64) == n)
+        .map(|(name, _)| name.clone());
+    match member {
+        Some(member) => Value::Enum { id, member },
+        None => value,
     }
 }
 
@@ -376,7 +585,7 @@ fn eval_binary(node: &Node, ctx: &mut EvalCtx) -> Result<Value, EvalError> {
     // The remaining operators (arithmetic, comparison, equality, bitwise/shift)
     // operate on the two evaluated values; share that core with the compound
     // assignment operators. An unhandled token reports its byte offset.
-    apply_binary_values(kind, &l, &r).map_err(|e| match e {
+    apply_binary_values(kind, &l, &r, ctx.env.default_unseeded_channels).map_err(|e| match e {
         EvalError::UnsupportedConstruct { kind, .. } => EvalError::UnsupportedConstruct {
             kind,
             at: op.byte_range().start,
@@ -391,10 +600,21 @@ fn eval_binary(node: &Node, ctx: &mut EvalCtx) -> Result<Value, EvalError> {
 /// assignment operators (`+=`, `&=`, …). Logical/short-circuit operators are
 /// intentionally excluded — they are handled in [`eval_binary`] before both
 /// operands are evaluated, and compound assignment never targets them.
-pub(crate) fn apply_binary_values(op: Kind, l: &Value, r: &Value) -> Result<Value, EvalError> {
+/// `div_by_zero_yields_zero` makes integer `/` and `%` by zero return `0` instead
+/// of failing loud — the documented M1 firmware behaviour, enabled in
+/// whole-project mode where the all-default offline input world can produce a
+/// degenerate zero divisor that real calibration/CAN data would not. `false`
+/// (single-function/cone mode) keeps the fail-loud guard so a genuine zero divisor
+/// in user-supplied inputs surfaces.
+pub(crate) fn apply_binary_values(
+    op: Kind,
+    l: &Value,
+    r: &Value,
+    div_by_zero_yields_zero: bool,
+) -> Result<Value, EvalError> {
     match op {
         Kind::Plus | Kind::Minus | Kind::Star | Kind::Slash | Kind::Percent => {
-            arithmetic(op, l, r)
+            arithmetic(op, l, r, div_by_zero_yields_zero)
         }
         Kind::Lt | Kind::Gt | Kind::LtEq | Kind::GtEq => compare(op, l, r),
         Kind::Eq | Kind::EqEq => Ok(Value::Bool(values_equal(l, r)?)),
@@ -410,7 +630,12 @@ pub(crate) fn apply_binary_values(op: Kind, l: &Value, r: &Value) -> Result<Valu
 /// Apply an arithmetic operator. Integer/unsigned operands stay integral (with
 /// the result kind chosen by `numeric_join`); any float operand promotes to
 /// float. Division/modulo by zero fail loud rather than producing NaN/inf.
-fn arithmetic(op: Kind, l: &Value, r: &Value) -> Result<Value, EvalError> {
+fn arithmetic(
+    op: Kind,
+    l: &Value,
+    r: &Value,
+    div_by_zero_yields_zero: bool,
+) -> Result<Value, EvalError> {
     let lt = value_type(l);
     let rt = value_type(r);
     let joined = numeric_join(lt, rt);
@@ -432,12 +657,12 @@ fn arithmetic(op: Kind, l: &Value, r: &Value) -> Result<Value, EvalError> {
         ValueType::Unsigned => {
             let a = as_u64(l)?;
             let b = as_u64(r)?;
-            int_op_u64(op, a, b)
+            int_op_u64(op, a, b, div_by_zero_yields_zero)
         }
         ValueType::Integer => {
             let a = as_i64(l)?;
             let b = as_i64(r)?;
-            int_op_i64(op, a, b)
+            int_op_i64(op, a, b, div_by_zero_yields_zero)
         }
         // One operand is non-numeric (Bool/Enum/String) or Unknown.
         _ => Err(EvalError::TypeError {
@@ -446,20 +671,20 @@ fn arithmetic(op: Kind, l: &Value, r: &Value) -> Result<Value, EvalError> {
     }
 }
 
-fn int_op_i64(op: Kind, a: i64, b: i64) -> Result<Value, EvalError> {
+fn int_op_i64(op: Kind, a: i64, b: i64, div_by_zero_yields_zero: bool) -> Result<Value, EvalError> {
     let out = match op {
         Kind::Plus => a.wrapping_add(b),
         Kind::Minus => a.wrapping_sub(b),
         Kind::Star => a.wrapping_mul(b),
         Kind::Slash => {
             if b == 0 {
-                return Err(div_by_zero());
+                return zero_divisor_result(div_by_zero_yields_zero).map(Value::Int);
             }
             a.wrapping_div(b)
         }
         Kind::Percent => {
             if b == 0 {
-                return Err(div_by_zero());
+                return zero_divisor_result(div_by_zero_yields_zero).map(Value::Int);
             }
             a.wrapping_rem(b)
         }
@@ -468,26 +693,37 @@ fn int_op_i64(op: Kind, a: i64, b: i64) -> Result<Value, EvalError> {
     Ok(Value::Int(out))
 }
 
-fn int_op_u64(op: Kind, a: u64, b: u64) -> Result<Value, EvalError> {
+fn int_op_u64(op: Kind, a: u64, b: u64, div_by_zero_yields_zero: bool) -> Result<Value, EvalError> {
     let out = match op {
         Kind::Plus => a.wrapping_add(b),
         Kind::Minus => a.wrapping_sub(b),
         Kind::Star => a.wrapping_mul(b),
         Kind::Slash => {
             if b == 0 {
-                return Err(div_by_zero());
+                return zero_divisor_result(div_by_zero_yields_zero).map(|z| Value::Uint(z as u64));
             }
             a.wrapping_div(b)
         }
         Kind::Percent => {
             if b == 0 {
-                return Err(div_by_zero());
+                return zero_divisor_result(div_by_zero_yields_zero).map(|z| Value::Uint(z as u64));
             }
             a.wrapping_rem(b)
         }
         _ => unreachable!(),
     };
     Ok(Value::Uint(out))
+}
+
+/// The result of an integer divide/modulo by zero. In whole-project mode it is the
+/// documented M1 firmware result `0` (the ECU never traps); otherwise it is a
+/// fail-loud [`EvalError`] so a genuine zero divisor in user inputs surfaces.
+fn zero_divisor_result(div_by_zero_yields_zero: bool) -> Result<i64, EvalError> {
+    if div_by_zero_yields_zero {
+        Ok(0)
+    } else {
+        Err(div_by_zero())
+    }
 }
 
 fn div_by_zero() -> EvalError {
@@ -531,15 +767,25 @@ fn values_equal(l: &Value, r: &Value) -> Result<bool, EvalError> {
     }
 }
 
-/// Apply a bitwise/shift operator. Both operands must be the same integral
-/// family (both signed or both unsigned); mixing or non-integral operands is a
-/// type error.
+/// Apply a bitwise/shift operator. Operands must be integral (signed or unsigned);
+/// a non-integral operand is a type error. Mixed signed/unsigned operands are
+/// allowed — real M1 code freely combines them (`(Status Word >> 8) & 0x01`, an
+/// `s32` masked with a hex `u32`). Bit operations act on the two's-complement bit
+/// pattern, so the result type follows [`numeric_join`]: `Unsigned` only when both
+/// operands are unsigned, otherwise `Integer` (the same rule as `+`/`-`).
 fn bitwise(op: Kind, l: &Value, r: &Value) -> Result<Value, EvalError> {
     match (l, r) {
+        // Both unsigned: compute and keep unsigned.
         (Value::Uint(a), Value::Uint(b)) => Ok(Value::Uint(bit_u64(op, *a, *b))),
-        (Value::Int(a), Value::Int(b)) => Ok(Value::Int(bit_i64(op, *a, *b))),
+        // Any integral mix (signed/signed, signed/unsigned, unsigned/signed):
+        // compute on the i64 bit pattern; the result is signed per `numeric_join`.
+        (Value::Int(_) | Value::Uint(_), Value::Int(_) | Value::Uint(_)) => {
+            Ok(Value::Int(bit_i64(op, as_i64(l)?, as_i64(r)?)))
+        }
         _ => Err(EvalError::TypeError {
-            detail: format!("bitwise operator requires matching integral operands, got {l:?} and {r:?}"),
+            detail: format!(
+                "bitwise operator requires integral operands, got {l:?} and {r:?}"
+            ),
         }),
     }
 }
@@ -820,12 +1066,12 @@ mod tests {
     #[test]
     fn parameter_identifier_reads_calibration() {
         let mut h = Harness::new();
-        // No calibration value -> fail loud.
-        match rhs_value("Gain", &mut h) {
-            Err(EvalError::MissingCalibration { path }) => assert_eq!(path, "Root.Demo.Gain"),
-            other => panic!("expected MissingCalibration, got {other:?}"),
-        }
-        // Provide it under the Root-stripped name real exports use.
+        // No calibration value: a parameter is a tunable calibration value, so an
+        // unseeded read defaults to its declared-type zero (externally driven),
+        // rather than aborting a no-calibration run. `Gain` is a float parameter.
+        assert_eq!(rhs_value("Gain", &mut h).unwrap(), Value::Float(0.0));
+        // Provide it under the Root-stripped name real exports use; calibration
+        // now wins over the default.
         h.calib.params.insert("Demo.Gain".to_string(), 2.5);
         assert_eq!(rhs_value("Gain", &mut h).unwrap(), Value::Float(2.5));
     }
@@ -1012,6 +1258,18 @@ mod tests {
             rhs_value("1.0 & 2u", &mut h),
             Err(EvalError::TypeError { .. })
         ));
+    }
+
+    #[test]
+    fn bitwise_mixed_signed_unsigned_is_allowed() {
+        let mut h = Harness::new();
+        // Real M1 code masks a signed value with a hex (unsigned) literal, e.g.
+        // `(Status Word >> 8) & 0x01`. Mixed integral operands are allowed; the
+        // result is signed (per numeric_join), the bit pattern is preserved.
+        assert_eq!(rhs_value("13 & 6u", &mut h).unwrap(), Value::Int(4));
+        assert_eq!(rhs_value("6u & 13", &mut h).unwrap(), Value::Int(4));
+        // A shift of a signed value by an unsigned count.
+        assert_eq!(rhs_value("256 >> 4u", &mut h).unwrap(), Value::Int(16));
     }
 
     #[test]
