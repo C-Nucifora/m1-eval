@@ -83,6 +83,35 @@ const = 4.0
     insta::assert_snapshot!("cone_trace", trace.to_json());
 }
 
+/// Whole-project multi-rate run: the scheduler runs the 100 Hz functions every
+/// base tick and the 50 Hz functions every other tick (holding their outputs
+/// between), with each function's stateful operators stepped by its own period.
+/// The trace pins the rate-gating + zero-order-hold + rate-correct-`dt`
+/// behaviour as a snapshot so any scheduling regression shows as a diff.
+#[test]
+fn whole_project_trace_snapshot() {
+    let dir = Path::new(env!("CARGO_MANIFEST_DIR")).join("tests/fixtures/multirate");
+    let engine = Engine::load(&dir.join("Project.m1prj"), None).expect("multirate fixture loads");
+
+    let toml = r#"
+mode = "whole-project"
+duration_s = 0.06
+base_rate_hz = 100.0
+
+[[inputs]]
+channel = "Root.MR.Seed"
+const = 2.0
+
+[[inputs]]
+channel = "Root.MR.Slow Out"
+const = 4.0
+"#;
+    let scenario = Scenario::from_toml_str(toml).expect("scenario parses");
+    let trace = engine.run(&scenario).expect("whole-project run succeeds");
+
+    insta::assert_snapshot!("whole_project_trace", trace.to_json());
+}
+
 /// Coverage report rendering is deterministic too — snapshot the mini fixture.
 #[test]
 fn coverage_render_snapshot() {
