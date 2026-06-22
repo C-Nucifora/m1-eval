@@ -49,8 +49,9 @@ impl Engine {
     }
 
     /// Evaluate a scenario, producing a [`Trace`] of channel/expression values
-    /// over the scenario's tick grid. Dispatches single-function or
-    /// dependency-cone per the scenario's mode. Deterministic.
+    /// over the scenario's tick grid. Dispatches single-function, dependency-cone,
+    /// or the whole-project multi-rate scheduler per the scenario's mode.
+    /// Deterministic.
     pub fn run(&self, scenario: &Scenario) -> Result<Trace, EvalError> {
         run_scenario(&self.loaded, scenario)
     }
@@ -102,6 +103,44 @@ const = 2.5
             .get("Root.Demo.Output")
             .expect("Output column present");
         assert_eq!(out, &vec![Value::Float(50.0); 3]);
+    }
+
+    #[test]
+    fn whole_project_run_through_engine_produces_every_scheduled_channel() {
+        // Task 14: the whole-project multi-rate scheduler is reachable through the
+        // unchanged `Engine::run` dispatch. The multirate fixture's fast (100 Hz)
+        // channels update every tick; the slow (50 Hz) channels run on even ticks
+        // and hold between. We seed `Slow Out` so the cross-rate Fast Writer read
+        // on tick 0 succeeds, and observe `Slow Echo` (read by nothing) for the
+        // pure zero-order-hold.
+        let dir = Path::new(env!("CARGO_MANIFEST_DIR")).join("tests/fixtures/multirate");
+        let engine =
+            Engine::load(&dir.join("Project.m1prj"), None).expect("multirate loads through engine");
+        let toml = r#"
+mode = "whole-project"
+duration_s = 0.04
+base_rate_hz = 100.0
+
+[[inputs]]
+channel = "Root.MR.Seed"
+const = 3.0
+
+[[inputs]]
+channel = "Root.MR.Slow Out"
+const = 6.0
+"#;
+        let scenario = Scenario::from_toml_str(toml).unwrap();
+        let trace = engine.run(&scenario).expect("whole-project engine run succeeds");
+
+        // 0.04 s at 100 Hz = 4 ticks; every scheduled channel has a dense column.
+        assert_eq!(trace.time.len(), 4);
+        let fast = trace.channels.get("Root.MR.Fast Out").expect("Fast Out column");
+        assert_eq!(fast.len(), 4, "fast channel present every tick");
+        // Slow Echo = Seed*2 = 6 on every even tick; held between -> all 6.
+        let echo = trace.channels.get("Root.MR.Slow Echo").expect("Slow Echo column");
+        assert_eq!(echo, &vec![Value::Float(6.0); 4]);
+        // The On-Startup function never runs in whole-project mode.
+        assert!(!trace.channels.contains_key("Root.MR.Started"));
     }
 
     #[test]
