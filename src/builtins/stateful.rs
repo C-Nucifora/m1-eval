@@ -47,11 +47,13 @@ pub fn call(
     site: CallSite,
     ctx: &mut EvalCtx,
 ) -> Result<Option<Value>, EvalError> {
-    let v = match object {
-        "Filter" => filter(method, args, site, ctx)?,
-        _ => return Ok(None),
-    };
-    Ok(v.map(Some).unwrap_or(None))
+    match object {
+        "Filter" => filter(method, args, site, ctx),
+        "Integral" => integral(method, args, site, ctx),
+        "Derivative" => derivative(method, args, site, ctx),
+        "Calculate" => calculate_stateful(method, args, site, ctx),
+        _ => Ok(None),
+    }
 }
 
 /// Evaluate a `Timer` object method (`Start`/`Stop`/`Reset`/`Remaining`).
@@ -161,6 +163,200 @@ fn extremum(
     };
     *slot = OpState::Filter { y };
     Ok(Value::Float(y))
+}
+
+// ---- Integral family --------------------------------------------------------
+//
+// `Integral.Normal(x, min, max, reset, preset)` accumulates the running area
+// under the input by the **trapezoidal rule**: each tick adds the area of the
+// trapezoid between the previous and current samples,
+//
+//     area = (x[n] + x[n-1]) / 2 * dt
+//
+// to a running accumulator, then **clamps** the accumulator into `[min, max]`
+// (anti-windup: the stored state is the clamped value, so the integral cannot
+// run away while saturated). On the first tick there is no previous sample, so
+// the accumulator seeds to `0` (or to the clamped `preset` if `reset` is true)
+// and no area is added. When `reset` is true on any tick the accumulator is
+// reloaded to the clamped `preset` before that tick's output.
+
+/// Dispatch the `Integral.*` family.
+fn integral(
+    method: &str,
+    args: &[Value],
+    site: CallSite,
+    ctx: &mut EvalCtx,
+) -> Result<Option<Value>, EvalError> {
+    match method {
+        "Normal" => integral_normal(args, site, ctx).map(Some),
+        _ => Ok(None),
+    }
+}
+
+/// `Integral.Normal(x, min, max, reset, preset)` — trapezoidal accumulation,
+/// clamped to `[min, max]`, with `reset` reloading the clamped `preset`.
+fn integral_normal(args: &[Value], site: CallSite, ctx: &mut EvalCtx) -> Result<Value, EvalError> {
+    let x = args[0].as_f64()?;
+    let min = args[1].as_f64()?;
+    let max = args[2].as_f64()?;
+    let reset = args[3].as_bool()?;
+    let preset = args[4].as_f64()?;
+    let dt = ctx.dt;
+
+    let slot = ctx.state.entry(site);
+    let prev = match slot {
+        OpState::Integral { acc, prev_x } => Some((*acc, *prev_x)),
+        _ => None,
+    };
+
+    let (acc, prev_x) = match prev {
+        // Reset on any tick: reload the clamped preset; this tick adds no area.
+        _ if reset => (clamp(preset, min, max), x),
+        // First tick: seed to zero (clamped), record the input.
+        None => (clamp(0.0, min, max), x),
+        Some((acc, prev_x)) => {
+            let area = (x + prev_x) * 0.5 * dt;
+            (clamp(acc + area, min, max), x)
+        }
+    };
+    *slot = OpState::Integral { acc, prev_x };
+    Ok(Value::Float(acc))
+}
+
+/// Clamp `v` into `[lo, hi]`. A reversed range (`lo > hi`) collapses to `hi`.
+fn clamp(v: f64, lo: f64, hi: f64) -> f64 {
+    v.max(lo).min(hi)
+}
+
+// ---- Derivative family ------------------------------------------------------
+//
+// `Derivative.Normal(x)` is the backward finite difference `(x[n] - x[n-1]) / dt`
+// (units of input-per-second). The first tick has no previous sample, so it
+// outputs `0` and seeds the previous input.
+//
+// `Derivative.Filtered(x)` passes that raw difference through a first-order
+// smoother to tame the noise amplification differentiation causes. The intrinsic
+// exposes no time constant, so Phase 1 uses a fixed internal constant
+// [`FILTERED_DERIVATIVE_TC`] (documented assumption, to be validated against M1
+// Sim): `d_filt[n] = a0*d_raw[n] + (1-a0)*d_filt[n-1]`, `a0 = dt/(tc+dt)`.
+//
+// `Derivative.Adaptive(x, delta, max_dt)` only recomputes the slope when the
+// input has moved by at least `delta` or `max_dt` seconds have elapsed since the
+// last update — otherwise it holds the previous value. This suppresses the
+// divide-by-tiny-dt noise on near-constant signals. The slope is taken over the
+// actual elapsed interval since the last accepted update.
+
+/// The fixed time constant (seconds) for `Derivative.Filtered`'s internal
+/// smoother. A documented Phase-1 assumption pending M1 Sim validation.
+const FILTERED_DERIVATIVE_TC: f64 = 0.1;
+
+/// Dispatch the `Derivative.*` family.
+fn derivative(
+    method: &str,
+    args: &[Value],
+    site: CallSite,
+    ctx: &mut EvalCtx,
+) -> Result<Option<Value>, EvalError> {
+    match method {
+        "Normal" => derivative_normal(args, site, ctx, false).map(Some),
+        "Filtered" => derivative_normal(args, site, ctx, true).map(Some),
+        "Adaptive" => derivative_adaptive(args, site, ctx).map(Some),
+        _ => Ok(None),
+    }
+}
+
+/// `Derivative.Normal`/`Filtered`(x). `filtered` selects whether the raw backward
+/// difference is passed through the fixed first-order smoother.
+fn derivative_normal(
+    args: &[Value],
+    site: CallSite,
+    ctx: &mut EvalCtx,
+    filtered: bool,
+) -> Result<Value, EvalError> {
+    let x = args[0].as_f64()?;
+    let dt = ctx.dt;
+    let slot = ctx.state.entry(site);
+    let prev = match slot {
+        OpState::Derivative { prev_x, prev_d } => Some((*prev_x, *prev_d)),
+        _ => None,
+    };
+
+    let (d, prev_d_out) = match prev {
+        // First tick: no slope yet.
+        None => (0.0, 0.0),
+        Some((prev_x, prev_d)) => {
+            let raw = if dt > 0.0 { (x - prev_x) / dt } else { 0.0 };
+            if filtered {
+                let a0 = first_order_alpha(FILTERED_DERIVATIVE_TC, dt);
+                let d = a0 * raw + (1.0 - a0) * prev_d;
+                (d, d)
+            } else {
+                (raw, raw)
+            }
+        }
+    };
+    *slot = OpState::Derivative {
+        prev_x: x,
+        prev_d: prev_d_out,
+    };
+    Ok(Value::Float(d))
+}
+
+/// `Derivative.Adaptive(x, delta, max_dt)` — recompute the slope only when the
+/// input has moved by `>= delta` or `max_dt` seconds have elapsed since the last
+/// accepted update; otherwise hold the previous derivative.
+fn derivative_adaptive(args: &[Value], site: CallSite, ctx: &mut EvalCtx) -> Result<Value, EvalError> {
+    let x = args[0].as_f64()?;
+    let delta = args[1].as_f64()?;
+    let max_dt = args[2].as_f64()?;
+    let dt = ctx.dt;
+    let slot = ctx.state.entry(site);
+
+    let prev = match slot {
+        OpState::DerivativeAdaptive {
+            last_x,
+            prev_d,
+            elapsed,
+        } => Some((*last_x, *prev_d, *elapsed)),
+        _ => None,
+    };
+
+    let (d, last_x, elapsed) = match prev {
+        // First tick: seed the reference input, no slope yet.
+        None => (0.0, x, 0.0),
+        Some((last_x, prev_d, elapsed)) => {
+            let elapsed = elapsed + dt;
+            let moved_enough = (x - last_x).abs() >= delta.abs();
+            let timed_out = max_dt > 0.0 && elapsed >= max_dt;
+            if moved_enough || timed_out {
+                // Accept an update: slope over the actual elapsed interval.
+                let d = if elapsed > 0.0 { (x - last_x) / elapsed } else { prev_d };
+                (d, x, 0.0)
+            } else {
+                // Hold the previous derivative; keep accumulating elapsed time.
+                (prev_d, last_x, elapsed)
+            }
+        }
+    };
+    *slot = OpState::DerivativeAdaptive {
+        last_x,
+        prev_d: d,
+        elapsed,
+    };
+    Ok(Value::Float(d))
+}
+
+/// Dispatch the stateful `Calculate.*` methods (`Stable`/`Hysteresis`/`Between`/
+/// `Beyond`). Implemented in Task 18; until then a placeholder returning `None`
+/// so the dispatcher falls through to the pure-`Calculate` submodule (which also
+/// returns `None` for these), ultimately failing loud.
+fn calculate_stateful(
+    _method: &str,
+    _args: &[Value],
+    _site: CallSite,
+    _ctx: &mut EvalCtx,
+) -> Result<Option<Value>, EvalError> {
+    Ok(None)
 }
 
 #[cfg(test)]
@@ -327,5 +523,117 @@ mod tests {
             trace: None,
         };
         assert!(call("NotStateful", "X", &[], site, &mut ctx).unwrap().is_none());
+    }
+
+    // ---- Task 17: Integral.Normal ----
+
+    fn integral(h: &mut Harness, x: f64, min: f64, max: f64, reset: bool, preset: f64) -> f64 {
+        h.tick(
+            "Integral",
+            "Normal",
+            &[
+                Value::Float(x),
+                Value::Float(min),
+                Value::Float(max),
+                Value::Bool(reset),
+                Value::Float(preset),
+            ],
+        )
+        .as_f64()
+        .unwrap()
+    }
+
+    #[test]
+    fn integral_trapezoidal_accumulation() {
+        // dt = 0.1. Inputs 2, 4, 6 with a wide clamp.
+        let mut h = Harness::new(0.1);
+        // Tick 1: seed -> 0 (no area on the first sample).
+        approx(integral(&mut h, 2.0, -100.0, 100.0, false, 0.0), 0.0);
+        // Tick 2: area = (4+2)/2 * 0.1 = 0.3 -> acc 0.3.
+        approx(integral(&mut h, 4.0, -100.0, 100.0, false, 0.0), 0.3);
+        // Tick 3: area = (6+4)/2 * 0.1 = 0.5 -> acc 0.8.
+        approx(integral(&mut h, 6.0, -100.0, 100.0, false, 0.0), 0.8);
+    }
+
+    #[test]
+    fn integral_clamps_to_range() {
+        // dt = 1.0 so areas are large; clamp at 1.0.
+        let mut h = Harness::new(1.0);
+        approx(integral(&mut h, 10.0, 0.0, 1.0, false, 0.0), 0.0); // seed
+        // area = (10+10)/2 * 1 = 10 -> clamps to max 1.0.
+        approx(integral(&mut h, 10.0, 0.0, 1.0, false, 0.0), 1.0);
+        // Stays clamped (anti-windup: stored state is the clamped value).
+        approx(integral(&mut h, 10.0, 0.0, 1.0, false, 0.0), 1.0);
+    }
+
+    #[test]
+    fn integral_reset_reloads_clamped_preset() {
+        let mut h = Harness::new(0.1);
+        integral(&mut h, 2.0, -100.0, 100.0, false, 0.0); // seed
+        integral(&mut h, 4.0, -100.0, 100.0, false, 0.0); // acc 0.3
+        // Reset to preset 5.0 (within range): output becomes 5.0.
+        approx(integral(&mut h, 9.0, -100.0, 100.0, true, 5.0), 5.0);
+        // After reset, prev_x is the current input (9), so next area uses it.
+        // area = (1+9)/2 * 0.1 = 0.5 -> acc 5.5.
+        approx(integral(&mut h, 1.0, -100.0, 100.0, false, 0.0), 5.5);
+    }
+
+    // ---- Task 17: Derivative.* ----
+
+    fn deriv(h: &mut Harness, method: &str, args: &[Value]) -> f64 {
+        h.tick("Derivative", method, args).as_f64().unwrap()
+    }
+
+    #[test]
+    fn derivative_normal_backward_difference() {
+        // dt = 0.1.
+        let mut h = Harness::new(0.1);
+        // First tick: 0 (no slope yet), seeds prev = 1.0.
+        approx(deriv(&mut h, "Normal", &[Value::Float(1.0)]), 0.0);
+        // (3 - 1)/0.1 = 20.
+        approx(deriv(&mut h, "Normal", &[Value::Float(3.0)]), 20.0);
+        // (3 - 3)/0.1 = 0.
+        approx(deriv(&mut h, "Normal", &[Value::Float(3.0)]), 0.0);
+        // (2.5 - 3)/0.1 = -5.
+        approx(deriv(&mut h, "Normal", &[Value::Float(2.5)]), -5.0);
+    }
+
+    #[test]
+    fn derivative_filtered_smooths_the_raw_difference() {
+        // dt = 0.1, fixed tc = 0.1 -> a0 = 0.5 in the internal smoother.
+        let mut h = Harness::new(0.1);
+        // First tick: 0 (seed).
+        approx(deriv(&mut h, "Filtered", &[Value::Float(0.0)]), 0.0);
+        // raw = (1 - 0)/0.1 = 10; d = 0.5*10 + 0.5*0 = 5.0.
+        approx(deriv(&mut h, "Filtered", &[Value::Float(1.0)]), 5.0);
+        // raw = (2 - 1)/0.1 = 10; d = 0.5*10 + 0.5*5 = 7.5.
+        approx(deriv(&mut h, "Filtered", &[Value::Float(2.0)]), 7.5);
+    }
+
+    #[test]
+    fn derivative_adaptive_holds_until_delta_or_timeout() {
+        // dt = 0.1, delta = 1.0, max_dt = 0.5.
+        let mut h = Harness::new(0.1);
+        let args = |x: f64| {
+            [
+                Value::Float(x),
+                Value::Float(1.0),
+                Value::Float(0.5),
+            ]
+        };
+        // First tick: seed at 0.0, output 0.
+        approx(deriv(&mut h, "Adaptive", &args(0.0)), 0.0);
+        // Move +0.3 (< delta 1.0) and elapsed 0.1 (< 0.5): hold previous (0).
+        approx(deriv(&mut h, "Adaptive", &args(0.3)), 0.0);
+        // Move to 1.5 (delta from 0.0 is 1.5 >= 1.0): accept. elapsed = 0.2,
+        // slope = (1.5 - 0.0)/0.2 = 7.5.
+        approx(deriv(&mut h, "Adaptive", &args(1.5)), 7.5);
+        // Now hold near 1.5: small moves under delta accumulate elapsed time.
+        approx(deriv(&mut h, "Adaptive", &args(1.6)), 7.5); // elapsed 0.1, held
+        approx(deriv(&mut h, "Adaptive", &args(1.7)), 7.5); // elapsed 0.2, held
+        approx(deriv(&mut h, "Adaptive", &args(1.8)), 7.5); // elapsed 0.3, held
+        approx(deriv(&mut h, "Adaptive", &args(1.9)), 7.5); // elapsed 0.4, held
+        // elapsed reaches 0.5 (>= max_dt): accept. slope = (2.0 - 1.5)/0.5 = 1.0.
+        approx(deriv(&mut h, "Adaptive", &args(2.0)), 1.0);
     }
 }
