@@ -14,7 +14,7 @@ per-expression value `Trace` that the visualiser overlays on a dependency graph.
 
 ## What it does (Phase 1)
 
-This is **Phase 1** of the engine: the core plus the single-function and
+The **Phase 1** foundation: the core evaluator plus the single-function and
 dependency-cone runners.
 
 - **Expression & statement evaluation** — operators (arithmetic, comparison,
@@ -115,6 +115,14 @@ m1-eval --project Project.m1prj --scenario scenario.toml --target  Root.Engine.P
 # Whole-project multi-rate run: every scheduled function at its own rate.
 m1-eval --project Project.m1prj --scenario scenario.toml --whole-project --out trace.csv
 
+# Counterfactual replay: hold a recorded log as ground truth, override a channel,
+# recompute only its downstream cone, and diff against the log.
+m1-eval --project Project.m1prj --log run.csv \
+        --override "Root.CF.Sensor=5" --out trace.csv --diff diff.csv
+
+# A binary .ld log needs the `ld` feature built in.
+cargo run --features ld -- --project Project.m1prj --log run.ld --out trace.csv
+
 # Static coverage report — what the engine can and cannot evaluate, plus the
 # per-function execution schedule.
 m1-eval --project Project.m1prj --coverage
@@ -124,17 +132,57 @@ m1-eval --project Project.m1prj --coverage
 See [`docs/cli.md`](docs/cli.md) for the full flag list, the scenario file
 format, and the exit-code contract.
 
+## What it adds (Phase 3 — log-driven counterfactual replay)
+
+**Phase 3** is the headline feature. Import a recorded MoTeC run, treat every
+logged channel as **ground truth**, **override** one or more channels (a constant
+or an expression), re-evaluate **only the downstream dependency cone** of each
+override, leave everything else at its logged value, and emit both the new
+`Trace` and a **per-channel `Diff` vs the logged series**.
+
+- **Log import.** A `Log` is a set of per-channel time series plus provenance.
+  Import is `--log <PATH>`: a `.csv` (always available) or a `.ld` binary log
+  (behind the `ld` feature). Each tick samples every logged channel by zero-order
+  hold — the same deterministic rule the rest of the engine uses.
+- **CSV log schema.** A `time`-first table; column headers are M1 channel paths
+  verbatim (spaces allowed); an optional i2-style units row (a non-numeric second
+  row) is captured as provenance, not read as values; data rows are
+  `t_seconds,value,…`. A non-numeric value cell fails loud. (Full schema in
+  [`docs/cli.md`](docs/cli.md).)
+- **Override + downstream cone.** `--override CH=expr` (repeatable) pins a channel
+  to a constant or an expression. Only the channels *downstream* of an override —
+  the forward dependency cone, the mirror of the upstream cone runner — recompute;
+  unrelated channels pass through at their logged value. An override expression
+  may read the channel's **logged** value (`CH=CH*1.05` means "5% above the log").
+- **Diff.** `--diff <PATH>` writes the per-channel logged-vs-counterfactual delta:
+  which channels moved, by how much, and which are unchanged.
+- **Source precedence.** calibration < scenario < **log** < **override**.
+- **The no-op invariant.** A no-op override (or `--log` with no `--override`)
+  reproduces the logged series within tolerance, and the changed-channel set is
+  empty — the load-bearing correctness guarantee of the whole pipeline.
+
+### The `ld` feature (clean-room `.ld` import)
+
+Binary `.ld` import is gated behind the `ld` cargo feature
+(`cargo build --features ld`); without it, an `.ld` log fails loud naming the
+feature, and CSV import always works. The `.ld` reader is **clean-room**: built on
+the MIT [`motec-i2`](https://crates.io/crates/motec-i2) crate (an independent
+reverse-engineering of the `.ld` *file format*) plus public format documentation.
+We parse an independently-documented file format operating on the user's own
+telemetry — we **never reverse-engineer MoTeC software**, never decompile it, and
+**never redistribute MoTeC data**, calibrations, firmware, or sample logs. All
+committed fixtures are synthetic (a hand-written CSV and a tiny `.ld` written by
+`motec-i2` at test time); real `.ld` testing is env-gated (`M1_EVAL_LOG_DIR`) and
+off the default path. Confirm your MoTeC software-licence (EULA) terms before
+distributing the `.ld` reader.
+
 ## Not yet — later phases
 
 `m1-eval` is phased; each phase is independently shippable. Phase 1 (the core +
-single-function / dependency-cone runners) and Phase 2 (the whole-project
-multi-rate scheduler, above) are built. The following are **not** implemented yet:
+single-function / dependency-cone runners), Phase 2 (the whole-project multi-rate
+scheduler), and Phase 3 (log-driven counterfactual replay, above) are built. Still
+to come:
 
-- **Phase 3** — **log-driven counterfactual replay**: import a recorded run
-  (CSV / `.ld`), treat logged channels as ground truth, override one or more
-  channels, re-evaluate only the downstream dependency cone, and diff against the
-  log. This is the headline feature, and it is **not yet** built — `.ld` /
-  CSV log import and counterfactual `--override` remain Phase 3.
 - **Phase 4** — LSP hover-to-evaluate and inline value hints, reusing this
   library.
 
