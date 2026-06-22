@@ -38,3 +38,9 @@ pub mod summary;
 pub use summary::{IoSets, io_sets};
 
 pub mod runner;
+
+pub mod coverage;
+pub use coverage::{CoverageItem, CoverageReport, ItemKind};
+
+pub mod engine;
+pub use engine::Engine;
