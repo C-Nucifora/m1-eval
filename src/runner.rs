@@ -559,6 +559,100 @@ mod tests {
     }
 
     #[test]
+    fn dependency_then_rate_orders_writer_before_reader_within_a_rate() {
+        // Within the 100 Hz group, Fast Writer (writes Fast Shared) must precede
+        // Fast Reader (reads Fast Shared) even though "Root.MR.Fast Reader" sorts
+        // before "Root.MR.Fast Writer" by name. Across rates, the 100 Hz group
+        // runs before the 50 Hz Slow Writer (fastest-first); no cross-rate edge
+        // forces Slow Writer ahead of its 100 Hz reader.
+        let loaded = multirate();
+        let ordered = build_whole_project_schedule(&loaded);
+        let order: Vec<String> = ordered
+            .iter()
+            .map(|r| r.sched.fn_symbol.clone().unwrap())
+            .collect();
+        assert_eq!(
+            order,
+            vec![
+                "Root.MR.Fast Writer".to_string(),
+                "Root.MR.Fast Reader".to_string(),
+                "Root.MR.Slow Writer".to_string(),
+            ],
+            "writer-before-reader within rate, fastest group first: {order:?}"
+        );
+    }
+
+    #[test]
+    fn whole_project_run_computes_every_scheduled_channel() {
+        // End-to-end whole-project run over the multirate fixture. With Seed = 3
+        // (constant input), Slow Writer computes Slow Out = 6. The 100 Hz Fast
+        // Writer reads Slow Out *across rates*: the fast group runs before the
+        // slow writer each tick, so it reads the previous value (stale-tolerant —
+        // no cross-rate edge). We seed Slow Out's steady-state (6) so the very
+        // first tick has a value to read; from then on Slow Writer holds it at 6.
+        // Therefore Fast Shared = 7 and Fast Out = 70 on every tick. Within the
+        // 100 Hz group the order runs Fast Writer before Fast Reader, so Fast Out
+        // sees the freshly-written Fast Shared the same tick. (Per-divisor
+        // rate-gating is P2-B; here every function runs every tick.)
+        let loaded = multirate();
+        let toml = r#"
+mode = "whole-project"
+duration_s = 0.05
+base_rate_hz = 100.0
+
+[[inputs]]
+channel = "Root.MR.Seed"
+const = 3.0
+
+[[inputs]]
+channel = "Root.MR.Slow Out"
+const = 6.0
+"#;
+        let scenario = Scenario::from_toml_str(toml).unwrap();
+        let trace = run(&loaded, &scenario).expect("whole-project run succeeds");
+
+        assert_eq!(trace.time.len(), 5);
+        let slow = trace.channels.get("Root.MR.Slow Out").expect("Slow Out");
+        let shared = trace.channels.get("Root.MR.Fast Shared").expect("Fast Shared");
+        let fast = trace.channels.get("Root.MR.Fast Out").expect("Fast Out");
+        assert!(slow.iter().all(|v| *v == Value::Float(6.0)), "{slow:?}");
+        assert!(shared.iter().all(|v| *v == Value::Float(7.0)), "{shared:?}");
+        assert!(fast.iter().all(|v| *v == Value::Float(70.0)), "{fast:?}");
+
+        // The startup function never runs in whole-project mode, so its channel
+        // is never written by the schedule.
+        assert!(
+            !trace.channels.contains_key("Root.MR.Started"),
+            "startup channel must not be produced"
+        );
+    }
+
+    #[test]
+    fn whole_project_run_is_deterministic() {
+        // Same scenario twice over the multirate fixture must produce identical
+        // traces — the strongest determinism check for the scheduler.
+        let loaded = multirate();
+        let toml = r#"
+mode = "whole-project"
+duration_s = 0.05
+base_rate_hz = 100.0
+
+[[inputs]]
+channel = "Root.MR.Seed"
+const = 3.0
+
+[[inputs]]
+channel = "Root.MR.Slow Out"
+const = 6.0
+"#;
+        let scenario = Scenario::from_toml_str(toml).unwrap();
+        let a = run(&loaded, &scenario).expect("run a");
+        let b = run(&loaded, &scenario).expect("run b");
+        assert_eq!(a.time, b.time);
+        assert_eq!(a.channels, b.channels);
+    }
+
+    #[test]
     fn tick_count_spans_half_open_interval() {
         assert_eq!(tick_count(1.0, 100.0), 100);
         assert_eq!(tick_count(0.5, 100.0), 50);
