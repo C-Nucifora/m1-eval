@@ -273,12 +273,12 @@ fn build_cone<'a>(loaded: &'a Loaded, target: &str) -> Result<Vec<Scheduled<'a>>
             continue;
         };
         for r in &io.reads {
-            if let Some(producer) = writer.get(r) {
-                if producer != &script_name {
-                    // producer must run before script_name.
-                    edges.push((producer.clone(), script_name.clone()));
-                    stack.push(producer.clone());
-                }
+            if let Some(producer) = writer.get(r)
+                && producer != &script_name
+            {
+                // producer must run before script_name.
+                edges.push((producer.clone(), script_name.clone()));
+                stack.push(producer.clone());
             }
         }
     }
