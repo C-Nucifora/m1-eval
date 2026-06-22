@@ -104,6 +104,26 @@ pub fn dispatch(
         "CanComms" | "Serial" | "System" | "Logging" => {
             io_stub::call(object, method, args, ctx)
         }
+        // 4b. `Math` is a *calibration-only* library object (its functions are
+        //     flagged `calibrationOnly` in the intrinsics) and is not, strictly,
+        //     valid in ECU `.m1scr` scripts — yet real EV-M1 control scripts
+        //     reference `Math.atan2`. We route that one function to the same
+        //     `y.atan2(x)` as `Calculate.InverseTan2` (a pragmatic, faithful
+        //     evaluation) and flag it `Stubbed` in coverage so the user sees it is
+        //     a calibration-only object surfaced in an ECU script. Every other
+        //     `Math.*` method is left to fail loud (we do not implement the
+        //     calibration maths library wholesale).
+        "Math" => {
+            validate_arity(object, method, args.len())?;
+            match method {
+                "atan2" => {
+                    let y = args[0].as_f64()?;
+                    let x = args[1].as_f64()?;
+                    Ok(Value::Float(y.atan2(x)))
+                }
+                _ => Err(unsupported(object, method)),
+            }
+        }
         // 5. Not a library object and not a table lookup. It may be a project
         //    object (e.g. a `Timer`) carrying an intrinsic object-method, or
         //    something genuinely unsupported.
@@ -318,6 +338,12 @@ const SUPPORTED_METHODS: &[(&str, &str)] = &[
 /// scenario-fed stubs (flagged externally driven), not faithfully evaluated.
 const STUB_OBJECTS: &[&str] = &["CanComms", "Serial", "System", "Logging"];
 
+/// Individual `(object, method)` pairs handled as documented stubs even though
+/// their object is not a whole stub object. `Math.atan2` is the calibration-only
+/// `Math` object surfaced in an ECU script: it is routed (to `y.atan2(x)`) but
+/// flagged external/stubbed so coverage stays honest about its provenance.
+const STUB_METHODS: &[(&str, &str)] = &[("Math", "atan2")];
+
 /// Classify a builtin `object.method` for the coverage report.
 ///
 /// A `Lookup` method on any object is treated as **supported** here — it is the
@@ -331,7 +357,7 @@ pub fn classify_builtin(object: &str, method: &str) -> BuiltinSupport {
     if SUPPORTED_METHODS.contains(&(object, method)) {
         return BuiltinSupport::Supported;
     }
-    if STUB_OBJECTS.contains(&object) {
+    if STUB_OBJECTS.contains(&object) || STUB_METHODS.contains(&(object, method)) {
         return BuiltinSupport::Stubbed;
     }
     BuiltinSupport::Unsupported
@@ -514,6 +540,51 @@ mod tests {
         let mut h = Harness::new();
         match h.call("NoSuchObject", "Whatever", &[]) {
             Err(EvalError::UnsupportedBuiltin { .. }) => {}
+            other => panic!("expected UnsupportedBuiltin, got {other:?}"),
+        }
+    }
+
+    // ---- Math.atan2 (calibration-only object surfaced in ECU scripts) ----
+
+    #[test]
+    fn math_atan2_routes_to_atan2() {
+        let mut h = Harness::new();
+        // atan2(1, 1) = pi/4. The calibration-only `Math` object is surfaced in
+        // real ECU scripts; we route its `atan2` to the same evaluation as
+        // Calculate.InverseTan2 (and flag it Stubbed for coverage).
+        match h.call("Math", "atan2", &[Value::Float(1.0), Value::Float(1.0)]) {
+            Ok(Value::Float(x)) => assert!((x - std::f64::consts::FRAC_PI_4).abs() < 1e-12),
+            other => panic!("expected Float(pi/4), got {other:?}"),
+        }
+    }
+
+    #[test]
+    fn math_atan2_wrong_arity_is_bad_call() {
+        let mut h = Harness::new();
+        // Math.atan2 takes two arguments (validated against intrinsics).
+        match h.call("Math", "atan2", &[Value::Float(1.0)]) {
+            Err(EvalError::BadCall { .. }) => {}
+            other => panic!("expected BadCall, got {other:?}"),
+        }
+    }
+
+    #[test]
+    fn math_atan2_is_classified_stubbed() {
+        // Coverage flags Math.atan2 as a stub: it is a calibration-only object
+        // surfaced in an ECU script, routed pragmatically but marked external.
+        assert_eq!(classify_builtin("Math", "atan2"), BuiltinSupport::Stubbed);
+    }
+
+    #[test]
+    fn math_unknown_method_is_unsupported() {
+        let mut h = Harness::new();
+        // Only `atan2` is routed from the calibration-only Math object; anything
+        // else fails loud rather than being silently evaluated.
+        match h.call("Math", "Sqrt", &[Value::Float(4.0)]) {
+            Err(EvalError::UnsupportedBuiltin { object, method }) => {
+                assert_eq!(object, "Math");
+                assert_eq!(method, "Sqrt");
+            }
             other => panic!("expected UnsupportedBuiltin, got {other:?}"),
         }
     }
