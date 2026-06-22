@@ -27,3 +27,6 @@ pub mod expr;
 pub use expr::{EvalCtx, eval};
 
 pub mod builtins;
+
+pub mod stmt;
+pub use stmt::{exec, exec_script};

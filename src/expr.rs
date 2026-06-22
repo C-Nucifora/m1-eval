@@ -164,7 +164,7 @@ fn eval_member(node: &Node, ctx: &mut EvalCtx) -> Result<Value, EvalError> {
 /// Flatten a `MemberExpression` to its dotted source path. The `object` may
 /// itself be a member expression (`A.B.C`), so recurse; each segment is taken
 /// verbatim (it may contain spaces). Only `.` joins segments — never whitespace.
-fn flatten_member(node: &Node) -> Result<String, EvalError> {
+pub(crate) fn flatten_member(node: &Node) -> Result<String, EvalError> {
     let object = node
         .child_by_field(Field::Object)
         .ok_or_else(|| member_shape_err(node))?;
@@ -192,7 +192,7 @@ fn member_shape_err(node: &Node) -> EvalError {
 /// `Root.Demo`). `resolve` handles the `In`/`Out`/`Parent`/`Root` anchors itself
 /// but not `This`, so we expand it here before classification. Only `.` splits
 /// segments, never whitespace. Non-`This` paths are returned unchanged.
-fn rewrite_this(path: &str, group: Option<&str>) -> Option<String> {
+pub(crate) fn rewrite_this(path: &str, group: Option<&str>) -> Option<String> {
     let group = group?;
     if path == "This" {
         return Some(group.to_string());
@@ -208,6 +208,17 @@ fn eval_path(path: &str, node: &Node, ctx: &mut EvalCtx) -> Result<Value, EvalEr
     // Expand a `This` anchor to the enclosing group before resolving.
     let rewritten = rewrite_this(path, ctx.group);
     let path = rewritten.as_deref().unwrap_or(path);
+
+    // A bare name (no dotted path) that names a `static local` of the current
+    // function reads its persisted slot. Static locals are not project symbols and
+    // do not live in `env.locals`, so the resolver would otherwise miss them; this
+    // check comes first so a stateful accumulator reads back the value it holds.
+    if let Some(fn_symbol) = ctx.fn_symbol
+        && !path.contains('.')
+        && let Some(v) = ctx.env.get_static(fn_symbol, path)
+    {
+        return Ok(v.clone());
+    }
 
     let target = classify(path, ctx.group, ctx.fn_symbol, ctx.project, &ctx.env.locals);
     match target {
@@ -352,21 +363,36 @@ fn eval_binary(node: &Node, ctx: &mut EvalCtx) -> Result<Value, EvalError> {
     let l = eval(&left, ctx)?;
     let r = eval(&right, ctx)?;
 
-    match kind {
-        // Arithmetic.
+    // The remaining operators (arithmetic, comparison, equality, bitwise/shift)
+    // operate on the two evaluated values; share that core with the compound
+    // assignment operators. An unhandled token reports its byte offset.
+    apply_binary_values(kind, &l, &r).map_err(|e| match e {
+        EvalError::UnsupportedConstruct { kind, .. } => EvalError::UnsupportedConstruct {
+            kind,
+            at: op.byte_range().start,
+        },
+        other => other,
+    })
+}
+
+/// Apply a binary operator to two already-evaluated values, reusing the same
+/// arithmetic/comparison/equality/bitwise semantics as the expression evaluator.
+/// This is the shared core behind the binary-expression branch and the compound
+/// assignment operators (`+=`, `&=`, …). Logical/short-circuit operators are
+/// intentionally excluded — they are handled in [`eval_binary`] before both
+/// operands are evaluated, and compound assignment never targets them.
+pub(crate) fn apply_binary_values(op: Kind, l: &Value, r: &Value) -> Result<Value, EvalError> {
+    match op {
         Kind::Plus | Kind::Minus | Kind::Star | Kind::Slash | Kind::Percent => {
-            arithmetic(kind, &l, &r)
+            arithmetic(op, l, r)
         }
-        // Ordered comparisons.
-        Kind::Lt | Kind::Gt | Kind::LtEq | Kind::GtEq => compare(kind, &l, &r),
-        // Equality (`eq`/`==` and `neq`/`!=`), including enum equality by member.
-        Kind::Eq | Kind::EqEq => Ok(Value::Bool(values_equal(&l, &r)?)),
-        Kind::Neq | Kind::BangEq => Ok(Value::Bool(!values_equal(&l, &r)?)),
-        // Bitwise / shift (integral only).
-        Kind::Amp | Kind::Pipe | Kind::Caret | Kind::LtLt | Kind::GtGt => bitwise(kind, &l, &r),
+        Kind::Lt | Kind::Gt | Kind::LtEq | Kind::GtEq => compare(op, l, r),
+        Kind::Eq | Kind::EqEq => Ok(Value::Bool(values_equal(l, r)?)),
+        Kind::Neq | Kind::BangEq => Ok(Value::Bool(!values_equal(l, r)?)),
+        Kind::Amp | Kind::Pipe | Kind::Caret | Kind::LtLt | Kind::GtGt => bitwise(op, l, r),
         other => Err(EvalError::UnsupportedConstruct {
             kind: format!("binary operator {other:?}"),
-            at: op.byte_range().start,
+            at: 0,
         }),
     }
 }
