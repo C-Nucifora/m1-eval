@@ -168,57 +168,12 @@ impl Scenario {
     /// (a non-monotonic log is the caller's problem and would be surfaced by the
     /// sampler holding the last in-order keyframe).
     pub fn load_csv(&mut self, csv: &str) -> Result<(), EvalError> {
-        let mut lines = csv.lines();
-        let header = lines.next().ok_or_else(|| EvalError::UnsupportedConstruct {
-            kind: "empty CSV: no header row".to_string(),
-            at: 0,
-        })?;
-        let cols: Vec<String> = split_csv_row(header);
-        if cols.is_empty() || !cols[0].eq_ignore_ascii_case("time") {
-            return Err(EvalError::UnsupportedConstruct {
-                kind: "CSV first column must be `time`".to_string(),
-                at: 0,
-            });
-        }
-        // One accumulator per non-time column.
-        let mut series: Vec<(String, Vec<(f64, Value)>)> =
-            cols[1..].iter().map(|c| (c.clone(), Vec::new())).collect();
-
-        for (row_idx, line) in lines.enumerate() {
-            if line.trim().is_empty() {
-                continue;
-            }
-            let cells = split_csv_row(line);
-            let t = cells
-                .first()
-                .and_then(|c| c.trim().parse::<f64>().ok())
-                .ok_or_else(|| EvalError::UnsupportedConstruct {
-                    kind: format!("CSV row {} has a non-numeric time", row_idx + 2),
-                    at: 0,
-                })?;
-            for (i, acc) in series.iter_mut().enumerate() {
-                let Some(cell) = cells.get(i + 1) else {
-                    continue;
-                };
-                let trimmed = cell.trim();
-                if trimmed.is_empty() {
-                    continue;
-                }
-                let v = trimmed
-                    .parse::<f64>()
-                    .map(Value::Float)
-                    .map_err(|_| EvalError::TypeError {
-                        detail: format!(
-                            "CSV row {} column {:?} value {trimmed:?} is not numeric",
-                            row_idx + 2,
-                            acc.0
-                        ),
-                    })?;
-                acc.1.push((t, v));
-            }
-        }
-
-        for (channel, points) in series {
+        // `load_csv` predates the i2 units row, so it does not detect one: a
+        // non-numeric first cell remains a hard error here (its long-standing
+        // behaviour). The shared parser carries the optional units-row handling
+        // for [`crate::log::Log::from_csv`].
+        let parsed = parse_time_series_csv(csv, false)?;
+        for (channel, points) in parsed.columns {
             if points.is_empty() {
                 continue;
             }
@@ -236,9 +191,114 @@ impl Scenario {
     }
 }
 
-/// Split a CSV row into trimmed, unquoted fields. Handles the minimal RFC-4180
-/// quoting the trace writer emits (double-quoted fields with `""` escapes).
-fn split_csv_row(line: &str) -> Vec<String> {
+/// One parsed `time`-first CSV: the per-channel keyframes plus an optional
+/// captured units row. Shared by [`Scenario::load_csv`] and
+/// [`crate::log::Log::from_csv`] so there is a single CSV parser, not two.
+pub(crate) struct ParsedTimeSeriesCsv {
+    /// One `(channel name, ascending (t, value) keyframes)` per non-time column,
+    /// in header order. Channels with no non-empty cell carry an empty `Vec`.
+    pub columns: Vec<(String, Vec<(f64, Value)>)>,
+    /// If `detect_units` was set and the first data row's first cell was
+    /// non-numeric, the units row mapped `channel name -> unit string` (empty
+    /// units cells are skipped). Otherwise empty.
+    pub units: std::collections::BTreeMap<String, String>,
+}
+
+/// Parse a `time`-first CSV into per-channel `(t, value)` keyframes.
+///
+/// The first column header must be `time` (case-insensitive); every other column
+/// header is a channel name (verbatim, spaces allowed). Each data row is
+/// `t_seconds, value, value, …`: `t` parses to `f64`, numeric cells to
+/// [`Value::Float`], empty cells add no keyframe (zero-order hold keeps the prior
+/// value), and a non-numeric value cell fails loud as an [`EvalError::TypeError`].
+///
+/// When `detect_units` is set, a *first data row whose first cell is non-numeric*
+/// is treated as an i2-style units row (e.g. `s,rpm,km/h`): its cells are diverted
+/// into `units` and it contributes no keyframe. With `detect_units` clear, a
+/// non-numeric first cell is the long-standing "non-numeric time" hard error.
+pub(crate) fn parse_time_series_csv(
+    csv: &str,
+    detect_units: bool,
+) -> Result<ParsedTimeSeriesCsv, EvalError> {
+    let mut lines = csv.lines();
+    let header = lines.next().ok_or_else(|| EvalError::UnsupportedConstruct {
+        kind: "empty CSV: no header row".to_string(),
+        at: 0,
+    })?;
+    let cols: Vec<String> = split_csv_row(header);
+    if cols.is_empty() || !cols[0].eq_ignore_ascii_case("time") {
+        return Err(EvalError::UnsupportedConstruct {
+            kind: "CSV first column must be `time`".to_string(),
+            at: 0,
+        });
+    }
+    // One accumulator per non-time column, in header order.
+    let mut columns: Vec<(String, Vec<(f64, Value)>)> =
+        cols[1..].iter().map(|c| (c.clone(), Vec::new())).collect();
+    let mut units: std::collections::BTreeMap<String, String> = std::collections::BTreeMap::new();
+    let mut seen_data_row = false;
+
+    for (row_idx, line) in lines.enumerate() {
+        if line.trim().is_empty() {
+            continue;
+        }
+        let cells = split_csv_row(line);
+        let first = cells.first().map(|c| c.trim()).unwrap_or("");
+
+        // The optional units row is only ever the *first* non-empty data line and
+        // only when its first cell is non-numeric. After that, a non-numeric first
+        // cell is a hard "non-numeric time" error.
+        let first_is_numeric = first.parse::<f64>().is_ok();
+        if detect_units && !seen_data_row && !first_is_numeric {
+            for (i, (channel, _)) in columns.iter().enumerate() {
+                let Some(cell) = cells.get(i + 1) else {
+                    continue;
+                };
+                let unit = cell.trim();
+                if !unit.is_empty() {
+                    units.insert(channel.clone(), unit.to_string());
+                }
+            }
+            seen_data_row = true;
+            continue;
+        }
+        seen_data_row = true;
+
+        let t = first
+            .parse::<f64>()
+            .map_err(|_| EvalError::UnsupportedConstruct {
+                kind: format!("CSV row {} has a non-numeric time", row_idx + 2),
+                at: 0,
+            })?;
+        for (i, acc) in columns.iter_mut().enumerate() {
+            let Some(cell) = cells.get(i + 1) else {
+                continue;
+            };
+            let trimmed = cell.trim();
+            if trimmed.is_empty() {
+                continue;
+            }
+            let v = trimmed
+                .parse::<f64>()
+                .map(Value::Float)
+                .map_err(|_| EvalError::TypeError {
+                    detail: format!(
+                        "CSV row {} column {:?} value {trimmed:?} is not numeric",
+                        row_idx + 2,
+                        acc.0
+                    ),
+                })?;
+            acc.1.push((t, v));
+        }
+    }
+
+    Ok(ParsedTimeSeriesCsv { columns, units })
+}
+
+/// Split a CSV row into unquoted fields. Handles the minimal RFC-4180 quoting
+/// the trace writer emits (double-quoted fields with `""` escapes). Shared with
+/// [`crate::log`] so both CSV readers use one tokenizer.
+pub(crate) fn split_csv_row(line: &str) -> Vec<String> {
     let mut out = Vec::new();
     let mut field = String::new();
     let mut chars = line.chars().peekable();
