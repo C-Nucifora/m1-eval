@@ -337,6 +337,18 @@ fn tick_loop(
     let mut state = StateStore::new();
     let mut trace = Trace::new();
 
+    // In **whole-project** mode there is no scenario driving the sensor/CAN inputs
+    // and no calibration seeding the tunables, so an unseeded *channel* read falls
+    // back to its type-correct startup default (flagged externally driven) rather
+    // than aborting the run — the channel-side analogue of the Tier-3 IO stubs.
+    // This covers every unseeded read uniformly: a hardware sensor channel, a CAN
+    // signal, a table-output `.Value` the auto-`Lookup` would compute, and a state
+    // channel read before its writer's first run. It propagates to inline
+    // user-function callees (they share this env). In `function`/`cone` mode the
+    // flag stays `false`, so a read of an unprovided input still fails loud — the
+    // scenario must drive every channel a single function reads.
+    env.default_unseeded_channels = matches!(scenario.mode, RunMode::WholeProject);
+
     // The union of every channel the schedule writes, computed once: on a tick a
     // function holds (does not run), we repeat its last value from `env` for these
     // channels so the trace stays a dense grid (zero-order hold).
@@ -392,8 +404,14 @@ fn tick_loop(
         // 4. Record any channel a scheduled function *holds* this tick (it did not
         //    run, so the executor wrote nothing) by repeating its current env
         //    value, plus the seeded inputs/overrides. This keeps every column
-        //    aligned to the time axis with the zero-order-hold value.
+        //    aligned to the time axis with the zero-order-hold value. Two passes:
+        //    the static scheduled-write set, then every channel that already has a
+        //    trace column — the latter catches channels written only by *inline*
+        //    user-function callees (e.g. a `Service Bits.Update` push, whose backing
+        //    function carries no schedule rate), which are not in the static set but
+        //    must still hold dense once they have appeared.
         hold_unwritten_channels(&scheduled_writes, &env, &mut trace);
+        hold_trace_channels(&env, &mut trace);
         for (path, series) in inputs.iter().chain(overrides.iter()) {
             // Only record if the executor did not already record this channel this
             // tick (assignment targets are recorded by the statement executor).
@@ -454,6 +472,29 @@ fn hold_unwritten_channels(writes: &BTreeSet<String>, env: &Env, trace: &mut Tra
         }
         if let Some(v) = env.get(path).cloned() {
             trace.record_channel(path.clone(), v);
+        }
+    }
+}
+
+/// Zero-order-hold every channel that already has a trace column but was not
+/// updated this tick, repeating its current `env` value. Unlike
+/// [`hold_unwritten_channels`] (the static scheduled-write set), this holds
+/// channels written only by *inline* user-function callees — whose backing
+/// functions carry no schedule rate, so they are not in the static set — once they
+/// have first appeared, keeping every column dense over the tick grid.
+fn hold_trace_channels(env: &Env, trace: &mut Trace) {
+    let len = trace.time.len();
+    // Collect the lagging channels first to avoid borrowing `trace.channels` while
+    // recording into it.
+    let lagging: Vec<String> = trace
+        .channels
+        .iter()
+        .filter(|(_, col)| col.len() < len)
+        .map(|(path, _)| path.clone())
+        .collect();
+    for path in lagging {
+        if let Some(v) = env.get(&path).cloned() {
+            trace.record_channel(path, v);
         }
     }
 }
