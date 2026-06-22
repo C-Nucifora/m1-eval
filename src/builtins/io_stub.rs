@@ -63,6 +63,93 @@ fn mark_external(ctx: &mut EvalCtx, key: &str) {
     }
 }
 
+/// Evaluate one project-object IO call `<object>.<method>(...)`.
+///
+/// These are the project-object analogue of the Tier-3 library stubs above: a
+/// DBC CAN message/signal object (`Balls3EV25.DashVals.Tx/TxOpen/SetBit/…`,
+/// `IZZE DBC.*.GetScaled/Receive`), a `GroupCompound` CAN service-bits push
+/// (`Service Bits.Update`), a package `Output.SetState`, or a buzzer's `.Buzze`.
+/// None of these can be truly evaluated offline — they read from / write to a
+/// CAN bus or an output pin we are not driving — so each resolves, like the
+/// library stubs, in three steps:
+///
+/// 1. **Scenario override.** A value seeded under `"<object>.<method>"` (e.g. a
+///    log replay driving a `GetScaled`/`Receive`) wins.
+/// 2. **Documented stub.** A reader has a determinate offline default
+///    (`Receive` → `false`, no message arrived; `GetScaled` → `0.0`;
+///    `GetUnsignedInteger` → `0`; `TxOpen` → an opaque handle `0`); a void writer
+///    (`Tx`/`TxInitialise`/`Init`/`SetBit`/`SetUnsignedInteger`/`Update`/
+///    `SetState`/`Buzze`) returns the unit value (a no-op offline). The stub `0`
+///    for reads is deliberate (not fail-loud) so a whole-project run does not
+///    abort on every CAN read.
+/// 3. **Fail loud.** Any other method on the object has no determinate offline
+///    value → [`EvalError::UnsupportedBuiltin`]. We never invent a bus value.
+///
+/// Every produced value flags `"<object>.<method>"` externally driven in the
+/// trace, so a consumer knows the column is simulated input, not evaluated
+/// output. Routing is keyed by the *method* name — the object varies per project
+/// (`DashVals`, `Service Bits`, `Fan Output`) but the method fixes the offline
+/// semantics.
+pub fn project_object_call(
+    object: &str,
+    method: &str,
+    _args: &[Value],
+    ctx: &mut EvalCtx,
+) -> Result<Value, EvalError> {
+    let key = format!("{object}.{method}");
+
+    // 1. Scenario override wins (e.g. a log replay driving a CAN read).
+    if let Some(v) = ctx.env.io_override(&key).cloned() {
+        mark_external(ctx, &key);
+        return Ok(v);
+    }
+
+    // 2. Documented offline stub, keyed by the method name.
+    let v = match method {
+        // A CAN message `.TxOpen()` returns an opaque transmit handle; offline it
+        // is the determinate zero handle.
+        "TxOpen" => Value::Uint(0),
+        // A CAN signal `.Receive()` is false offline — no frame has arrived.
+        "Receive" => Value::Bool(false),
+        // A scaled CAN signal read has no offline value; the documented stub is 0.
+        "GetScaled" => Value::Float(0.0),
+        // A raw unsigned CAN signal read stubs to 0.
+        "GetUnsignedInteger" => Value::Uint(0),
+        // Void writers: a CAN transmit / bit set / service-bits push / output set
+        // / buzzer actuation is a no-op offline. Return the unit value so an
+        // expression statement evaluating the call succeeds.
+        "Tx" | "TxInitialise" | "Init" | "SetBit" | "SetUnsignedInteger" | "Update"
+        | "SetState" | "Buzze" => Value::Bool(true),
+        // Any other method on the object has no determinate offline value.
+        _ => {
+            return Err(EvalError::UnsupportedBuiltin {
+                object: object.to_string(),
+                method: method.to_string(),
+            });
+        }
+    };
+    mark_external(ctx, &key);
+    Ok(v)
+}
+
+/// The project-object IO methods handled as documented offline stubs (flagged
+/// externally driven). The single source of truth the coverage classifier
+/// consults so it agrees with [`project_object_call`].
+pub const PROJECT_OBJECT_STUB_METHODS: &[&str] = &[
+    "Tx",
+    "TxOpen",
+    "TxInitialise",
+    "Init",
+    "SetBit",
+    "SetUnsignedInteger",
+    "GetScaled",
+    "GetUnsignedInteger",
+    "Receive",
+    "Update",
+    "SetState",
+    "Buzze",
+];
+
 /// The documented offline value for a Tier-3 call, or `Ok(None)` when there is no
 /// determinate stub (so the caller fails loud). Each stub is a paraphrased,
 /// defensible offline interpretation — not a guessed sensor reading.

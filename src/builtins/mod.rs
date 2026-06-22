@@ -158,6 +158,29 @@ fn dispatch_object_method(
         return Ok(v);
     }
 
+    // Channel `.Set(value)` — the imperative setter. When the object resolves to a
+    // `Channel`/`Parameter` symbol, this is a *write* of that channel (exactly
+    // what `m1-typecheck` `schedule.rs` and `summary::io_sets` treat `Chan.Set*`
+    // as), not a fail-loud unknown method. Falls through to IO/Timer routing when
+    // the object is not a channel.
+    if method == "Set"
+        && let Some(v) = try_channel_set(object, args, ctx)?
+    {
+        return Ok(v);
+    }
+
+    // Project-object IO (DBC CAN messages/signals, a `Service Bits` GroupCompound
+    // push, a package `Output.SetState`, a buzzer's `.Buzze`). These are the
+    // project-object analogue of the Tier-3 library stubs: externally driven,
+    // never truly evaluated offline. Route an object that classifies to a
+    // package/group/reference symbol — or an unresolved DBC object (no `.m1dbc`
+    // loaded) — through the IO stub, *before* the Timer fallback so a real Timer
+    // (which resolves to its own object) is never swallowed by a stub method that
+    // a Timer does not carry.
+    if is_io_stub_object(object, ctx) && is_project_object_io_method(method) {
+        return io_stub::project_object_call(object, method, args, ctx);
+    }
+
     // The Timer object methods (Start/Stop/Reset/Remaining) are stateful and must
     // share one countdown across all of an object's method calls — so key the
     // state by the object *path*, not the individual call site. A canonical path
@@ -168,6 +191,87 @@ fn dispatch_object_method(
         return Ok(v);
     }
     Err(unsupported(object, method))
+}
+
+/// Attempt a channel `.Set(value)` imperative setter. Returns `Ok(Some(unit))`
+/// when `object` resolves to a `Channel`/`Parameter` symbol — writing the single
+/// evaluated argument to its canonical path and recording the write to the trace
+/// — and `Ok(None)` when `object` is not a channel (so dispatch falls through to
+/// IO/Timer routing). A wrong argument count is a fail-loud [`EvalError::BadCall`]
+/// (the setter takes exactly one value).
+fn try_channel_set(
+    object: &str,
+    args: &[Value],
+    ctx: &mut EvalCtx,
+) -> Result<Option<Value>, EvalError> {
+    // Only a project channel/parameter has an imperative `.Set`.
+    let Target::Symbol(canon) = classify(object, ctx.group, ctx.fn_symbol, ctx.project, &ctx.env.locals)
+    else {
+        return Ok(None);
+    };
+    let is_writable = ctx
+        .project
+        .symbols()
+        .get(&canon)
+        .map(|s| matches!(s.kind, SymbolKind::Channel | SymbolKind::Parameter))
+        .unwrap_or(false);
+    if !is_writable {
+        return Ok(None);
+    }
+
+    // The setter takes exactly one value — fail loud on any other arity rather
+    // than guessing which argument to write.
+    if args.len() != 1 {
+        return Err(EvalError::BadCall {
+            detail: format!(
+                "{object}.Set expects 1 argument, got {}",
+                args.len()
+            ),
+        });
+    }
+    let value = args[0].clone();
+    ctx.env.set(canon.clone(), value.clone());
+    if let Some(trace) = ctx.trace.as_deref_mut() {
+        trace.record_channel(canon, value.clone());
+    }
+    // The setter is a statement-level write; reuse the unit value the IO void
+    // writers return so an expression-statement call succeeds.
+    Ok(Some(Value::Bool(true)))
+}
+
+/// Whether `method` is a project-object IO stub method (a CAN Tx/Get/Receive, a
+/// GroupCompound `.Update`, an `Output.SetState`, a buzzer `.Buzze`).
+fn is_project_object_io_method(method: &str) -> bool {
+    io_stub::PROJECT_OBJECT_STUB_METHODS.contains(&method)
+}
+
+/// Whether `object` is a project object whose IO methods are externally-driven
+/// stubs: it classifies to a package/group/reference symbol (`Object`/`Group`/
+/// `Reference`/`Other`) — or it does not resolve at all, which is how a DBC CAN
+/// object appears when no `.m1dbc` is loaded. A library object, a channel, a
+/// table, or a function is *not* an IO-stub object (each has its own route).
+fn is_io_stub_object(object: &str, ctx: &EvalCtx) -> bool {
+    match classify(object, ctx.group, ctx.fn_symbol, ctx.project, &ctx.env.locals) {
+        Target::Symbol(canon) => ctx
+            .project
+            .symbols()
+            .get(&canon)
+            .map(|s| {
+                matches!(
+                    s.kind,
+                    SymbolKind::Object
+                        | SymbolKind::Group
+                        | SymbolKind::Reference
+                        | SymbolKind::Other
+                )
+            })
+            .unwrap_or(false),
+        // An unresolved object spelling is the DBC case (the CAN message/signal is
+        // sourced from a `.m1dbc` we did not load). A builtin/library object or a
+        // resolved local is handled elsewhere and is never an IO-stub object.
+        Target::Unresolved => true,
+        Target::Local(_) | Target::Builtin { .. } => false,
+    }
 }
 
 /// The state key for a Timer object: a [`CallSite`] whose script slot is the
@@ -362,8 +466,11 @@ const SUPPORTED_METHODS: &[(&str, &str)] = &[
 ///   evaluated by `stateful::timer` at runtime. They were already evaluated but
 ///   the coverage report formerly flagged them unsupported; listing them here
 ///   reconciles coverage with what `dispatch_object_method` actually does.
+/// - `Set` is the imperative channel setter (P15-C): resolved at runtime to a
+///   channel write. Like `AsInteger`, coverage classifies on the method alone and
+///   the runtime fails loud if the object is not a channel.
 const SUPPORTED_OBJECT_METHODS: &[&str] =
-    &["AsInteger", "Start", "Stop", "Reset", "Remaining"];
+    &["AsInteger", "Set", "Start", "Stop", "Reset", "Remaining"];
 
 /// The Tier-3 IO library objects: their methods are handled as documented/
 /// scenario-fed stubs (flagged externally driven), not faithfully evaluated.
@@ -394,6 +501,13 @@ pub fn classify_builtin(object: &str, method: &str) -> BuiltinSupport {
     }
     if SUPPORTED_METHODS.contains(&(object, method)) {
         return BuiltinSupport::Supported;
+    }
+    // Project-object IO methods (DBC CAN Tx/Get/Receive, GroupCompound `.Update`,
+    // `Output.SetState`, a buzzer `.Buzze`) are externally-driven documented stubs.
+    // Classified on the method name alone — the object varies per project, but the
+    // method fixes the offline route (matching `dispatch_object_method`).
+    if io_stub::PROJECT_OBJECT_STUB_METHODS.contains(&method) {
+        return BuiltinSupport::Stubbed;
     }
     if STUB_OBJECTS.contains(&object) || STUB_METHODS.contains(&(object, method)) {
         return BuiltinSupport::Stubbed;
@@ -804,6 +918,257 @@ mod tests {
                 classify_builtin("Startup Delay", method),
                 BuiltinSupport::Supported,
                 "Timer.{method} should be supported"
+            );
+        }
+    }
+
+    // ---- project-object method routing (P15-C, Tasks 6-7) ----
+
+    /// A harness over the enums fixture that *owns a trace*, so `.Set` channel
+    /// writes and externally-driven IO stubs can assert on the recorded columns.
+    /// The fixture carries a plain `Precharge State` channel, a `Service Bits`
+    /// value-compound, a `DashVals` CAN message (+ `Aux Switch` signal), and a
+    /// `Fan Output` package object — the project-object analogues of the EV-M1
+    /// constructs Task 6/7 route.
+    struct ProjectObjHarness {
+        project: Project,
+        calib: Calibration,
+        env: Env,
+        state: StateStore,
+        trace: crate::trace::Trace,
+    }
+
+    impl ProjectObjHarness {
+        fn new() -> ProjectObjHarness {
+            let dir = Path::new(env!("CARGO_MANIFEST_DIR")).join("tests/fixtures/enums");
+            let loaded = crate::loader::load(&dir.join("Project.m1prj"), None)
+                .expect("enums fixture loads");
+            ProjectObjHarness {
+                project: loaded.project,
+                calib: Calibration::default(),
+                env: Env::new(),
+                state: StateStore::new(),
+                trace: crate::trace::Trace::new(),
+            }
+        }
+
+        fn call(&mut self, object: &str, method: &str, args: &[Value]) -> Result<Value, EvalError> {
+            let site = CallSite::new("Demo.Update.m1scr", 0);
+            let mut ctx = EvalCtx {
+                project: &self.project,
+                calib: &self.calib,
+                env: &mut self.env,
+                state: &mut self.state,
+                group: Some("Root.Demo"),
+                fn_symbol: Some("Root.Demo.Update"),
+                script_name: "Demo.Update.m1scr",
+                dt: 0.01,
+                trace: Some(&mut self.trace),
+            };
+            dispatch(object, method, args, site, &mut ctx)
+        }
+    }
+
+    // ---- Task 6: Channel .Set(value) imperative setter ----
+
+    #[test]
+    fn channel_set_writes_the_channel_and_records_it() {
+        let mut h = ProjectObjHarness::new();
+        // `Precharge State.Set(1)` writes the channel under its canonical path and
+        // records the write to the trace, returning the unit value.
+        let result = h
+            .call("Precharge State", "Set", &[Value::Int(1)])
+            .expect("Channel.Set succeeds");
+        assert_eq!(result, Value::Bool(true), "Set returns the unit value");
+        // The canonical path now holds the written value.
+        assert_eq!(
+            h.env.get("Root.Demo.Precharge State"),
+            Some(&Value::Int(1))
+        );
+        // And the write was recorded to the trace.
+        assert_eq!(
+            h.trace.channels.get("Root.Demo.Precharge State"),
+            Some(&vec![Value::Int(1)])
+        );
+    }
+
+    #[test]
+    fn channel_set_via_absolute_path_writes_the_channel() {
+        let mut h = ProjectObjHarness::new();
+        h.call("Root.Demo.Precharge State", "Set", &[Value::Float(3.5)])
+            .expect("Channel.Set on absolute path succeeds");
+        assert_eq!(
+            h.env.get("Root.Demo.Precharge State"),
+            Some(&Value::Float(3.5))
+        );
+    }
+
+    #[test]
+    fn channel_set_wrong_arity_is_bad_call() {
+        let mut h = ProjectObjHarness::new();
+        // `.Set` is a single-argument setter; zero or many args is a BadCall.
+        match h.call("Precharge State", "Set", &[]) {
+            Err(EvalError::BadCall { .. }) => {}
+            other => panic!("expected BadCall on zero-arg Set, got {other:?}"),
+        }
+        match h.call(
+            "Precharge State",
+            "Set",
+            &[Value::Int(1), Value::Int(2)],
+        ) {
+            Err(EvalError::BadCall { .. }) => {}
+            other => panic!("expected BadCall on two-arg Set, got {other:?}"),
+        }
+    }
+
+    #[test]
+    fn set_is_classified_supported() {
+        // Coverage reports `.Set` supported on any object (resolved at runtime to a
+        // channel write; the runtime fails loud if the object is not a channel).
+        assert_eq!(
+            classify_builtin("Precharge State", "Set"),
+            BuiltinSupport::Supported
+        );
+    }
+
+    // ---- Task 7: project-object IO stubs ----
+
+    #[test]
+    fn dbc_message_tx_open_returns_opaque_handle_and_is_external() {
+        let mut h = ProjectObjHarness::new();
+        // A CAN message object's `.TxOpen()` cannot be evaluated offline; it
+        // returns a documented opaque handle and is flagged externally driven.
+        assert_eq!(
+            h.call("DashVals", "TxOpen", &[]).unwrap(),
+            Value::Uint(0)
+        );
+        assert!(h.trace.is_external("DashVals.TxOpen"));
+    }
+
+    #[test]
+    fn dbc_void_writers_return_unit_value() {
+        let mut h = ProjectObjHarness::new();
+        // The void CAN writers all return the unit value (a no-op offline).
+        for method in [
+            "Tx",
+            "TxInitialise",
+            "Init",
+            "SetBit",
+            "SetUnsignedInteger",
+        ] {
+            assert_eq!(
+                h.call("DashVals", method, &[]).unwrap(),
+                Value::Bool(true),
+                "{method} should return the unit value"
+            );
+        }
+    }
+
+    #[test]
+    fn dbc_signal_receive_is_false_offline() {
+        let mut h = ProjectObjHarness::new();
+        // No CAN message arrives offline, so `.Receive()` is false.
+        assert_eq!(
+            h.call("DashVals.Aux Switch", "Receive", &[]).unwrap(),
+            Value::Bool(false)
+        );
+        assert!(h.trace.is_external("DashVals.Aux Switch.Receive"));
+    }
+
+    #[test]
+    fn dbc_signal_get_scaled_is_zero_offline() {
+        let mut h = ProjectObjHarness::new();
+        // A CAN signal read has no offline value; the documented stub is 0.0 so a
+        // whole-project run does not abort on every CAN read.
+        assert_eq!(
+            h.call("DashVals.Aux Switch", "GetScaled", &[]).unwrap(),
+            Value::Float(0.0)
+        );
+        assert!(h.trace.is_external("DashVals.Aux Switch.GetScaled"));
+    }
+
+    #[test]
+    fn io_stub_scenario_override_wins() {
+        let mut h = ProjectObjHarness::new();
+        // A scenario can externally drive a CAN read (e.g. from a log replay).
+        h.env
+            .set_io_override("DashVals.Aux Switch.GetScaled", Value::Float(42.0));
+        assert_eq!(
+            h.call("DashVals.Aux Switch", "GetScaled", &[]).unwrap(),
+            Value::Float(42.0)
+        );
+        assert!(h.trace.is_external("DashVals.Aux Switch.GetScaled"));
+    }
+
+    #[test]
+    fn group_compound_update_is_a_void_stub() {
+        let mut h = ProjectObjHarness::new();
+        // `Service Bits.Update()` (a GroupCompound CAN service-bits push) is an
+        // externally-driven void writer.
+        assert_eq!(
+            h.call("Service Bits", "Update", &[]).unwrap(),
+            Value::Bool(true)
+        );
+        assert!(h.trace.is_external("Service Bits.Update"));
+    }
+
+    #[test]
+    fn output_set_state_is_a_void_stub() {
+        let mut h = ProjectObjHarness::new();
+        // `Fan Output.SetState(...)` (a package Output object) is a void writer.
+        assert_eq!(
+            h.call("Fan Output", "SetState", &[Value::Bool(true)]).unwrap(),
+            Value::Bool(true)
+        );
+        assert!(h.trace.is_external("Fan Output.SetState"));
+    }
+
+    #[test]
+    fn buzzer_buzze_is_a_void_stub() {
+        let mut h = ProjectObjHarness::new();
+        // The buzzer's `.Buzze` is an externally-driven void writer (the buzzer is
+        // hardware we cannot actuate offline).
+        assert_eq!(
+            h.call("Fan Output", "Buzze", &[]).unwrap(),
+            Value::Bool(true)
+        );
+    }
+
+    #[test]
+    fn unknown_object_method_still_fails_loud() {
+        let mut h = ProjectObjHarness::new();
+        // A project object with a method that is neither a setter, an enum
+        // accessor, a Timer method, nor a known IO stub fails loud — never a guess.
+        match h.call("Fan Output", "NotAKnownMethod", &[]) {
+            Err(EvalError::UnsupportedBuiltin { object, method }) => {
+                assert_eq!(object, "Fan Output");
+                assert_eq!(method, "NotAKnownMethod");
+            }
+            other => panic!("expected UnsupportedBuiltin, got {other:?}"),
+        }
+    }
+
+    #[test]
+    fn io_stub_methods_are_classified_stubbed() {
+        // Each project-object IO method is reported as a documented stub.
+        for method in [
+            "Tx",
+            "TxOpen",
+            "TxInitialise",
+            "Init",
+            "SetBit",
+            "SetUnsignedInteger",
+            "GetScaled",
+            "GetUnsignedInteger",
+            "Receive",
+            "Update",
+            "SetState",
+            "Buzze",
+        ] {
+            assert_eq!(
+                classify_builtin("DashVals", method),
+                BuiltinSupport::Stubbed,
+                "{method} should be a stub"
             );
         }
     }

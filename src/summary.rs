@@ -29,6 +29,7 @@ use crate::value::Value;
 use m1_core::{Field, Kind, Node};
 use m1_typecheck::Project;
 use m1_typecheck::parsed::ParsedScript;
+use m1_typecheck::symbols::SymbolKind;
 use std::collections::{BTreeSet, HashMap};
 
 /// The canonical read/write sets of one function's body.
@@ -70,16 +71,67 @@ struct Walker<'a> {
 }
 
 impl Walker<'_> {
-    /// Walk a node, dispatching assignments specially and recursing elsewhere.
+    /// Walk a node, dispatching assignments and method calls specially and
+    /// recursing elsewhere.
     fn walk(&mut self, node: &Node) {
         match node.kind() {
             Kind::LocalDeclaration => self.walk_local_decl(node),
             Kind::AssignmentStatement => self.walk_assignment(node),
+            Kind::CallExpression => self.walk_call(node),
             _ => {
                 for child in node.named_children() {
                     self.walk(&child);
                 }
             }
+        }
+    }
+
+    /// A method call `<receiver>.<method>(args)` in statement position. The
+    /// arguments are reads; the callee's channel receiver (if any) is accounted by
+    /// [`Walker::account_call_callee`].
+    fn walk_call(&mut self, node: &Node) {
+        if let Some(args) = node.child_by_field(Field::Arguments) {
+            self.walk_reads(&args);
+        }
+        self.account_call_callee(node);
+    }
+
+    /// Account the *receiver* of a method call's callee. Mirrors `m1-typecheck`
+    /// schedule.rs: when the receiver resolves to a project channel/parameter,
+    /// `Chan.Set*(…)` is the imperative setter — a **write** of that channel — and
+    /// any other method (`AsInteger`/`Lookup`/`Get…`/…) is a **read**. A
+    /// library/object callee (`Calculate.Max`) has no channel receiver and is
+    /// ignored. The arguments are handled by the caller, not here.
+    fn account_call_callee(&mut self, call_node: &Node) {
+        let Some(callee) = call_node.child_by_field(Field::Function) else {
+            return;
+        };
+        if callee.kind() != Kind::MemberExpression {
+            return;
+        }
+        let (Some(receiver), Some(method)) = (
+            callee.child_by_field(Field::Object),
+            callee.child_by_field(Field::Property),
+        ) else {
+            return;
+        };
+        // The receiver must resolve to a project channel/parameter to count.
+        let Some(path) = self.canonical_symbol(&receiver) else {
+            return;
+        };
+        let writable = self
+            .project
+            .symbols()
+            .get(&path)
+            .map(|s| matches!(s.kind, SymbolKind::Channel | SymbolKind::Parameter))
+            .unwrap_or(false);
+        if !writable {
+            return;
+        }
+        if method.text().starts_with("Set") {
+            self.sets.writes.insert(path);
+        } else {
+            self.sets.reads.insert(path);
         }
     }
 
@@ -145,11 +197,15 @@ impl Walker<'_> {
                 // walks the argument list.)
             }
             Kind::CallExpression => {
-                // The callee is `Object.Method` (a builtin or table); we do not
-                // count it as a channel read. The arguments, however, are reads.
+                // The callee may be a library/table object (`Calculate.Max`,
+                // `Map.Lookup`) — not a channel read — or a method on a channel
+                // receiver (`Chan.AsInteger()` reads `Chan`, `Chan.Set(…)` writes
+                // it). `account_call_callee` handles the channel-receiver case; the
+                // arguments are always reads.
                 if let Some(args) = node.child_by_field(Field::Arguments) {
                     self.walk_reads(&args);
                 }
+                self.account_call_callee(node);
             }
             _ => {
                 for child in node.named_children() {
@@ -251,5 +307,33 @@ mod tests {
         assert!(sets.reads.contains("Root.Demo.Speed"));
         assert!(sets.reads.contains("Root.Demo.Gain"));
         assert!(sets.writes.contains("Root.Demo.Output"));
+    }
+
+    #[test]
+    fn channel_set_call_is_a_write_not_a_read() {
+        let project = mini_project();
+        // `Chan.Set(value)` is the imperative setter — a *write* of the channel,
+        // matching `m1-typecheck` schedule.rs and the evaluator's `.Set` route. The
+        // argument is still a read.
+        let script = script_from("Output.Set(Speed);\n");
+        let sets = io_sets(&script, &project, Some("Root.Demo"));
+
+        assert!(sets.writes.contains("Root.Demo.Output"), "{sets:?}");
+        // The receiver is a write, NOT mis-counted as a read.
+        assert!(!sets.reads.contains("Root.Demo.Output"), "{sets:?}");
+        // The argument is a read.
+        assert!(sets.reads.contains("Root.Demo.Speed"), "{sets:?}");
+    }
+
+    #[test]
+    fn non_set_method_call_on_channel_is_a_read() {
+        let project = mini_project();
+        // A non-`Set` method (`Output.AsInteger()`) reads its receiver — only the
+        // imperative setter family writes. The receiver therefore appears as a read.
+        let script = script_from("local x = Output.AsInteger();\n");
+        let sets = io_sets(&script, &project, Some("Root.Demo"));
+
+        assert!(sets.reads.contains("Root.Demo.Output"), "{sets:?}");
+        assert!(!sets.writes.contains("Root.Demo.Output"), "{sets:?}");
     }
 }
