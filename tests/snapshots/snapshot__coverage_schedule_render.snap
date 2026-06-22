@@ -1,0 +1,17 @@
+---
+source: tests/snapshot.rs
+expression: report.render()
+---
+Supported:
+  builtin Integral.Normal
+  construct assignment_statement
+Stubbed:
+  (none)
+Unsupported:
+  (none)
+Schedule:
+  Root.MR.Fast Reader @ 100 Hz
+  Root.MR.Fast Writer @ 100 Hz
+  Root.MR.Slow Integrator @ 50 Hz
+  Root.MR.Slow Writer @ 50 Hz
+  Root.MR.Init (unscheduled)

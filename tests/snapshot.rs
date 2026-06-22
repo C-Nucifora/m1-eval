@@ -121,3 +121,14 @@ fn coverage_render_snapshot() {
     let report = engine.coverage();
     insta::assert_snapshot!("coverage_render", report.render());
 }
+
+/// The multirate fixture's coverage report renders a `Schedule:` section listing
+/// every scheduled function fastest-first with its rate, and flags the On-Startup
+/// function unscheduled — pinned so a regression in the schedule report shows.
+#[test]
+fn coverage_schedule_render_snapshot() {
+    let dir = Path::new(env!("CARGO_MANIFEST_DIR")).join("tests/fixtures/multirate");
+    let engine = Engine::load(&dir.join("Project.m1prj"), None).expect("multirate fixture loads");
+    let report = engine.coverage();
+    insta::assert_snapshot!("coverage_schedule_render", report.render());
+}

@@ -54,6 +54,14 @@ pub struct CoverageReport {
     pub stubbed: Vec<CoverageItem>,
     /// Items the engine does not handle (would fail loud at runtime).
     pub unsupported: Vec<CoverageItem>,
+    /// The whole-project execution schedule: one `(function symbol, rate)` entry
+    /// per script-backed function. `Some(hz)` is the function's periodic rate (it
+    /// runs that many times per second in whole-project mode); `None` flags a
+    /// function with no resolvable periodic trigger (`On Startup`, an untriggered
+    /// or `$(…)`-parameterised trigger) — it is **not** run by the whole-project
+    /// scheduler. Sorted `(rate descending, function symbol)` for a deterministic
+    /// report; empty when the analysis had no [`Project`] to resolve rates from.
+    pub schedule: Vec<(String, Option<f64>)>,
 }
 
 impl CoverageReport {
@@ -102,6 +110,7 @@ impl CoverageReport {
             supported: supported.into_iter().collect(),
             stubbed: stubbed.into_iter().collect(),
             unsupported: unsupported.into_iter().collect(),
+            schedule: build_schedule(scripts, project),
         }
     }
 
@@ -113,8 +122,63 @@ impl CoverageReport {
         render_section(&mut out, "Supported", &self.supported);
         render_section(&mut out, "Stubbed", &self.stubbed);
         render_section(&mut out, "Unsupported", &self.unsupported);
+        render_schedule(&mut out, &self.schedule);
         out
     }
+}
+
+/// Append the `Schedule:` section: one line per function with its rate, or a flag
+/// that it is unscheduled (and so never runs in whole-project mode). An empty
+/// schedule still prints the label so the output shape is stable.
+fn render_schedule(out: &mut String, schedule: &[(String, Option<f64>)]) {
+    out.push_str("Schedule:\n");
+    if schedule.is_empty() {
+        out.push_str("  (none)\n");
+        return;
+    }
+    for (function, rate) in schedule {
+        match rate {
+            Some(hz) => out.push_str(&format!("  {function} @ {hz} Hz\n")),
+            None => out.push_str(&format!("  {function} (unscheduled)\n")),
+        }
+    }
+}
+
+/// Derive the whole-project execution schedule: one `(function symbol, rate)`
+/// entry per script-backed function. Mirrors `runner::enumerate_scheduled`'s rate
+/// derivation (`function_symbol_for_script` → `symbols().get(..).call_rate_hz`)
+/// but keeps the **unscheduled** (`None`) functions too, so the report can flag
+/// them. Sorted `(rate descending, function symbol)` for determinism; empty when
+/// no [`Project`] is available to resolve rates.
+fn build_schedule(scripts: &[ParsedScript], project: Option<&Project>) -> Vec<(String, Option<f64>)> {
+    let Some(project) = project else {
+        return Vec::new();
+    };
+    let mut schedule: Vec<(String, Option<f64>)> = scripts
+        .iter()
+        .filter_map(|script| {
+            // A script without a backing function symbol is not a scheduled
+            // function (e.g. a non-function script) — skip it entirely.
+            let fn_symbol = project.function_symbol_for_script(&script.name)?;
+            let rate_hz = project.symbols().get(&fn_symbol).and_then(|s| s.call_rate_hz);
+            Some((fn_symbol, rate_hz))
+        })
+        .collect();
+    // Fastest-first, ties broken by the function symbol path. A `None` rate sorts
+    // last (unscheduled functions after every periodic one).
+    schedule.sort_by(|a, b| {
+        rate_sort_key(b.1)
+            .partial_cmp(&rate_sort_key(a.1))
+            .unwrap_or(std::cmp::Ordering::Equal)
+            .then_with(|| a.0.cmp(&b.0))
+    });
+    schedule
+}
+
+/// Sort key that places a periodic rate by its Hz (descending when compared
+/// reversed) and an unscheduled `None` last (treated as the lowest rate).
+fn rate_sort_key(rate: Option<f64>) -> f64 {
+    rate.unwrap_or(f64::NEG_INFINITY)
 }
 
 /// Append one labelled section of items to `out`.
@@ -381,5 +445,64 @@ Output = i;
         assert!(text.contains("Unsupported:"));
         // Stubbed has nothing here.
         assert!(text.contains("(none)"));
+    }
+
+    #[test]
+    fn schedule_reports_rated_functions_and_flags_unscheduled() {
+        // Task 17: with a project, the report carries a per-function schedule —
+        // each function's `call_rate_hz` (or `None` for an On-Startup function
+        // that never runs in whole-project mode). The multirate fixture has four
+        // periodic functions (two at 100 Hz, two at 50 Hz) and one startup.
+        let dir =
+            std::path::Path::new(env!("CARGO_MANIFEST_DIR")).join("tests/fixtures/multirate");
+        let loaded = crate::loader::load(&dir.join("Project.m1prj"), None)
+            .expect("multirate fixture loads");
+        let report = CoverageReport::analyse_in(&loaded.scripts, Some(&loaded.project));
+
+        // Look the schedule up by function symbol path.
+        let by_fn: std::collections::HashMap<&str, Option<f64>> = report
+            .schedule
+            .iter()
+            .map(|(f, hz)| (f.as_str(), *hz))
+            .collect();
+
+        assert_eq!(by_fn.get("Root.MR.Fast Writer"), Some(&Some(100.0)));
+        assert_eq!(by_fn.get("Root.MR.Fast Reader"), Some(&Some(100.0)));
+        assert_eq!(by_fn.get("Root.MR.Slow Writer"), Some(&Some(50.0)));
+        assert_eq!(by_fn.get("Root.MR.Slow Integrator"), Some(&Some(50.0)));
+        // The On-Startup function is reported with rate `None` (unscheduled).
+        assert_eq!(by_fn.get("Root.MR.Init"), Some(&None));
+    }
+
+    #[test]
+    fn render_includes_schedule_section_flagging_unscheduled() {
+        // The `Schedule:` section lists each function with its rate; an
+        // unscheduled (`None`) function is flagged so the user sees it will not
+        // run in whole-project mode.
+        let dir =
+            std::path::Path::new(env!("CARGO_MANIFEST_DIR")).join("tests/fixtures/multirate");
+        let loaded = crate::loader::load(&dir.join("Project.m1prj"), None)
+            .expect("multirate fixture loads");
+        let report = CoverageReport::analyse_in(&loaded.scripts, Some(&loaded.project));
+        let text = report.render();
+
+        assert!(text.contains("Schedule:"), "no Schedule section: {text}");
+        assert!(
+            text.contains("Root.MR.Fast Writer") && text.contains("100"),
+            "rated function not rendered: {text}"
+        );
+        assert!(
+            text.contains("Root.MR.Init") && text.contains("unscheduled"),
+            "startup function not flagged unscheduled: {text}"
+        );
+    }
+
+    #[test]
+    fn schedule_is_empty_without_project_context() {
+        // The project-free `analyse` cannot resolve function rates (no `Project`),
+        // so the schedule is empty — but `render` still labels the section.
+        let report = CoverageReport::analyse(&scripts_from("Output = Speed;\n"));
+        assert!(report.schedule.is_empty());
+        assert!(report.render().contains("Schedule:"));
     }
 }
