@@ -1,0 +1,14 @@
+<?xml version="1.0"?>
+<MoTeCM1BuildSession>
+ <Project Name="Mini" TargetHardware="ecu120">
+  <ComponentStream><List>
+   <Component Classname="BuiltIn.Channel" Name="Root.Sibling"><Props Type="f32"><Locale><Default Unit="rpm"/></Locale></Props></Component>
+   <Component Classname="BuiltIn.GroupCompound" Name="Root.Demo"/>
+   <Component Classname="BuiltIn.Channel" Name="Root.Demo.Speed"><Props Type="f32"><Locale><Default Unit="rpm"/></Locale></Props></Component>
+   <Component Classname="BuiltIn.Channel" Name="Root.Demo.Output"><Props Type="f32"/></Component>
+   <Component Classname="BuiltIn.Parameter" Name="Root.Demo.Gain"><Props Type="f32"/></Component>
+   <Component Classname="BuiltIn.Table" Name="Root.Demo.Map"><Props Type="f32"/></Component>
+   <Component Classname="BuiltIn.FuncUser" Filename="Demo.Update.m1scr" Name="Root.Demo.Update"/>
+  </List></ComponentStream>
+ </Project>
+</MoTeCM1BuildSession>

@@ -10,3 +10,6 @@ pub mod calib;
 pub use calib::{CalTable, Calibration};
 
 pub mod table;
+
+pub mod loader;
+pub use loader::{Loaded, load};

@@ -1,0 +1,4 @@
+// Synthetic M1 script for m1-eval fixture tests. No proprietary content.
+// Scales an input speed channel by a calibrated gain and writes the output.
+local scaled = Speed * Gain;
+Output = scaled;
