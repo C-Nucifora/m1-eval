@@ -19,3 +19,8 @@ pub use env::{CallSite, Env, OpState, StateStore};
 
 pub mod ident;
 pub use ident::{Target, classify};
+
+pub mod expr;
+pub use expr::{EvalCtx, eval};
+
+pub mod builtins;
