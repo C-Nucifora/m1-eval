@@ -34,6 +34,9 @@ pub use stmt::{exec, exec_script};
 pub mod scenario;
 pub use scenario::{InputKind, InputSeries, RunMode, Scenario};
 
+pub mod log;
+pub use log::{Log, LogMeta};
+
 pub mod summary;
 pub use summary::{IoSets, io_sets};
 
