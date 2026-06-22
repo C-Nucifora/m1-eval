@@ -13,3 +13,6 @@ pub mod table;
 
 pub mod loader;
 pub use loader::{Loaded, load};
+
+pub mod env;
+pub use env::{CallSite, Env, OpState, StateStore};
