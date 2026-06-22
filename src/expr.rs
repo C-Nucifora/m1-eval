@@ -971,14 +971,25 @@ mod tests {
     }
 
     #[test]
-    fn builtin_call_dispatches_and_is_unsupported_in_m4() {
+    fn pure_builtin_call_dispatches_and_evaluates() {
         let mut h = Harness::new();
-        // Calculate.Max(...) dispatches through builtins::dispatch, which is a
-        // fail-loud stub in M4.
-        match rhs_value("Calculate.Max(2, 3)", &mut h) {
+        // M5 wires the pure builtins: Calculate.Max(2, 3) dispatches through
+        // builtins::dispatch and computes a real value (3).
+        assert_eq!(
+            rhs_value("Calculate.Max(2, 3)", &mut h).unwrap(),
+            Value::Int(3)
+        );
+    }
+
+    #[test]
+    fn unimplemented_builtin_call_still_fails_loud() {
+        let mut h = Harness::new();
+        // A stateful builtin (Filter.FirstOrder, M6) is not implemented yet, so a
+        // call to it must fail loud rather than no-op.
+        match rhs_value("Filter.FirstOrder(1.0, 0.1)", &mut h) {
             Err(EvalError::UnsupportedBuiltin { object, method }) => {
-                assert_eq!(object, "Calculate");
-                assert_eq!(method, "Max");
+                assert_eq!(object, "Filter");
+                assert_eq!(method, "FirstOrder");
             }
             other => panic!("expected UnsupportedBuiltin, got {other:?}"),
         }
