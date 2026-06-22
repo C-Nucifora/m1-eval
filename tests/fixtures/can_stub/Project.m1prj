@@ -1,0 +1,26 @@
+<?xml version="1.0"?>
+<!-- Synthetic m1-eval CAN-stub fixture. No proprietary MoTeC content. -->
+<!--                                                                    -->
+<!-- A single 100 Hz function exercises the Tier-3 IO library stubs: it -->
+<!-- opens a CAN receive handle and reads a float and an unsigned from  -->
+<!-- the bus, then writes the float to an output channel. Offline there -->
+<!-- is no CAN bus, so each `CanComms.*` call returns its documented,    -->
+<!-- type-correct externally-driven default (a Handle -> the benign      -->
+<!-- unit, a FloatingPoint read -> 0.0, an Integer read -> 0) instead of -->
+<!-- failing loud. This is the CI-safe guard for the gated EV-M1 whole-  -->
+<!-- project test: it proves a run whose script reads CAN completes.     -->
+<MoTeCM1BuildSession>
+ <Project Name="CanStub" TargetHardware="ecu120">
+  <ComponentStream><List>
+   <Component Classname="BuiltIn.GroupCompound" Name="Root.CanDemo"/>
+   <Component Classname="BuiltIn.GroupCompound" Name="Root.Events"/>
+   <Component Classname="BuiltIn.EventKernel" Name="Root.Events.On 100Hz"/>
+
+   <Component Classname="BuiltIn.Channel" Name="Root.CanDemo.Bus Value"><Props Type="f32"/></Component>
+
+   <Component Classname="BuiltIn.FuncUser" Filename="CanDemo.Read.m1scr" Name="Root.CanDemo.Read">
+    <Props SelectedTrigger="Root.Events.On 100Hz"/>
+   </Component>
+  </List></ComponentStream>
+ </Project>
+</MoTeCM1BuildSession>

@@ -1,0 +1,6 @@
+// Synthetic M1 script for m1-eval fixture tests. No proprietary content.
+// Reads from a CAN bus that does not exist offline: each CanComms.* call
+// resolves to its documented externally-driven stub rather than failing loud.
+local handle = CanComms.RxOpenStandard(0, 0, 0, false);
+local raw = CanComms.GetUnsignedInteger(handle, 0, 8);
+Bus Value = CanComms.GetFloat(handle, 0);
