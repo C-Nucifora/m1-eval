@@ -966,6 +966,8 @@ mod tests {
                 fn_symbol: Some("Root.Demo.Update"),
                 script_name: "Demo.Update.m1scr",
                 dt: self.dt,
+                scripts: &[],
+                depth: 0,
                 trace: None,
             };
             call(object, method, args, site, &mut ctx)
@@ -1054,6 +1056,8 @@ mod tests {
                 fn_symbol: Some("Root.Demo.Update"),
                 script_name: "Demo.Update.m1scr",
                 dt: h.dt,
+                scripts: &[],
+                depth: 0,
                 trace: None,
             };
             let v = call("Filter", "FirstOrder", &[Value::Float(seed), tc.clone()], site, &mut ctx)
@@ -1078,6 +1082,8 @@ mod tests {
             fn_symbol: Some("Root.Demo.Update"),
             script_name: "Demo.Update.m1scr",
             dt: h.dt,
+            scripts: &[],
+            depth: 0,
             trace: None,
         };
         assert!(call("NotStateful", "X", &[], site, &mut ctx).unwrap().is_none());
@@ -1367,6 +1373,8 @@ mod tests {
                 fn_symbol: Some("Root.Demo.Update"),
                 script_name: "Demo.Update.m1scr",
                 dt: h.dt,
+                scripts: &[],
+                depth: 0,
                 trace: None,
             };
             timer(method, args, key.clone(), &mut ctx).unwrap().unwrap()
@@ -1393,6 +1401,8 @@ mod tests {
                 fn_symbol: Some("Root.Demo.Update"),
                 script_name: "Demo.Update.m1scr",
                 dt: h.dt,
+                scripts: &[],
+                depth: 0,
                 trace: None,
             };
             timer(method, args, key.clone(), &mut ctx).unwrap().unwrap()

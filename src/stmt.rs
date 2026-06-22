@@ -148,6 +148,11 @@ enum Dest {
     Static { fn_symbol: String, var: String },
     /// A project channel/parameter, by canonical path.
     Channel(String),
+    /// The current function frame's `Out` return slot (`Out = <expr>;`). The
+    /// `Out` keyword is function-local and never a project symbol — `resolve`
+    /// treats it as opaque — so it is special-cased here to land in the env
+    /// out-slot, which `userfn::call` reads as the function's return value.
+    Out,
 }
 
 /// Resolve an assignment target node into a [`Dest`]. The target is a path
@@ -159,6 +164,14 @@ fn resolve_target(target: &Node, ctx: &mut EvalCtx) -> Result<Dest, EvalError> {
     let path = target_path(target)?;
     let rewritten = expr::rewrite_this(&path, ctx.group);
     let path = rewritten.as_deref().unwrap_or(&path);
+
+    // The `Out` return-value object: a user function's `Out = <expr>;` assignment
+    // writes the env out-slot, the value `userfn::call` reads back as the return.
+    // `Out` is function-local (never a project symbol), so it is recognised here
+    // before classification rather than failing loud as an unresolved target.
+    if path == "Out" {
+        return Ok(Dest::Out);
+    }
 
     // A bare name that already names a `static local` of the current function is a
     // static write — this is how a `static local x` accumulator is updated.
@@ -218,6 +231,11 @@ fn read_dest(dest: &Dest, ctx: &EvalCtx) -> Result<Value, EvalError> {
             .get(canon)
             .cloned()
             .ok_or_else(|| EvalError::MissingInput { channel: canon.clone() }),
+        Dest::Out => ctx
+            .env
+            .get_out()
+            .cloned()
+            .ok_or_else(|| EvalError::MissingInput { channel: "Out".to_string() }),
     }
 }
 
@@ -232,6 +250,8 @@ fn write_dest(dest: &Dest, value: Value, ctx: &mut EvalCtx) {
                 trace.record_channel(canon.clone(), value);
             }
         }
+        // The return slot is function-local: write it, do not record a channel.
+        Dest::Out => ctx.env.set_out(value),
     }
 }
 
@@ -621,6 +641,8 @@ mod tests {
                 fn_symbol: Some("Root.Demo.Update"),
                 script_name: "Demo.Update.m1scr",
                 dt: 0.01,
+                scripts: &[],
+                depth: 0,
                 trace: Some(&mut self.trace),
             }
         }
@@ -702,6 +724,27 @@ mod tests {
             Err(EvalError::MissingInput { .. }) => {}
             other => panic!("expected MissingInput, got {other:?}"),
         }
+    }
+
+    #[test]
+    fn out_assignment_writes_the_out_slot() {
+        let mut h = Harness::new();
+        // `Out = <expr>;` is the user-function return assignment: it writes the
+        // env out-slot, not a project channel (and does not fail loud as an
+        // unresolved target the way it did before P15-D).
+        h.run("Out = 3 * 2;\n").unwrap();
+        assert_eq!(h.env.get_out(), Some(&Value::Int(6)));
+        // It is NOT recorded as a project channel write.
+        assert!(!h.trace.channels.contains_key("Out"));
+        assert!(!h.trace.channels.contains_key("Root.Demo.Out"));
+    }
+
+    #[test]
+    fn out_compound_assignment_reads_then_writes_the_out_slot() {
+        let mut h = Harness::new();
+        // A compound `Out +=` reads the current out-slot first, then writes back.
+        h.run("Out = 1;\nOut += 4;\n").unwrap();
+        assert_eq!(h.env.get_out(), Some(&Value::Int(5)));
     }
 
     #[test]
@@ -942,6 +985,8 @@ mod tests {
             fn_symbol: Some("Root.Demo.Update"),
             script_name: &script.name,
             dt: 0.01,
+            scripts: &[],
+            depth: 0,
             trace: Some(&mut trace),
         };
 

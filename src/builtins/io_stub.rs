@@ -231,6 +231,8 @@ mod tests {
                 fn_symbol: Some("Root.Demo.Update"),
                 script_name: "Demo.Update.m1scr",
                 dt: 0.02,
+                scripts: &[],
+                depth: 0,
                 trace: Some(&mut self.trace),
             };
             crate::builtins::dispatch(object, method, args, site, &mut ctx)

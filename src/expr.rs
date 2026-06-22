@@ -55,6 +55,16 @@ pub struct EvalCtx<'a> {
     pub script_name: &'a str,
     /// The tick step in seconds (stateful operators advance by this).
     pub dt: f64,
+    /// Every parsed script in the project, so an inline user-function call
+    /// ([`crate::builtins::userfn`]) can find the backing [`ParsedScript`] of the
+    /// callee symbol (the reverse of `function_symbol_for_script`). Threaded from
+    /// the runner; an empty slice in unit tests that never call a user function.
+    pub scripts: &'a [m1_typecheck::parsed::ParsedScript],
+    /// Current inline-call nesting depth. `0` at the top of a tick; incremented
+    /// each time [`crate::builtins::userfn::call`] enters a callee body, so a
+    /// runtime call cycle fails loud past a fixed bound rather than overflowing
+    /// the stack (the upstream static check is T097; this is the runtime guard).
+    pub depth: u32,
     /// Optional per-expression / external-channel sink. When present, the call
     /// evaluator records each builtin call's result value at its [`CallSite`],
     /// and Tier-3 IO stubs flag the channels they externally drive. `None` in
@@ -634,7 +644,7 @@ fn eval_call(node: &Node, ctx: &mut EvalCtx) -> Result<Value, EvalError> {
         }
     }
 
-    match callee.kind() {
+    let result = match callee.kind() {
         Kind::MemberExpression => {
             let object_node = callee
                 .child_by_field(Field::Object)
@@ -644,29 +654,56 @@ fn eval_call(node: &Node, ctx: &mut EvalCtx) -> Result<Value, EvalError> {
                 .ok_or_else(|| op_shape_err(&callee, "call method"))?;
             let method = method_node.text();
 
-            // A call whose object is a single builtin-library identifier
-            // (`Calculate`, `Limit`, …) dispatches as a builtin. Anything else —
-            // a method on a project symbol (table `.Lookup`, object accessors)
-            // or a deeper member object — is handled by later milestones (table
-            // lookup in M5, stateful operators in M6); for M4 they go through
-            // dispatch too and fail loud as unsupported.
-            let object = match object_node.kind() {
-                Kind::MemberExpression => flatten_member(&object_node)?,
-                _ => object_node.text().to_string(),
-            };
-            let result = crate::builtins::dispatch(&object, method, &args, site.clone(), ctx)?;
-            // Record the call's value at its call site for the value overlay.
-            if let Some(trace) = ctx.trace.as_deref_mut() {
-                trace.record_expr((site.script().to_string(), site.offset()), result.clone());
+            // A member-expression callee may be an inline *user* function/method
+            // call (`Slip Control.Update(...)`): the whole `object.method` path
+            // names a project `Function`/`Method` symbol. Try that first — its
+            // body is executed inline (P15-D) — and only fall through to library
+            // dispatch when the path is not a user function (`Ok(None)`).
+            let full_path = flatten_member(&callee)?;
+            if let Some(v) = crate::builtins::userfn::call(&full_path, &args, ctx)? {
+                v
+            } else {
+                // Not a user function: dispatch the method on its object. A call
+                // whose object is a single builtin-library identifier
+                // (`Calculate`, `Limit`, …) dispatches as a library builtin;
+                // a project-object method (table `.Lookup`, enum `.AsInteger`,
+                // channel `.Set`, an IO stub, a Timer) is routed inside `dispatch`.
+                let object = match object_node.kind() {
+                    Kind::MemberExpression => flatten_member(&object_node)?,
+                    _ => object_node.text().to_string(),
+                };
+                crate::builtins::dispatch(&object, method, &args, site.clone(), ctx)?
             }
-            Ok(result)
         }
-        // A bare-identifier callee is a user-function call — out of the M4 cone.
-        _ => Err(EvalError::UnsupportedConstruct {
-            kind: "user-function call (out of Phase-1 cone scope)".to_string(),
-            at: node.byte_range().start,
-        }),
+        // A bare-identifier callee `Update(...)` is an inline user-function call
+        // (the callee names a project `Function`/`Method` symbol directly). Route
+        // it through `userfn::call`; a name that is not a user function fails loud
+        // rather than guessing (it is neither a library object nor a value).
+        Kind::Identifier => {
+            let name = callee.text();
+            match crate::builtins::userfn::call(name, &args, ctx)? {
+                Some(v) => v,
+                None => {
+                    return Err(EvalError::UnsupportedConstruct {
+                        kind: format!("call to non-function {name:?}"),
+                        at: node.byte_range().start,
+                    });
+                }
+            }
+        }
+        _ => {
+            return Err(EvalError::UnsupportedConstruct {
+                kind: "unsupported call callee".to_string(),
+                at: node.byte_range().start,
+            });
+        }
+    };
+
+    // Record the call's value at its call site for the value overlay.
+    if let Some(trace) = ctx.trace.as_deref_mut() {
+        trace.record_expr((site.script().to_string(), site.offset()), result.clone());
     }
+    Ok(result)
 }
 
 fn op_shape_err(node: &Node, what: &str) -> EvalError {
@@ -719,6 +756,8 @@ mod tests {
                 fn_symbol: Some("Root.Demo.Update"),
                 script_name: "Demo.Update.m1scr",
                 dt: 0.01,
+                scripts: &[],
+                depth: 0,
                 trace: None,
             }
         }

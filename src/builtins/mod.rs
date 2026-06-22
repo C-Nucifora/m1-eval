@@ -25,6 +25,7 @@ pub mod enum_conv;
 pub mod io_stub;
 pub mod limit;
 pub mod stateful;
+pub mod userfn;
 
 use crate::env::CallSite;
 use crate::error::EvalError;
@@ -566,6 +567,8 @@ mod tests {
                 fn_symbol: Some("Root.Demo.Update"),
                 script_name: "Demo.Update.m1scr",
                 dt: 0.01,
+                scripts: &[],
+                depth: 0,
                 trace: None,
             }
         }
@@ -837,6 +840,8 @@ mod tests {
                 fn_symbol: Some("Root.Demo.Update"),
                 script_name: "Demo.Update.m1scr",
                 dt: 0.01,
+                scripts: &[],
+                depth: 0,
                 trace: None,
             }
         }
@@ -963,6 +968,8 @@ mod tests {
                 fn_symbol: Some("Root.Demo.Update"),
                 script_name: "Demo.Update.m1scr",
                 dt: 0.01,
+                scripts: &[],
+                depth: 0,
                 trace: Some(&mut self.trace),
             };
             dispatch(object, method, args, site, &mut ctx)

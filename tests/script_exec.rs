@@ -52,6 +52,8 @@ fn demo_update_script_computes_output() {
         fn_symbol: Some("Root.Demo.Update"),
         script_name: &script.name,
         dt: 0.01,
+        scripts: &loaded.scripts,
+        depth: 0,
         trace: Some(&mut trace),
     };
 
@@ -89,6 +91,8 @@ fn demo_update_is_deterministic_in_inputs() {
             fn_symbol: Some("Root.Demo.Update"),
             script_name: &script.name,
             dt: 0.01,
+            scripts: &loaded.scripts,
+            depth: 0,
             trace: None,
         };
         exec_script(&root, &mut ctx).expect("script executes");

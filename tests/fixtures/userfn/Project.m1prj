@@ -1,0 +1,19 @@
+<?xml version="1.0"?>
+<MoTeCM1BuildSession>
+ <Project Name="UserFn" TargetHardware="ecu120">
+  <ComponentStream><List>
+   <Component Classname="BuiltIn.GroupCompound" Name="Root.Caller"/>
+   <Component Classname="BuiltIn.Channel" Name="Root.Caller.Input"><Props Type="f32"/></Component>
+   <Component Classname="BuiltIn.Channel" Name="Root.Caller.Output"><Props Type="f32"/></Component>
+   <Component Classname="BuiltIn.FuncUser" Filename="Caller.Update.m1scr" Name="Root.Caller.Update"/>
+   <Component Classname="BuiltIn.GroupCompound" Name="Root.Helper"/>
+   <Component Classname="BuiltIn.FuncUserParam" Filename="Helper.Compute.m1scr" Name="Root.Helper.Compute">
+    <Signature ReturnType="f32"><Params><Param Name="x" Type="f32"/></Params></Signature>
+   </Component>
+   <Component Classname="BuiltIn.GroupCompound" Name="Root.Recur"/>
+   <Component Classname="BuiltIn.FuncUserParam" Filename="Recur.Loop.m1scr" Name="Root.Recur.Loop">
+    <Signature ReturnType="f32"><Params><Param Name="n" Type="f32"/></Params></Signature>
+   </Component>
+  </List></ComponentStream>
+ </Project>
+</MoTeCM1BuildSession>

@@ -160,6 +160,12 @@ pub struct Env {
     /// IO stub returns it instead of a documented default — this is how a
     /// scenario externally drives a hardware-backed builtin. Empty by default.
     pub io_overrides: HashMap<String, Value>,
+    /// The current function frame's return-value slot — the `Out` object an M1
+    /// user function assigns to (`Out = <expr>;`). A single slot per *active*
+    /// frame: `userfn::call` saves the caller's slot, clears it, runs the callee
+    /// (whose `Out =` statements write here), reads the result, then restores the
+    /// caller's slot. `None` means the current function has not assigned `Out`.
+    pub out: Option<Value>,
 }
 
 impl Env {
@@ -208,6 +214,25 @@ impl Env {
     /// Seed a scenario value for a Tier-3 IO call `"Object.Method"`.
     pub fn set_io_override(&mut self, call: impl Into<String>, value: Value) {
         self.io_overrides.insert(call.into(), value);
+    }
+
+    /// Write the current frame's `Out` return slot — the value an `Out = <expr>;`
+    /// statement assigns inside a user-function body.
+    pub fn set_out(&mut self, value: Value) {
+        self.out = Some(value);
+    }
+
+    /// The current frame's `Out` return value, if the body has assigned one.
+    pub fn get_out(&self) -> Option<&Value> {
+        self.out.as_ref()
+    }
+
+    /// Clear the current frame's `Out` slot (entering a fresh callee frame so its
+    /// own `Out =` writes start from "unassigned", or after reading the return).
+    /// Returns the previous slot so a caller can save and restore it across a
+    /// nested call.
+    pub fn clear_out(&mut self) -> Option<Value> {
+        self.out.take()
     }
 
     /// Begin executing a function: start with a fresh, empty local scope. Statics
@@ -264,6 +289,33 @@ mod tests {
             env.get_static("Root.Demo.Update", "accum"),
             Some(&Value::Float(10.0))
         );
+    }
+
+    #[test]
+    fn out_slot_set_get_clear_roundtrip() {
+        let mut env = Env::new();
+        // Unassigned by default.
+        assert_eq!(env.get_out(), None);
+        // A body assigns Out; the slot holds it.
+        env.set_out(Value::Float(6.0));
+        assert_eq!(env.get_out(), Some(&Value::Float(6.0)));
+        // Clearing returns the prior value and empties the slot.
+        assert_eq!(env.clear_out(), Some(Value::Float(6.0)));
+        assert_eq!(env.get_out(), None);
+        // Clearing an empty slot returns None.
+        assert_eq!(env.clear_out(), None);
+    }
+
+    #[test]
+    fn out_slot_is_independent_of_locals_and_statics() {
+        let mut env = Env::new();
+        env.set_local("y", Value::Int(7));
+        env.set_out(Value::Int(99));
+        // Leaving a function clears locals but does NOT touch the out slot — the
+        // caller (`userfn::call`) owns save/restore of the out slot explicitly.
+        env.leave_function();
+        assert_eq!(env.get_local("y"), None);
+        assert_eq!(env.get_out(), Some(&Value::Int(99)));
     }
 
     #[test]

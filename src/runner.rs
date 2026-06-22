@@ -114,6 +114,8 @@ fn tick_loop(
                 fn_symbol: sched.fn_symbol.as_deref(),
                 script_name: &sched.script.name,
                 dt,
+                scripts: &loaded.scripts,
+                depth: 0,
                 trace: Some(&mut trace),
             };
             exec_script(&root, &mut ctx)?;
@@ -428,6 +430,36 @@ const = 2.0
         for (g, e) in got.iter().zip(expected.iter()) {
             assert!((g - e).abs() < 1e-9, "got {got:?}, expected {expected:?}");
         }
+    }
+
+    #[test]
+    fn single_function_calls_user_helper_inline() {
+        // The userfn fixture: Caller.Update runs `Output = Helper.Compute(Input)`,
+        // and the helper (a FuncUserParam, `<Param x>`, body `Out = In.x * 2.0`)
+        // is executed inline. With Input = 4, Output = 8 each tick — proving the
+        // call binds In.x, runs the helper body, and reads its Out return.
+        let dir = Path::new(env!("CARGO_MANIFEST_DIR")).join("tests/fixtures/userfn");
+        let loaded = load(&dir.join("Project.m1prj"), None).expect("userfn fixture loads");
+
+        let toml = r#"
+mode = "function"
+target = "Caller.Update"
+duration_s = 0.03
+base_rate_hz = 100.0
+
+[[inputs]]
+channel = "Root.Caller.Input"
+const = 4.0
+"#;
+        let scenario = Scenario::from_toml_str(toml).unwrap();
+        let trace = run(&loaded, &scenario).expect("userfn run succeeds");
+
+        assert_eq!(trace.time.len(), 3);
+        let out = trace
+            .channels
+            .get("Root.Caller.Output")
+            .expect("Output recorded");
+        assert!(out.iter().all(|v| *v == Value::Float(8.0)), "{out:?}");
     }
 
     #[test]
