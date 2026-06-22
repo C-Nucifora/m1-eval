@@ -20,18 +20,28 @@
 //! Counterfactual replay (`--override`) and log-driven input (`--log` CSV/`.ld`)
 //! are Phase 3 and are not implemented here yet.
 
-use clap::Parser;
+use clap::{ArgGroup, Parser};
 use m1_eval::{Engine, RunMode, Scenario};
 use std::path::{Path, PathBuf};
 use std::process;
 
 /// Stepped, deterministic evaluator for MoTeC M1 scripts.
+///
+/// The three run-mode overrides (`--function`, `--target`, `--whole-project`)
+/// are mutually exclusive — at most one selects how to drive the run. clap's
+/// `ArgGroup` enforces this, exiting `2` (usage error) when more than one is
+/// given, before the engine loads anything.
 #[derive(Parser, Debug)]
 #[command(
     name = "m1-eval",
     version,
     about = "Stepped, deterministic evaluator for MoTeC M1 scripts"
 )]
+#[command(group(
+    ArgGroup::new("mode_override")
+        .args(["function", "target", "whole_project"])
+        .multiple(false)
+))]
 struct Args {
     /// Project.m1prj (defaults to the nearest one upward, or $M1_PROJECT).
     #[arg(long)]
@@ -46,14 +56,20 @@ struct Args {
     scenario: Option<PathBuf>,
 
     /// Override the scenario's mode: run this single function each tick.
-    /// Mutually exclusive with --target.
-    #[arg(long, conflicts_with = "target")]
+    /// Mutually exclusive with --target and --whole-project.
+    #[arg(long)]
     function: Option<String>,
 
     /// Override the scenario's mode: run this target channel's dependency cone.
-    /// Mutually exclusive with --function.
+    /// Mutually exclusive with --function and --whole-project.
     #[arg(long)]
     target: Option<String>,
+
+    /// Override the scenario's mode: run the whole-project multi-rate scheduler
+    /// (every periodically-scheduled function at its own rate). Mutually
+    /// exclusive with --function and --target.
+    #[arg(long)]
+    whole_project: bool,
 
     /// Where to write the trace. Format is inferred from the extension
     /// (.json or .csv); without --out the trace prints to stdout as JSON.
@@ -120,10 +136,19 @@ fn load_scenario(path: &Path) -> Result<Scenario, String> {
     parsed.map_err(|e| format!("{}: {e}", path.display()))
 }
 
-/// Apply a `--function`/`--target` mode override to a scenario, if either flag
-/// was given. The CLI flag wins over the scenario file's `mode`/`target`.
-fn apply_mode_override(scenario: &mut Scenario, function: Option<String>, target: Option<String>) {
-    if let Some(f) = function {
+/// Apply a `--function`/`--target`/`--whole-project` mode override to a scenario,
+/// if one was given. The CLI flag wins over the scenario file's `mode`/`target`.
+/// At most one of the three can be set (enforced by the clap `ArgGroup`), so the
+/// order of these branches is immaterial.
+fn apply_mode_override(
+    scenario: &mut Scenario,
+    function: Option<String>,
+    target: Option<String>,
+    whole_project: bool,
+) {
+    if whole_project {
+        scenario.mode = RunMode::WholeProject;
+    } else if let Some(f) = function {
         scenario.mode = RunMode::Function(f);
     } else if let Some(t) = target {
         scenario.mode = RunMode::Cone(t);
@@ -170,7 +195,12 @@ fn main() {
                 process::exit(1);
             }
         };
-        apply_mode_override(&mut scenario, args.function, args.target);
+        apply_mode_override(
+            &mut scenario,
+            args.function,
+            args.target,
+            args.whole_project,
+        );
 
         let trace = match engine.run(&scenario) {
             Ok(t) => t,

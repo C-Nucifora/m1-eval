@@ -16,6 +16,29 @@ fn mini_dir() -> PathBuf {
     Path::new(env!("CARGO_MANIFEST_DIR")).join("tests/fixtures/mini")
 }
 
+/// Absolute path to the synthetic multirate fixture directory (two periodic
+/// rate groups plus an On-Startup function), used by the whole-project tests.
+fn multirate_dir() -> PathBuf {
+    Path::new(env!("CARGO_MANIFEST_DIR")).join("tests/fixtures/multirate")
+}
+
+/// A whole-project scenario TOML for the multirate fixture: it pins the base
+/// tick at 100 Hz and seeds the external `Seed`/`Slow Out` inputs the schedule
+/// reads on the first tick. `mode = "whole-project"` needs no `target`.
+const WHOLE_PROJECT_SCENARIO: &str = r#"
+mode = "whole-project"
+duration_s = 0.04
+base_rate_hz = 100.0
+
+[[inputs]]
+channel = "Root.MR.Seed"
+const = 3.0
+
+[[inputs]]
+channel = "Root.MR.Slow Out"
+const = 6.0
+"#;
+
 /// A scenario TOML that runs the mini `Demo.Update` function for three ticks with
 /// a constant speed and the calibrated gain, so `Output = Speed * Gain = 50`.
 const SCENARIO: &str = r#"
@@ -156,6 +179,86 @@ fn nonexistent_project_path_is_eval_error() {
         .arg(&scenario)
         .assert()
         .code(1);
+}
+
+#[test]
+fn whole_project_flag_runs_every_scheduled_channel() {
+    // Task 16: `--whole-project` overrides the scenario mode and drives the
+    // multi-rate scheduler. The written trace header lists every scheduled
+    // channel (the fast `Fast Out` and the slow `Slow Echo`), and the run exits 0.
+    let tmp = tempfile::tempdir().unwrap();
+    let scenario = write_scenario(tmp.path(), WHOLE_PROJECT_SCENARIO);
+    let out = tmp.path().join("trace.csv");
+    let mr = multirate_dir();
+
+    Command::cargo_bin("m1-eval")
+        .unwrap()
+        .arg("--project")
+        .arg(mr.join("Project.m1prj"))
+        .arg("--scenario")
+        .arg(&scenario)
+        .arg("--whole-project")
+        .arg("--out")
+        .arg(&out)
+        .assert()
+        .success();
+
+    let csv = std::fs::read_to_string(&out).expect("csv trace written");
+    let header = csv.lines().next().unwrap_or_default();
+    assert!(
+        header.contains("Root.MR.Fast Out"),
+        "header missing fast channel: {header}"
+    );
+    assert!(
+        header.contains("Root.MR.Slow Echo"),
+        "header missing slow channel: {header}"
+    );
+    // The On-Startup function never runs, so its channel is absent.
+    assert!(
+        !csv.contains("Root.MR.Started"),
+        "startup channel must not appear: {csv}"
+    );
+}
+
+#[test]
+fn whole_project_with_function_is_usage_error() {
+    // `--whole-project` is mutually exclusive with `--function`: combining them is
+    // a usage error (clap ArgGroup) → exit 2, before the engine even loads.
+    let tmp = tempfile::tempdir().unwrap();
+    let scenario = write_scenario(tmp.path(), WHOLE_PROJECT_SCENARIO);
+    let mr = multirate_dir();
+
+    Command::cargo_bin("m1-eval")
+        .unwrap()
+        .arg("--project")
+        .arg(mr.join("Project.m1prj"))
+        .arg("--scenario")
+        .arg(&scenario)
+        .arg("--whole-project")
+        .arg("--function")
+        .arg("MR.Fast Reader")
+        .assert()
+        .code(2);
+}
+
+#[test]
+fn whole_project_with_target_is_usage_error() {
+    // `--whole-project` is mutually exclusive with `--target` too → exit 2.
+    let tmp = tempfile::tempdir().unwrap();
+    let scenario = write_scenario(tmp.path(), WHOLE_PROJECT_SCENARIO);
+    let mr = multirate_dir();
+
+    Command::cargo_bin("m1-eval")
+        .unwrap()
+        .arg("--project")
+        .arg(mr.join("Project.m1prj"))
+        .arg("--scenario")
+        .arg(&scenario)
+        .arg("--whole-project")
+        .arg("--target")
+        .arg("Root.MR.Fast Out")
+        .assert()
+        .code(2);
 }
 
 #[test]
