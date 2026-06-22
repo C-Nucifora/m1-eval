@@ -18,9 +18,12 @@
 //! facade returns.
 
 use crate::builtins::{BuiltinSupport, classify_builtin};
+use crate::ident::{Target, classify};
 use m1_core::{Field, Kind, Node};
+use m1_typecheck::Project;
 use m1_typecheck::parsed::ParsedScript;
-use std::collections::BTreeSet;
+use m1_typecheck::symbols::SymbolKind;
+use std::collections::{BTreeSet, HashMap};
 
 /// One thing a script uses, with where it was found. `name` is a `Object.Method`
 /// for a builtin call or a construct kind for a language construct.
@@ -54,14 +57,35 @@ pub struct CoverageReport {
 }
 
 impl CoverageReport {
-    /// Analyse every script in `scripts`, producing a combined report.
+    /// Analyse every script in `scripts`, producing a combined report. No project
+    /// context: a member-expression callee is classified on its `(object, method)`
+    /// spelling alone, so a user-function call whose method name collides with an
+    /// IO-stub method (e.g. `Update`) cannot be distinguished from the stub. Use
+    /// [`CoverageReport::analyse_in`] for project-accurate user-function coverage.
     pub fn analyse(scripts: &[ParsedScript]) -> CoverageReport {
+        Self::analyse_in(scripts, None)
+    }
+
+    /// Analyse every script with optional project context. When a [`Project`] is
+    /// given, a `CallExpression` whose member-expression callee resolves to a user
+    /// `Function`/`Method` symbol is reported **Supported** (it is evaluated inline
+    /// — P15-D), disambiguating it from a same-named IO-stub method (`Service
+    /// Bits.Update` vs `Slip Control.Update`). This mirrors `eval_call`, which
+    /// tries `userfn::call` before library/IO dispatch.
+    pub fn analyse_in(scripts: &[ParsedScript], project: Option<&Project>) -> CoverageReport {
         let mut supported = BTreeSet::new();
         let mut stubbed = BTreeSet::new();
         let mut unsupported = BTreeSet::new();
         for script in scripts {
+            // The script's enclosing group, for resolving group-relative callees.
+            let group = project.and_then(|p| p.group_for_script(&script.name));
+            let cx = WalkCtx {
+                project,
+                group: group.as_deref(),
+            };
             walk(
                 &script.cst.root(),
+                &cx,
                 &mut supported,
                 &mut stubbed,
                 &mut unsupported,
@@ -140,26 +164,43 @@ fn is_reportable_construct(kind: Kind) -> bool {
     )
 }
 
+/// The per-script context the coverage walk carries: the optional project model
+/// and the script's enclosing group, used to resolve a call's callee to a user
+/// function (so an inline user-function call is reported Supported, not stubbed).
+struct WalkCtx<'a> {
+    project: Option<&'a Project>,
+    group: Option<&'a str>,
+}
+
 /// Recursively walk a node, bucketing builtin calls and reportable constructs.
 fn walk(
     node: &Node,
+    cx: &WalkCtx,
     supported: &mut BTreeSet<CoverageItem>,
     stubbed: &mut BTreeSet<CoverageItem>,
     unsupported: &mut BTreeSet<CoverageItem>,
 ) {
-    // Builtin calls: classify the `Object.Method`.
-    if node.kind() == Kind::CallExpression
-        && let Some((object, method)) = call_object_method(node)
-    {
-        let item = CoverageItem {
-            name: format!("{object}.{method}"),
-            kind: ItemKind::Builtin,
-        };
-        match classify_builtin(&object, &method) {
-            BuiltinSupport::Supported => supported.insert(item),
-            BuiltinSupport::Stubbed => stubbed.insert(item),
-            BuiltinSupport::Unsupported => unsupported.insert(item),
-        };
+    // Calls: an inline user-function/method call (member-expr or bare-identifier
+    // callee resolving to a project `Function`/`Method`) is Supported (P15-D);
+    // otherwise classify the `Object.Method` against the builtin dispatch table.
+    if node.kind() == Kind::CallExpression {
+        if let Some(name) = user_function_callee(node, cx) {
+            // A user function the engine evaluates inline.
+            supported.insert(CoverageItem {
+                name,
+                kind: ItemKind::Builtin,
+            });
+        } else if let Some((object, method)) = call_object_method(node) {
+            let item = CoverageItem {
+                name: format!("{object}.{method}"),
+                kind: ItemKind::Builtin,
+            };
+            match classify_builtin(&object, &method) {
+                BuiltinSupport::Supported => supported.insert(item),
+                BuiltinSupport::Stubbed => stubbed.insert(item),
+                BuiltinSupport::Unsupported => unsupported.insert(item),
+            };
+        }
     }
 
     // Reportable language constructs.
@@ -176,8 +217,35 @@ fn walk(
     }
 
     for child in node.named_children() {
-        walk(&child, supported, stubbed, unsupported);
+        walk(&child, cx, supported, stubbed, unsupported);
     }
+}
+
+/// The flattened callee path of a `CallExpression` when it resolves (against the
+/// walk's project + group) to a user `Function`/`Method` symbol — i.e. a call the
+/// engine evaluates inline (P15-D). `None` when there is no project context, the
+/// callee does not resolve to a user function, or the callee shape is unexpected.
+///
+/// Both call forms are recognised, mirroring `eval_call`: a member-expression
+/// callee (`Slip Control.Update`) and a bare-identifier callee (`Update`).
+fn user_function_callee(node: &Node, cx: &WalkCtx) -> Option<String> {
+    let project = cx.project?;
+    let callee = node.child_by_field(Field::Function)?;
+    let path = match callee.kind() {
+        Kind::MemberExpression => crate::expr::flatten_member(&callee).ok()?,
+        Kind::Identifier => callee.text().to_string(),
+        _ => return None,
+    };
+    let no_locals = HashMap::new();
+    let Target::Symbol(canon) = classify(&path, cx.group, None, project, &no_locals) else {
+        return None;
+    };
+    let is_user_fn = project
+        .symbols()
+        .get(&canon)
+        .map(|s| matches!(s.kind, SymbolKind::Function | SymbolKind::Method))
+        .unwrap_or(false);
+    is_user_fn.then_some(path)
 }
 
 /// Extract `(object, method)` from a `CallExpression` whose callee is a member
@@ -258,6 +326,49 @@ Output = i;
             constructs.iter().any(|c| c.contains("assignment") || c.contains("Assignment")),
             "{constructs:?}"
         );
+    }
+
+    #[test]
+    fn user_function_call_is_supported_not_stubbed() {
+        // A member-expression callee that resolves to a user `Function`/`Method`
+        // symbol is evaluated inline (P15-D) — Supported — even though its method
+        // name (`Update`) collides with the `Service Bits.Update` GroupCompound IO
+        // stub. The coverage walk must resolve the callee against the project to
+        // disambiguate, mirroring `eval_call` (which tries `userfn::call` first).
+        let dir = std::path::Path::new(env!("CARGO_MANIFEST_DIR"))
+            .join("tests/fixtures/userfn");
+        let loaded = crate::loader::load(&dir.join("Project.m1prj"), None)
+            .expect("userfn fixture loads");
+        let report = CoverageReport::analyse_in(&loaded.scripts, Some(&loaded.project));
+
+        let supported: Vec<&str> = report.supported.iter().map(|i| i.name.as_str()).collect();
+        assert!(
+            supported.contains(&"Helper.Compute"),
+            "Helper.Compute should be Supported, got supported={supported:?}"
+        );
+        // It must NOT appear in the unsupported or stubbed buckets.
+        let unsupported: Vec<&str> =
+            report.unsupported.iter().map(|i| i.name.as_str()).collect();
+        let stubbed: Vec<&str> = report.stubbed.iter().map(|i| i.name.as_str()).collect();
+        assert!(
+            !unsupported.contains(&"Helper.Compute"),
+            "unsupported={unsupported:?}"
+        );
+        assert!(
+            !stubbed.contains(&"Helper.Compute"),
+            "stubbed={stubbed:?}"
+        );
+    }
+
+    #[test]
+    fn group_compound_update_without_project_context_is_still_stubbed() {
+        // Without a project (the project-free `analyse`), a `<obj>.Update` call
+        // keeps its method-name classification (Stubbed) — the conservative
+        // default when the callee cannot be resolved as a user function.
+        let src = "Service Bits.Update();\n";
+        let report = CoverageReport::analyse(&scripts_from(src));
+        let stubbed: Vec<&str> = report.stubbed.iter().map(|i| i.name.as_str()).collect();
+        assert!(stubbed.contains(&"Service Bits.Update"), "{stubbed:?}");
     }
 
     #[test]

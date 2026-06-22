@@ -1156,6 +1156,29 @@ mod tests {
     }
 
     #[test]
+    fn phase15_calculate_overloads_are_classified_supported() {
+        // Every Tier-1 pure Calculate overload P15-A added must report Supported so
+        // the coverage report agrees with the dispatch table.
+        for method in [
+            "Absolute",
+            "Average",
+            "NAN",
+            "Infinity",
+            "IsFinite",
+            "MaximumFloat",
+            "InverseSin",
+            "InverseCos",
+            "InverseTan",
+        ] {
+            assert_eq!(
+                classify_builtin("Calculate", method),
+                BuiltinSupport::Supported,
+                "Calculate.{method} should be Supported"
+            );
+        }
+    }
+
+    #[test]
     fn io_stub_methods_are_classified_stubbed() {
         // Each project-object IO method is reported as a documented stub.
         for method in [

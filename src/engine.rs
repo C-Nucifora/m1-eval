@@ -59,7 +59,7 @@ impl Engine {
     /// engine supports, stubs, or cannot handle each. Pure static analysis — no
     /// scenario needed; safe to call before [`Engine::run`].
     pub fn coverage(&self) -> CoverageReport {
-        CoverageReport::analyse(&self.loaded.scripts)
+        CoverageReport::analyse_in(&self.loaded.scripts, Some(&self.loaded.project))
     }
 }
 
