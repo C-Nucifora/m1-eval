@@ -59,6 +59,66 @@ fn write_scenario(dir: &Path, body: &str) -> PathBuf {
     path
 }
 
+/// Absolute path to the synthetic counterfactual fixture (a Sensor -> Mid ->
+/// Result chain plus an unrelated Other), used by the counterfactual-replay tests.
+fn counterfactual_dir() -> PathBuf {
+    Path::new(env!("CARGO_MANIFEST_DIR")).join("tests/fixtures/counterfactual")
+}
+
+/// A self-consistent CSV log for the counterfactual fixture: Sensor=3 so Mid=6,
+/// Result=7, Other=42 (what the scripts compute), held over 0.1 s.
+const CF_LOG_CSV: &str = "time,Sensor,Mid,Result,Other\n0,3,6,7,42\n0.1,3,6,7,42\n";
+
+#[test]
+fn counterfactual_override_writes_trace_and_diff() {
+    let tmp = tempfile::tempdir().unwrap();
+    let log = tmp.path().join("log.csv");
+    std::fs::write(&log, CF_LOG_CSV).expect("write log");
+    let out = tmp.path().join("trace.json");
+    let diff = tmp.path().join("diff.json");
+    let cf = counterfactual_dir();
+
+    Command::cargo_bin("m1-eval")
+        .unwrap()
+        .arg("--project")
+        .arg(cf.join("Project.m1prj"))
+        .arg("--log")
+        .arg(&log)
+        .arg("--override")
+        .arg("Root.CF.Sensor=5")
+        .arg("--out")
+        .arg(&out)
+        .arg("--diff")
+        .arg(&diff)
+        .assert()
+        .success();
+
+    // Overriding Sensor (3 -> 5) recomputes Mid and Result downstream; Other is
+    // unrelated and stays at its logged value.
+    let diff_body = std::fs::read_to_string(&diff).expect("diff file written");
+    assert!(diff_body.contains("Root.CF.Mid"), "diff missing Mid: {diff_body}");
+    assert!(diff_body.contains("Root.CF.Result"), "diff missing Result");
+    assert!(
+        diff_body.contains("\"changed\":true"),
+        "diff should flag a changed channel: {diff_body}"
+    );
+    assert!(out.exists(), "trace file written");
+}
+
+#[test]
+fn override_without_log_is_usage_error() {
+    // --override requires --log (clap `requires`): a usage error, exit 2.
+    let cf = counterfactual_dir();
+    Command::cargo_bin("m1-eval")
+        .unwrap()
+        .arg("--project")
+        .arg(cf.join("Project.m1prj"))
+        .arg("--override")
+        .arg("Root.CF.Sensor=5")
+        .assert()
+        .code(2);
+}
+
 #[test]
 fn ok_run_writes_trace_with_output_channel() {
     let tmp = tempfile::tempdir().unwrap();

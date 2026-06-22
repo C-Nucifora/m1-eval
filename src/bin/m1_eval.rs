@@ -17,8 +17,10 @@
 //!   runnable action (no resolvable project, or neither `--scenario` nor
 //!   `--coverage`).
 //!
-//! Counterfactual replay (`--override`) and log-driven input (`--log` CSV/`.ld`)
-//! are Phase 3 and are not implemented here yet.
+//! Counterfactual replay is supported: `--log` attaches a recorded MoTeC log
+//! (CSV, or `.ld` with `--features ld`) as ground truth, `--override CH=expr`
+//! (repeatable) replaces channels, only their downstream cone recomputes, and
+//! `--diff` writes the per-channel logged-vs-counterfactual delta.
 
 use clap::{ArgGroup, Parser};
 use m1_eval::{Engine, RunMode, Scenario};
@@ -80,6 +82,22 @@ struct Args {
     /// stubbed, or unsupported) instead of, or alongside, running.
     #[arg(long)]
     coverage: bool,
+
+    /// Counterfactual replay: a recorded MoTeC log (CSV, or .ld with
+    /// `--features ld`) held as ground truth. Triggers a counterfactual run.
+    #[arg(long)]
+    log: Option<PathBuf>,
+
+    /// A counterfactual channel override `CHANNEL=value-or-expression` (repeatable).
+    /// The channel is pinned to the constant or expression each tick; only its
+    /// downstream cone recomputes. Requires --log.
+    #[arg(long = "override", requires = "log")]
+    overrides: Vec<String>,
+
+    /// Where to write the counterfactual diff (per-channel logged-vs-counterfactual
+    /// delta). Format inferred from the extension (.json or .csv). Requires --log.
+    #[arg(long, requires = "log")]
+    diff: Option<PathBuf>,
 }
 
 /// The output format for a written trace, inferred from the `--out` extension.
@@ -166,14 +184,14 @@ fn main() {
 
     // A run needs something to do: evaluate a scenario, or print coverage. With
     // neither, the invocation is incomplete — a usage error.
-    if args.scenario.is_none() && !args.coverage {
-        eprintln!("m1-eval: nothing to do (pass --scenario to run, or --coverage to report)");
+    if args.scenario.is_none() && !args.coverage && args.log.is_none() {
+        eprintln!("m1-eval: nothing to do (pass --scenario or --log to run, or --coverage to report)");
         process::exit(2);
     }
 
     // Load the engine. A project/calibration that will not load is a fail-loud
     // run error (exit 1).
-    let engine = match Engine::load(&project_path, args.config.as_deref()) {
+    let mut engine = match Engine::load(&project_path, args.config.as_deref()) {
         Ok(e) => e,
         Err(e) => {
             eprintln!("m1-eval: {}: {e}", project_path.display());
@@ -184,6 +202,54 @@ fn main() {
     // Coverage report (static analysis), if requested.
     if args.coverage {
         print!("{}", engine.coverage().render());
+    }
+
+    // Counterfactual replay (--log): hold the log as ground truth, apply the
+    // overrides, recompute only the downstream cone, and emit the trace (+ diff).
+    if let Some(log_path) = &args.log {
+        if let Err(e) = engine.load_log(log_path) {
+            eprintln!("m1-eval: {}: {e}", log_path.display());
+            process::exit(1);
+        }
+        for spec in &args.overrides {
+            if let Err(e) = engine.override_channel(spec) {
+                eprintln!("m1-eval: --override {spec:?}: {e}");
+                process::exit(1);
+            }
+        }
+        let cf = match engine.run_counterfactual_diff() {
+            Ok(cf) => cf,
+            Err(e) => {
+                eprintln!("m1-eval: {e}");
+                process::exit(1);
+            }
+        };
+        // The recomputed trace -> --out (or stdout as JSON).
+        match &args.out {
+            Some(out) => {
+                let body = match format_for(out) {
+                    OutFormat::Json => cf.trace.to_json(),
+                    OutFormat::Csv => cf.trace.to_csv(),
+                };
+                if let Err(e) = std::fs::write(out, body) {
+                    eprintln!("m1-eval: {}: {e}", out.display());
+                    process::exit(1);
+                }
+            }
+            None => println!("{}", cf.trace.to_json()),
+        }
+        // The per-channel diff -> --diff (format by extension), if requested.
+        if let Some(diff_path) = &args.diff {
+            let body = match format_for(diff_path) {
+                OutFormat::Json => cf.diff.to_json(),
+                OutFormat::Csv => cf.diff.to_csv(),
+            };
+            if let Err(e) = std::fs::write(diff_path, body) {
+                eprintln!("m1-eval: {}: {e}", diff_path.display());
+                process::exit(1);
+            }
+        }
+        return;
     }
 
     // Evaluate the scenario, if given.
