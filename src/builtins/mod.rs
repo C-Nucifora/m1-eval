@@ -133,10 +133,10 @@ pub fn dispatch(
 }
 
 /// Dispatch a method call whose `object` is not a firmware library object — it is
-/// a project object (a `Timer`, a CAN signal, …) carrying an *object method*
-/// (`Start`/`Remaining`/`Receive`/…) from the intrinsic registry. Only the
-/// stateful `Timer` methods are implemented in Phase 1; everything else fails
-/// loud.
+/// a project object (a `Timer`, an enum source, a CAN signal, …) carrying an
+/// *object method* (`AsInteger`/`Start`/`Remaining`/`Receive`/…) from the
+/// intrinsic registry. The enum `.AsInteger` accessor and the stateful `Timer`
+/// methods are implemented; everything else fails loud.
 fn dispatch_object_method(
     object: &str,
     method: &str,
@@ -144,6 +144,20 @@ fn dispatch_object_method(
     _site: CallSite,
     ctx: &mut EvalCtx,
 ) -> Result<Value, EvalError> {
+    // Enum `.AsInteger()` — always called with empty parens. The object is either
+    // an enum-type-qualified member literal (`Drive State.Idle`) or a
+    // value-holding enum source (an enum channel / value-compound). Resolved at
+    // runtime against the enum model; an object that is no enum source returns
+    // `Ok(None)` here and falls through to the Timer attempt below. An object that
+    // *is* an enum source but cannot convert (unknown member, unset channel)
+    // fails loud inside `as_integer`.
+    if method == "AsInteger"
+        && args.is_empty()
+        && let Some(v) = enum_conv::as_integer(object, ctx)?
+    {
+        return Ok(v);
+    }
+
     // The Timer object methods (Start/Stop/Reset/Remaining) are stateful and must
     // share one countdown across all of an object's method calls — so key the
     // state by the object *path*, not the individual call site. A canonical path
@@ -335,6 +349,22 @@ const SUPPORTED_METHODS: &[(&str, &str)] = &[
     ("Change", "Either"),
 ];
 
+/// Project-object methods supported regardless of the object's *name* — the
+/// object varies per project (a timer is `Startup Delay`, an enum source is
+/// `Drive State.Idle` or `Control.Drive State`), but the method name fixes the
+/// runtime route, so coverage classifies on the method alone:
+///
+/// - `AsInteger` is the enum→integer accessor (P15-B): resolved at runtime
+///   against the enum model. Like `Lookup`, coverage cannot see the value, so it
+///   is reported supported and the runtime fails loud if the object is not an
+///   enum source.
+/// - `Start`/`Stop`/`Reset`/`Remaining` are the project `Timer` object methods,
+///   evaluated by `stateful::timer` at runtime. They were already evaluated but
+///   the coverage report formerly flagged them unsupported; listing them here
+///   reconciles coverage with what `dispatch_object_method` actually does.
+const SUPPORTED_OBJECT_METHODS: &[&str] =
+    &["AsInteger", "Start", "Stop", "Reset", "Remaining"];
+
 /// The Tier-3 IO library objects: their methods are handled as documented/
 /// scenario-fed stubs (flagged externally driven), not faithfully evaluated.
 const STUB_OBJECTS: &[&str] = &["CanComms", "Serial", "System", "Logging"];
@@ -353,6 +383,13 @@ const STUB_METHODS: &[(&str, &str)] = &[("Math", "atan2")];
 /// and the runtime fails loud if the specific object is not a table).
 pub fn classify_builtin(object: &str, method: &str) -> BuiltinSupport {
     if method == "Lookup" {
+        return BuiltinSupport::Supported;
+    }
+    // Object-name-independent project-object methods (`AsInteger` enum accessor,
+    // the `Timer` Start/Stop/Reset/Remaining) — classified on the method alone,
+    // because the object spelling is the project symbol's name, not a fixed
+    // library object.
+    if SUPPORTED_OBJECT_METHODS.contains(&method) {
         return BuiltinSupport::Supported;
     }
     if SUPPORTED_METHODS.contains(&(object, method)) {
@@ -645,6 +682,129 @@ mod tests {
         match h.call("Calculate", "Lookup", &[Value::Float(0.0)]) {
             Err(EvalError::UnsupportedBuiltin { .. }) => {}
             other => panic!("expected UnsupportedBuiltin, got {other:?}"),
+        }
+    }
+
+    // ---- enum .AsInteger through dispatch (P15-B, Task 5) ----
+
+    /// A harness over the synthetic enums fixture so `.AsInteger` dispatch can
+    /// resolve the project-local `Drive State` enum and its enum-typed channel.
+    struct EnumHarness {
+        project: Project,
+        calib: Calibration,
+        env: Env,
+        state: StateStore,
+    }
+
+    impl EnumHarness {
+        fn new() -> EnumHarness {
+            let dir = Path::new(env!("CARGO_MANIFEST_DIR")).join("tests/fixtures/enums");
+            let loaded = crate::loader::load(&dir.join("Project.m1prj"), None)
+                .expect("enums fixture loads");
+            EnumHarness {
+                project: loaded.project,
+                calib: Calibration::default(),
+                env: Env::new(),
+                state: StateStore::new(),
+            }
+        }
+
+        fn enum_id(&self) -> usize {
+            self.project.symbols().enum_by_name("Drive State").unwrap()
+        }
+
+        fn ctx(&mut self) -> EvalCtx<'_> {
+            EvalCtx {
+                project: &self.project,
+                calib: &self.calib,
+                env: &mut self.env,
+                state: &mut self.state,
+                group: Some("Root.Demo"),
+                fn_symbol: Some("Root.Demo.Update"),
+                script_name: "Demo.Update.m1scr",
+                dt: 0.01,
+                trace: None,
+            }
+        }
+
+        fn call(&mut self, object: &str, method: &str, args: &[Value]) -> Result<Value, EvalError> {
+            let site = CallSite::new("Demo.Update.m1scr", 0);
+            let mut ctx = self.ctx();
+            dispatch(object, method, args, site, &mut ctx)
+        }
+    }
+
+    #[test]
+    fn dispatch_as_integer_on_enum_literal() {
+        let mut h = EnumHarness::new();
+        // `Drive State.Idle.AsInteger()` → 0 (ContainerOrder), via the literal form.
+        assert_eq!(
+            h.call("Drive State.Idle", "AsInteger", &[]).unwrap(),
+            Value::Int(0)
+        );
+        // Precharging is ContainerOrder 2.
+        assert_eq!(
+            h.call("Drive State.Precharging", "AsInteger", &[]).unwrap(),
+            Value::Int(2)
+        );
+    }
+
+    #[test]
+    fn dispatch_as_integer_on_enum_channel() {
+        let mut h = EnumHarness::new();
+        let id = h.enum_id();
+        h.env.set(
+            "Root.Demo.Mode",
+            Value::Enum {
+                id,
+                member: "Precharging".to_string(),
+            },
+        );
+        // The value form reads the channel's current enum value and converts it.
+        assert_eq!(
+            h.call("Root.Demo.Mode", "AsInteger", &[]).unwrap(),
+            Value::Int(2)
+        );
+    }
+
+    #[test]
+    fn dispatch_as_integer_on_non_enum_fails_loud() {
+        let mut h = EnumHarness::new();
+        // A name that is neither an enum literal nor an enum-typed project symbol:
+        // `.AsInteger` cannot convert it, so dispatch falls through to the Timer
+        // attempt and ultimately fails loud rather than guessing.
+        match h.call("No Such Thing", "AsInteger", &[]) {
+            Err(EvalError::UnsupportedBuiltin { method, .. }) => {
+                assert_eq!(method, "AsInteger");
+            }
+            other => panic!("expected UnsupportedBuiltin, got {other:?}"),
+        }
+    }
+
+    #[test]
+    fn as_integer_is_classified_supported() {
+        // Coverage reports `.AsInteger` supported on any object (resolved at
+        // runtime against the enum model, like `Lookup`).
+        assert_eq!(
+            classify_builtin("Drive State.Idle", "AsInteger"),
+            BuiltinSupport::Supported
+        );
+        assert_eq!(
+            classify_builtin("Control.Drive State", "AsInteger"),
+            BuiltinSupport::Supported
+        );
+    }
+
+    #[test]
+    fn timer_methods_are_classified_supported() {
+        // The project Timer methods are evaluated by `stateful::timer` at runtime;
+        // coverage now matches reality and reports them supported.
+        for method in ["Start", "Stop", "Reset", "Remaining"] {
+            assert_eq!(
+                classify_builtin("Startup Delay", method),
+                BuiltinSupport::Supported,
+                "Timer.{method} should be supported"
+            );
         }
     }
 }
