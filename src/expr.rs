@@ -995,12 +995,13 @@ mod tests {
     #[test]
     fn unimplemented_builtin_call_still_fails_loud() {
         let mut h = Harness::new();
-        // A stateful builtin (Filter.FirstOrder, M6) is not implemented yet, so a
-        // call to it must fail loud rather than no-op.
-        match rhs_value("Filter.FirstOrder(1.0, 0.1)", &mut h) {
+        // A buffered sample-delay (Delay.Signal15) is intentionally not
+        // implemented in Phase 1, so a call to it must fail loud rather than
+        // no-op — the stateful object is recognised but this method is not.
+        match rhs_value("Delay.Signal15(1.0, 3)", &mut h) {
             Err(EvalError::UnsupportedBuiltin { object, method }) => {
-                assert_eq!(object, "Filter");
-                assert_eq!(method, "FirstOrder");
+                assert_eq!(object, "Delay");
+                assert_eq!(method, "Signal15");
             }
             other => panic!("expected UnsupportedBuiltin, got {other:?}"),
         }

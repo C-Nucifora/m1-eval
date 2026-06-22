@@ -21,7 +21,9 @@
 
 pub mod calculate;
 pub mod convert;
+pub mod io_stub;
 pub mod limit;
+pub mod stateful;
 
 use crate::env::CallSite;
 use crate::error::EvalError;
@@ -49,7 +51,7 @@ pub fn dispatch(
     object: &str,
     method: &str,
     args: &[Value],
-    _site: CallSite,
+    site: CallSite,
     ctx: &mut EvalCtx,
 ) -> Result<Value, EvalError> {
     // 1. Table `.Lookup()` — the object is a project table symbol, not a library
@@ -66,6 +68,14 @@ pub fn dispatch(
     match object {
         "Calculate" | "Limit" | "Convert" => {
             validate_arity(object, method, args.len())?;
+            // A stateful `Calculate.*` method (Stable/Hysteresis/Between/Beyond)
+            // is a time-domain operator, not a pure one: route it to the stateful
+            // engine. The pure `Calculate.*` math stays in its own submodule.
+            if object == "Calculate" {
+                if let Some(v) = stateful::call(object, method, args, site.clone(), ctx)? {
+                    return Ok(v);
+                }
+            }
             let result = match object {
                 "Calculate" => calculate::call(method, args)?,
                 "Limit" => limit::call(method, args)?,
@@ -79,9 +89,47 @@ pub fn dispatch(
                 None => Err(unsupported(object, method)),
             }
         }
-        // 3. Not a pure library object and not a table lookup: unimplemented.
-        _ => Err(unsupported(object, method)),
+        // 3. Stateful (time-domain) library objects: each is a state machine keyed
+        //    by `site` and advanced by `ctx.dt`. Validate arity, then evaluate.
+        "Filter" | "Integral" | "Derivative" | "Debounce" | "Delay" | "Change" => {
+            validate_arity(object, method, args.len())?;
+            match stateful::call(object, method, args, site, ctx)? {
+                Some(v) => Ok(v),
+                // The object is stateful but this specific method is not yet
+                // implemented (e.g. the buffered `Delay.SignalN`): fail loud.
+                None => Err(unsupported(object, method)),
+            }
+        }
+        // 4. Tier-3 IO objects: scenario-fed / documented stubs.
+        "CanComms" | "Serial" | "System" | "Logging" => {
+            io_stub::call(object, method, args, ctx)
+        }
+        // 5. Not a library object and not a table lookup. It may be a project
+        //    object (e.g. a `Timer`) carrying an intrinsic object-method, or
+        //    something genuinely unsupported.
+        _ => dispatch_object_method(object, method, args, site, ctx),
     }
+}
+
+/// Dispatch a method call whose `object` is not a firmware library object — it is
+/// a project object (a `Timer`, a CAN signal, …) carrying an *object method*
+/// (`Start`/`Remaining`/`Receive`/…) from the intrinsic registry. Only the
+/// stateful `Timer` methods are implemented in Phase 1; everything else fails
+/// loud.
+fn dispatch_object_method(
+    object: &str,
+    method: &str,
+    args: &[Value],
+    site: CallSite,
+    ctx: &mut EvalCtx,
+) -> Result<Value, EvalError> {
+    // The Timer object methods (Start/Stop/Reset/Remaining) are stateful — route
+    // them to the stateful engine, which keys the countdown by `site` (one timer
+    // per textual occurrence of the object in this Phase-1 cone model).
+    if let Some(v) = stateful::timer(method, args, site, ctx)? {
+        return Ok(v);
+    }
+    Err(unsupported(object, method))
 }
 
 /// Attempt a table `.Lookup()`. Returns `Ok(Some(value))` when `object` resolves

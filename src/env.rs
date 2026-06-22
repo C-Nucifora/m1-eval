@@ -65,17 +65,51 @@ impl CallSite {
 
 /// Per-call-site state for a stateful builtin.
 ///
-/// M3 provides only the empty [`OpState::Uninit`] slot so [`StateStore::entry`]
-/// has something to default-construct; the M6 stateful-builtin milestone extends
-/// this enum with one variant per operator family (filter capacitor, integral
-/// accumulator, delay/debounce timer, `Change` previous-value, …). Keeping the
-/// default variant means a freshly-keyed site starts uninitialised and the
-/// operator seeds itself on first tick.
+/// A freshly-keyed site starts [`OpState::Uninit`]; the operator seeds the right
+/// variant on its first tick (so the discretisation has a defined previous
+/// value). One variant per M6 operator family. The variants are simple data
+/// holders — the update laws live in [`crate::builtins::stateful`], documented in
+/// our own words. The state is keyed by [`CallSite`], so two textual occurrences
+/// of the same operator keep independent state, and re-evaluating the same node
+/// each tick advances the same state machine.
 #[derive(Debug, Clone, Default, PartialEq)]
 pub enum OpState {
     /// No state has been recorded for this call site yet (first tick).
     #[default]
     Uninit,
+    /// First-order filter family (`Filter.FirstOrder/Maximum/Minimum`): the
+    /// previous filtered output `y[n-1]`.
+    Filter { y: f64 },
+    /// `Integral.Normal`: the running clamped accumulator and the previous input
+    /// (for trapezoidal area).
+    Integral { acc: f64, prev_x: f64 },
+    /// `Derivative.{Normal,Filtered}`: the previous input, plus the previous
+    /// filtered-derivative output for the `Filtered` variant.
+    Derivative { prev_x: f64, prev_d: f64 },
+    /// `Derivative.Adaptive`: the input value at the last accepted update, the
+    /// previous emitted derivative, and the time elapsed since the last update.
+    DerivativeAdaptive {
+        last_x: f64,
+        prev_d: f64,
+        elapsed: f64,
+    },
+    /// Debounce/Delay timer family (`Delay.Rising/Falling`, `Debounce.*`,
+    /// `Calculate.Stable/Hysteresis/Between/Beyond`, `Change.*` filtered):
+    /// the currently-held output, the candidate condition being timed, and the
+    /// time the candidate has been held.
+    Timed {
+        output: bool,
+        candidate: bool,
+        held: f64,
+    },
+    /// `Change.{By,Up,Down}`: the previous numeric argument value, plus a timer
+    /// and pending flag for the filtered overloads.
+    ChangeBy { prev_x: f64, held: f64, pending: bool },
+    /// `Change.{To,From,Either}`: the previous boolean condition, plus a timer
+    /// for the filtered overloads.
+    ChangeEdge { prev: bool, held: f64 },
+    /// A countdown `Timer` object: the remaining time and whether it is running.
+    Timer { remaining: f64, running: bool },
 }
 
 /// The per-call-site state map for stateful builtins. A new site defaults to
