@@ -21,6 +21,7 @@
 
 pub mod calculate;
 pub mod convert;
+pub mod enum_conv;
 pub mod io_stub;
 pub mod limit;
 pub mod stateful;

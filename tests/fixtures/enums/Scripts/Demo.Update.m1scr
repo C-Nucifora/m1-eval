@@ -1,0 +1,3 @@
+// Synthetic M1 script for m1-eval enum .AsInteger fixture tests. No proprietary content.
+// Exercises the enum-type-qualified literal form of .AsInteger.
+Mode = Drive State.Precharging.AsInteger();
