@@ -314,7 +314,8 @@ fn decode_channel_points(bytes: &[u8], ch: &M1Channel) -> Result<Vec<(f64, Value
 }
 
 /// Reject a channel whose samples we cannot decode correctly. Returns a fail-loud
-/// [`EvalError`] for a non-zero offset or a zero sample rate — otherwise `Ok(())`.
+/// [`EvalError`] for a non-zero offset, a zero sample rate, or a zero
+/// engineering-unit scale (the decode divisor) — otherwise `Ok(())`.
 /// (An unrecognised datatype is already rejected at metadata-parse time.)
 fn check_decodable(ch: &M1Channel) -> Result<(), EvalError> {
     // The documented engineering-unit decode assumes a zero raw-sample offset.
@@ -333,6 +334,18 @@ fn check_decodable(ch: &M1Channel) -> Result<(), EvalError> {
         return Err(EvalError::UnsupportedConstruct {
             kind: format!(
                 "`.ld` channel `{}` has a zero sample rate (no time base)",
+                ch.name
+            ),
+            at: 0,
+        });
+    }
+    // The engineering-unit decode divides by `scale`; a zero scale would divide by
+    // zero and produce inf/NaN samples silently.
+    if ch.scale == 0 {
+        return Err(EvalError::UnsupportedConstruct {
+            kind: format!(
+                "`.ld` channel `{}` has a zero engineering-unit scale (divisor), \
+                 which would produce inf/NaN samples",
                 ch.name
             ),
             at: 0,
@@ -422,7 +435,7 @@ pub fn from_ld(bytes: &[u8], source: impl Into<String>) -> Result<Log, EvalError
 
 #[cfg(test)]
 mod tests {
-    use super::{M1Channel, M1Datatype, from_ld};
+    use super::{M1Channel, M1Datatype, check_decodable, from_ld};
     use crate::error::EvalError;
     use crate::scenario::InputKind;
     use crate::value::Value;
@@ -780,5 +793,18 @@ mod tests {
             }
             other => panic!("expected fail-loud on zero sample rate, got {other:?}"),
         }
+    }
+
+    #[test]
+    fn zero_scale_fails_loud() {
+        // The engineering-unit decode divides by `scale`; a zero scale would yield
+        // inf/NaN samples silently. Reject it up front, like the zero-sample-rate
+        // guard.
+        let mut ch = m1_channel(M1Datatype::I16);
+        ch.scale = 0;
+        assert!(
+            check_decodable(&ch).is_err(),
+            "a zero engineering-unit scale must fail loud, not decode to inf/NaN"
+        );
     }
 }
