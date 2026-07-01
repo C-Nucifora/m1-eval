@@ -836,10 +836,19 @@ pub fn run_counterfactual(
     };
 
     // Build the downstream cone of the override channels: the only functions that
-    // recompute. Fails loud when no function reads any override channel.
+    // recompute. Fails loud when a (non-empty) override targets a channel no
+    // function reads. With NO overrides, however, there is nothing to recompute:
+    // the cone is empty and the tick loop reproduces the log verbatim — the
+    // documented no-op invariant (`--log` with no `--override`). Guard the empty
+    // case so `build_downstream_cone`'s empty-seed fail-loud is reserved for a real
+    // no-reader override.
     let override_channels: Vec<String> =
         overrides.iter().map(|o| o.channel().to_string()).collect();
-    let cone = build_downstream_cone(loaded, &override_channels)?;
+    let cone = if override_channels.is_empty() {
+        Vec::new()
+    } else {
+        build_downstream_cone(loaded, &override_channels)?
+    };
 
     // Canonicalise the log series and each override channel against the project
     // scope (the cone's first function), so `Sensor` and `Root.CF.Sensor` address
@@ -1884,6 +1893,43 @@ base_rate_hz = 100.0
             2,
             "default duration = log.duration_s (0.02)"
         );
+    }
+
+    #[test]
+    fn counterfactual_no_override_reproduces_log() {
+        // The documented no-op invariant: `--log` with NO `--override` reproduces
+        // the logged series verbatim and the changed-channel set is empty. With no
+        // overrides there is no downstream cone to build, so nothing recomputes —
+        // every logged channel passes through at its logged value. (Regression:
+        // this used to fail loud with `no function reads override channel(s) []`.)
+        let loaded = counterfactual();
+        let log = consistent_log();
+        let cfg = CounterfactualCfg {
+            base_rate_hz: 100.0,
+            duration_s: 0.03,
+        };
+        let trace = run_counterfactual(&loaded, &log, &[], &cfg).expect("no-op cf runs");
+
+        // Every logged channel is reproduced verbatim at its logged keyframes.
+        assert_eq!(floats(&trace, "Root.CF.Sensor"), vec![10.0, 20.0, 30.0]);
+        assert_eq!(floats(&trace, "Root.CF.Mid"), vec![20.0, 40.0, 60.0]);
+        assert_eq!(floats(&trace, "Root.CF.Result"), vec![21.0, 41.0, 61.0]);
+        assert_eq!(floats(&trace, "Root.CF.Other"), vec![42.0, 42.0, 42.0]);
+
+        // The changed-channel set is empty: the counterfactual trace equals the log
+        // sampled on the same grid, so no channel moved.
+        let log_inputs = canonicalise(&log.channels, &loaded, None, None);
+        for (path, series) in &log_inputs {
+            let cf = floats(&trace, path);
+            for (i, value) in cf.iter().enumerate() {
+                let t = i as f64 / cfg.base_rate_hz;
+                let logged = match series.sample(t) {
+                    Value::Float(x) => x,
+                    other => panic!("expected float in log {path:?}, got {other:?}"),
+                };
+                assert_eq!(*value, logged, "channel {path:?} unchanged at tick {i}");
+            }
+        }
     }
 
     #[test]
