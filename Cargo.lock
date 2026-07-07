@@ -283,8 +283,8 @@ checksum = "32a66949e030da00e8c7d4434b251670a91556f4144941d37452769c25d58a53"
 
 [[package]]
 name = "m1-core"
-version = "0.14.1"
-source = "git+https://github.com/C-Nucifora/m1-core.git?tag=v0.14.1#7c265135542617ef2bf45515181fe41f3e6a0f76"
+version = "0.15.0"
+source = "git+https://github.com/C-Nucifora/m1-core.git?tag=v0.15.0#1fe6f9ad4d6a0479c5cfeb770270fab0f89e8f89"
 dependencies = [
  "tree-sitter",
  "tree-sitter-m1",
@@ -292,7 +292,7 @@ dependencies = [
 
 [[package]]
 name = "m1-eval"
-version = "0.2.0"
+version = "0.2.1"
 dependencies = [
  "assert_cmd",
  "clap",
@@ -309,8 +309,8 @@ dependencies = [
 
 [[package]]
 name = "m1-typecheck"
-version = "0.42.1"
-source = "git+https://github.com/C-Nucifora/m1-typecheck.git?tag=v0.42.1#7ba1af94a0a74aeaf1309561ecebcb66cc3c4f28"
+version = "0.45.1"
+source = "git+https://github.com/C-Nucifora/m1-typecheck.git?tag=v0.45.1#a8af044a844ec762213ac0944f2e4d602188f761"
 dependencies = [
  "clap",
  "m1-core",
@@ -323,8 +323,8 @@ dependencies = [
 
 [[package]]
 name = "m1-workspace"
-version = "0.12.0"
-source = "git+https://github.com/nedlane/m1-workspace.git?tag=v0.12.0#3612f48925dc57960deb9325ec82494e1d16cfc1"
+version = "0.13.0"
+source = "git+https://github.com/nedlane/m1-workspace.git?tag=v0.13.0#cf1b5b862d255cc4ecb89a7b708016bd9a9f33db"
 dependencies = [
  "serde",
  "serde_ignored",
@@ -694,8 +694,8 @@ checksum = "009994f150cc0cd50ff54917d5bc8bffe8cad10ca10d81c34da2ec421ae61782"
 
 [[package]]
 name = "tree-sitter-m1"
-version = "0.7.1"
-source = "git+https://github.com/C-Nucifora/tree-sitter-m1.git?tag=v0.7.1#7d31d2415934d0546c86765b1c38a033e52653ae"
+version = "0.8.0"
+source = "git+https://github.com/C-Nucifora/tree-sitter-m1.git?tag=v0.8.0#e9dbd45be91c0771105637924a2c5c87ae17c1fb"
 dependencies = [
  "cc",
  "tree-sitter-language",
