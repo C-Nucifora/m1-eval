@@ -147,27 +147,37 @@ fn resolve_base_rate(scenario: &Scenario, schedule: &[ScheduledRated]) -> Result
             at: 0,
         });
     }
-    let mut lcm_mhz: u64 = 1;
-    for r in schedule {
-        let mhz = millihertz(r.rate_hz).ok_or_else(|| EvalError::UnsupportedConstruct {
-            kind: format!(
-                "cannot schedule rate {} Hz exactly (not representable in whole millihertz)",
-                r.rate_hz
-            ),
-            at: 0,
-        })?;
-        lcm_mhz = lcm_mhz / gcd(lcm_mhz, mhz) * mhz;
-        // 1 MHz cap: beyond this the tick grid explodes; ask for an explicit base.
+    lcm_rate_hz(schedule.iter().map(|r| r.rate_hz)).ok_or_else(|| EvalError::UnsupportedConstruct {
+        kind: "no practical exact common base for the scheduled rates (a rate is not \
+               representable in whole millihertz, or the lcm exceeds 1 MHz); pin \
+               base_rate_hz to a rate every scheduled rate divides exactly"
+            .to_string(),
+        at: 0,
+    })
+}
+
+/// The least common multiple of `rates` as an exact base rate in Hz — the
+/// smallest grid every rate divides with an integer tick period. `None` when
+/// the iterator is empty, a rate is not representable in whole millihertz, or
+/// the lcm exceeds the 1 MHz cap (beyond which the tick grid explodes).
+pub(crate) fn lcm_rate_hz(rates: impl IntoIterator<Item = f64>) -> Option<f64> {
+    let mut lcm_mhz: u64 = 0;
+    for r in rates {
+        let mhz = millihertz(r)?;
+        lcm_mhz = if lcm_mhz == 0 {
+            mhz
+        } else {
+            lcm_mhz / gcd(lcm_mhz, mhz) * mhz
+        };
         if lcm_mhz > 1_000_000_000 {
-            return Err(EvalError::UnsupportedConstruct {
-                kind: "no practical exact common base for the scheduled rates (lcm exceeds \
-                       1 MHz); pin base_rate_hz to a rate every scheduled rate divides exactly"
-                    .to_string(),
-                at: 0,
-            });
+            return None;
         }
     }
-    Ok(lcm_mhz as f64 / 1000.0)
+    if lcm_mhz == 0 {
+        None
+    } else {
+        Some(lcm_mhz as f64 / 1000.0)
+    }
 }
 
 /// A rate as exact integer millihertz, or `None` when it is not representable
@@ -952,14 +962,41 @@ pub fn run_counterfactual(
     // The union of channels the cone writes, so a cone function that does not run
     // on a tick holds its last value (zero-order hold) — reusing the schedule-write
     // hold machinery the tick loop already relies on.
+    //
+    // Each cone function keeps its **declared** project rate (its trigger's
+    // `call_rate_hz`): a 10 Hz state machine in the cone runs every 10th tick of
+    // a 100 Hz replay with dt = 0.1 s, exactly as scheduled on the ECU — not
+    // once per base tick, which over-ran slow filters/integrators/debounce
+    // logic 10x. A function without a resolvable periodic rate (no trigger)
+    // falls back to the base rate, preserving the pre-rate behaviour for
+    // untriggered fixtures.
     let rated: Vec<ScheduledRated> = cone
         .into_iter()
-        .map(|sched| ScheduledRated {
-            sched,
-            rate_hz: base_rate_hz,
+        .map(|sched| {
+            let rate_hz = sched
+                .fn_symbol
+                .as_deref()
+                .and_then(|f| loaded.project.symbols().get(f))
+                .and_then(|s| s.call_rate_hz)
+                .unwrap_or(base_rate_hz);
+            ScheduledRated { sched, rate_hz }
         })
         .collect();
     let scheduled_writes = schedule_writes(loaded, &rated);
+
+    // Exact per-function divisors and dt on the replay grid — the same exactness
+    // rule as the whole-project scheduler: a base that cannot represent a cone
+    // rate exactly is rejected loudly rather than rounded.
+    let plans: Vec<RunPlan> = rated
+        .iter()
+        .map(|r| {
+            let divisor = exact_divisor(base_rate_hz, r.rate_hz, r.sched.fn_symbol.as_deref())?;
+            Ok(RunPlan {
+                divisor,
+                dt: 1.0 / r.rate_hz,
+            })
+        })
+        .collect::<Result<_, EvalError>>()?;
 
     let ticks = tick_count(duration_s, base_rate_hz);
     let mut env = Env::new();
@@ -1030,10 +1067,14 @@ pub fn run_counterfactual(
         // 3. Open the tick.
         trace.push_tick(t);
 
-        // 4. Run only the cone functions, writer-before-reader. Each recomputes its
+        // 4. Run only the cone functions, writer-before-reader, each gated to its
+        //    own declared rate with its own period as dt. Each recomputes its
         //    downstream channel from the overridden inputs; everything else holds
         //    its logged (or overridden) value.
-        for rated in &rated {
+        for (rated, plan) in rated.iter().zip(plans.iter()) {
+            if i % plan.divisor != 0 {
+                continue;
+            }
             let sched = &rated.sched;
             let root = sched.script.cst.root();
             let mut ctx = EvalCtx {
@@ -1044,7 +1085,7 @@ pub fn run_counterfactual(
                 group: sched.group.as_deref(),
                 fn_symbol: sched.fn_symbol.as_deref(),
                 script_name: &sched.script.name,
-                dt: 1.0 / base_rate_hz,
+                dt: plan.dt,
                 scripts: &loaded.scripts,
                 depth: 0,
                 trace: Some(&mut trace),
@@ -2032,6 +2073,100 @@ base_rate_hz = 100.0
         // (c) Other is unrelated to the override cone: it passes through at its
         //     logged value (42) — C never runs in the cone.
         assert_eq!(floats(&trace, "Root.CF.Other"), vec![42.0, 42.0, 42.0]);
+    }
+
+    #[test]
+    fn counterfactual_preserves_declared_function_rates() {
+        // The cfrate fixture schedules Root.CR.Slow at 10 Hz. A counterfactual
+        // replay over a 100 Hz log must still run it at 10 Hz — every 10th base
+        // tick, with dt = 0.1 s — not once per base tick at dt = 0.01 s. The old
+        // implementation assigned every cone function the counterfactual base
+        // rate, so slow state machines/integrators ran 10x too often.
+        //
+        // Slow Ramp is a trapezoidal Integral.Normal of the constant 1: run k
+        // holds dt*k, so over a 1 s replay at 10 Hz it ends at 0.1*9 = 0.9 with
+        // exactly 9 plateau transitions (10 runs). The base-rate bug would end
+        // at 0.01*99 = 0.99 with 99 transitions.
+        let dir = Path::new(env!("CARGO_MANIFEST_DIR")).join("tests/fixtures/cfrate");
+        let loaded = load(&dir.join("Project.m1prj"), None).expect("cfrate fixture loads");
+        let n = 100;
+        let sensor = InputSeries {
+            channel: "Root.CR.Sensor".to_string(),
+            kind: InputKind::Series(
+                (0..n)
+                    .map(|i| (i as f64 * 0.01, Value::Float(5.0)))
+                    .collect(),
+            ),
+        };
+        let log = Log {
+            channels: vec![sensor],
+            meta: LogMeta {
+                source: "synthetic-cfrate".to_string(),
+                duration_s: 1.0,
+                channel_count: 1,
+                units: BTreeMap::new(),
+            },
+        };
+        let overrides = vec![Override::parse("Root.CR.Sensor=7.0").expect("parses")];
+        let cfg = CounterfactualCfg {
+            base_rate_hz: 100.0,
+            duration_s: 1.0,
+        };
+        let trace = run_counterfactual(&loaded, &log, &overrides, &cfg).expect("cf runs");
+
+        assert_eq!(trace.time.len(), 100, "1 s @ 100 Hz base grid");
+        let ramp = floats(&trace, "Root.CR.Slow Ramp");
+        let transitions = ramp.windows(2).filter(|w| w[1] != w[0]).count();
+        assert_eq!(
+            transitions, 9,
+            "10 Hz function runs 10 times over 1 s (9 ramp transitions), got {transitions}"
+        );
+        let last = *ramp.last().unwrap();
+        assert!(
+            (last - 0.9).abs() < 1e-9,
+            "dt = 0.1 s per run: final ramp 0.9, got {last}"
+        );
+        // The cone recompute itself still applies every run: Slow Echo reflects
+        // the overridden Sensor, held between runs.
+        let echo = floats(&trace, "Root.CR.Slow Echo");
+        assert!(
+            echo.iter().all(|v| *v == 14.0),
+            "Slow Echo = overridden Sensor * 2 on every tick (held between runs)"
+        );
+    }
+
+    #[test]
+    fn counterfactual_base_that_cannot_represent_a_cone_rate_is_rejected() {
+        // A counterfactual base the cone's declared rate does not divide exactly
+        // must fail loud, mirroring the whole-project scheduler's exactness rule.
+        // 25 Hz cannot represent the 10 Hz function (25/10 = 2.5).
+        let dir = Path::new(env!("CARGO_MANIFEST_DIR")).join("tests/fixtures/cfrate");
+        let loaded = load(&dir.join("Project.m1prj"), None).expect("cfrate fixture loads");
+        let sensor = InputSeries {
+            channel: "Root.CR.Sensor".to_string(),
+            kind: InputKind::Series(vec![(0.0, Value::Float(5.0))]),
+        };
+        let log = Log {
+            channels: vec![sensor],
+            meta: LogMeta {
+                source: "synthetic-cfrate".to_string(),
+                duration_s: 1.0,
+                channel_count: 1,
+                units: BTreeMap::new(),
+            },
+        };
+        let overrides = vec![Override::parse("Root.CR.Sensor=7.0").expect("parses")];
+        let cfg = CounterfactualCfg {
+            base_rate_hz: 25.0,
+            duration_s: 1.0,
+        };
+        let err = run_counterfactual(&loaded, &log, &overrides, &cfg)
+            .expect_err("25 Hz base with a 10 Hz cone function must fail");
+        let msg = format!("{err}");
+        assert!(
+            msg.contains("25") && msg.contains("cannot schedule"),
+            "error names the base and the exactness failure: {msg}"
+        );
     }
 
     #[test]

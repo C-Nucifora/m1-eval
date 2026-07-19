@@ -1,0 +1,28 @@
+<?xml version="1.0"?>
+<!-- Synthetic m1-eval cfrate fixture. No proprietary MoTeC content.         -->
+<!-- One 10 Hz function downstream of Sensor: a counterfactual replay at a   -->
+<!-- faster base (e.g. the 100 Hz log grid) must still run it at 10 Hz with  -->
+<!-- dt = 0.1 s, not once per base tick.                                     -->
+<MoTeCM1BuildSession>
+ <Project Name="CFRate" TargetHardware="ecu120">
+  <ComponentStream><List>
+   <Component Classname="BuiltIn.GroupCompound" Name="Root.CR"/>
+   <Component Classname="BuiltIn.GroupCompound" Name="Root.Events"/>
+   <Component Classname="BuiltIn.EventKernel" Name="Root.Events.On 10Hz"/>
+   <Component Classname="BuiltIn.EventKernel" Name="Root.Events.On 4Hz"/>
+
+   <Component Classname="BuiltIn.Channel" Name="Root.CR.Sensor"><Props Type="f32"/></Component>
+   <Component Classname="BuiltIn.Channel" Name="Root.CR.Slow Echo"><Props Type="f32"/></Component>
+   <Component Classname="BuiltIn.Channel" Name="Root.CR.Slow Ramp"><Props Type="f32"/></Component>
+
+   <Component Classname="BuiltIn.Channel" Name="Root.CR.Four Echo"><Props Type="f32"/></Component>
+
+   <Component Classname="BuiltIn.FuncUser" Filename="CR.Slow.m1scr" Name="Root.CR.Slow">
+    <Props SelectedTrigger="Root.Events.On 10Hz"/>
+   </Component>
+   <Component Classname="BuiltIn.FuncUser" Filename="CR.Four.m1scr" Name="Root.CR.Four">
+    <Props SelectedTrigger="Root.Events.On 4Hz"/>
+   </Component>
+  </List></ComponentStream>
+ </Project>
+</MoTeCM1BuildSession>
