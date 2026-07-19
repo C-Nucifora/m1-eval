@@ -158,6 +158,13 @@ override, leave everything else at its logged value, and emit both the new
   the forward dependency cone, the mirror of the upstream cone runner — recompute;
   unrelated channels pass through at their logged value. An override expression
   may read the channel's **logged** value (`CH=CH*1.05` means "5% above the log").
+- **Cone functions keep their declared rates.** Each cone function runs at its
+  project rate (its trigger's Hz) on the replay grid, with its own period as
+  `dt` — a 10 Hz state machine in the cone of a 100 Hz replay still runs every
+  10th tick with `dt = 0.1 s`, exactly as scheduled on the ECU. The default
+  replay base is the lcm of the project's rates (the smallest grid every rate
+  divides exactly); a pinned base that cannot represent a cone rate exactly is
+  rejected loudly.
 - **Diff.** `--diff <PATH>` writes the per-channel logged-vs-counterfactual delta:
   which channels moved, by how much, and which are unchanged.
 - **Source precedence.** calibration < scenario < **log** < **override**.

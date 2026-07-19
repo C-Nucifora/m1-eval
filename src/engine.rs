@@ -160,9 +160,11 @@ impl Engine {
     ///
     /// Source precedence is calibration < log < override. Requires a log to have
     /// been attached with [`Engine::load_log`] first; without one there is no ground
-    /// truth to replay, which fails loud. The base tick rate defaults to the
-    /// project's fastest scheduled call rate (or 100 Hz when the project schedules
-    /// nothing periodically); the duration defaults to the log's own duration.
+    /// truth to replay, which fails loud. The base tick rate defaults to the least
+    /// common multiple of the project's scheduled call rates — the smallest grid
+    /// every cone function's declared rate divides exactly (100 Hz when the project
+    /// schedules nothing periodically); the duration defaults to the log's own
+    /// duration. Each cone function keeps its declared rate on that grid.
     /// Deterministic: the same log and overrides always yield the same trace.
     ///
     /// (Milestone P3-C wraps this in a `Counterfactual { trace, diff }`; this
@@ -201,22 +203,24 @@ impl Engine {
     /// counterfactual recomputes only the override cone, but the grid rate governs
     /// stateful-operator `dt`, so a project-derived default is the faithful choice.
     fn default_counterfactual_rate(&self) -> f64 {
-        self.loaded
-            .scripts
-            .iter()
-            .filter_map(|script| {
-                let fn_symbol = self
-                    .loaded
-                    .project
-                    .function_symbol_for_script(&script.name)?;
-                self.loaded
-                    .project
-                    .symbols()
-                    .get(&fn_symbol)
-                    .and_then(|s| s.call_rate_hz)
-            })
-            .fold(None::<f64>, |acc, r| Some(acc.map_or(r, |m| m.max(r))))
-            .unwrap_or(100.0)
+        // The lcm of the declared rates — the smallest grid every cone function
+        // divides exactly, mirroring the whole-project auto base. The fastest
+        // rate is NOT sufficient: rates {10, 4} need a 20 Hz grid, and the
+        // replay preserves each cone function's declared rate, so the base must
+        // represent them all. 100 Hz when the project schedules nothing
+        // periodically (or no exact common base exists under the 1 MHz cap).
+        crate::runner::lcm_rate_hz(self.loaded.scripts.iter().filter_map(|script| {
+            let fn_symbol = self
+                .loaded
+                .project
+                .function_symbol_for_script(&script.name)?;
+            self.loaded
+                .project
+                .symbols()
+                .get(&fn_symbol)
+                .and_then(|s| s.call_rate_hz)
+        }))
+        .unwrap_or(100.0)
     }
 
     /// Evaluate a scenario, producing a [`Trace`] of channel/expression values
@@ -248,6 +252,27 @@ mod tests {
             Some(&dir.join("parameters.m1cfg")),
         )
         .expect("mini fixture loads through the engine")
+    }
+
+    #[test]
+    fn default_counterfactual_base_covers_non_dividing_rates() {
+        // The cfrate fixture schedules 10 Hz and 4 Hz functions, both downstream
+        // of Sensor. The default counterfactual base must be a rate BOTH divide
+        // exactly — their lcm, 20 Hz. The old "fastest declared rate" default
+        // (10 Hz) cannot represent the 4 Hz cone function (10/4 = 2.5) and the
+        // replay would fail loud.
+        let dir = Path::new(env!("CARGO_MANIFEST_DIR")).join("tests/fixtures/cfrate");
+        let mut engine = Engine::load(&dir.join("Project.m1prj"), None).expect("cfrate loads");
+        let csv = "time,Root.CR.Sensor\n0.0,5.0\n0.5,5.0\n1.0,5.0\n";
+        let (_dir, path) = temp_log("csv", csv);
+        engine.load_log(&path).expect("log loads");
+        engine
+            .override_channel("Root.CR.Sensor=7.0")
+            .expect("override parses");
+        let trace = engine
+            .run_counterfactual()
+            .expect("default base must schedule both 10 and 4 Hz exactly");
+        assert!(!trace.time.is_empty());
     }
 
     #[test]
