@@ -40,10 +40,12 @@ dependency-cone runners.
 
 ## What it adds (Phase 2 — the whole-project multi-rate scheduler)
 
-**Phase 2** turns the engine into a faithful **mini-ECU**: instead of running one
+**Phase 2** adds the whole-project multi-rate scheduler: instead of running one
 function or one dependency cone, the `whole-project` mode runs *every*
 periodically-scheduled function each tick at its own rate, over a fixed duration,
-producing one deterministic `Trace`. Select it with `mode = "whole-project"` in
+producing one deterministic `Trace`. It models the ECU's *schedule*, not the
+ECU itself — execution budgets, stalls, preemption, and watchdog effects are
+out of scope. Select it with `mode = "whole-project"` in
 the scenario or the `--whole-project` CLI flag (which overrides the scenario's
 mode and is mutually exclusive with `--function` / `--target`).
 
@@ -53,8 +55,10 @@ The multi-rate model:
   `.m1prj` trigger — a `BuiltIn.EventKernel` clock such as `On 500Hz` /
   `On 50Hz` — surfaced by `m1-typecheck` as the symbol's `call_rate_hz`. Every
   function with a resolvable periodic rate (500 / 200 / 50 / 10 / 2 Hz) is
-  scheduled; an `On Startup` or untriggered function (rate `None`) is **not** run
-  by the scheduler and is flagged *unscheduled* in `--coverage`.
+  scheduled. An `On Startup` function runs **exactly once**, before the first
+  periodic tick (its outputs hold from tick 0). Untriggered and
+  `$(…)`-parameterised-trigger functions are **not** run and are flagged
+  *unscheduled* in `--coverage`.
 - **Base tick + exact rate divisors.** The run advances on one base tick grid.
   When `base_rate_hz` is unset it defaults to the **least common multiple** of
   the scheduled rates, so every function has an exact integer tick period —
@@ -85,10 +89,18 @@ The multi-rate model:
 
 - **Deterministic.** A fixed tick grid and explicit `dt`, no wall-clock and no
   RNG: the same scenario always produces the same `Trace`.
-- **Fail-loud.** The evaluator never substitutes a guessed or default number. An
-  unimplemented builtin, an unsupported construct, a missing calibration value,
-  an unresolved symbol, or a missing scenario input all surface as an error and
-  abort the run — never a silently-wrong value.
+- **Fail-loud.** By default the evaluator never substitutes a guessed number. An
+  unimplemented builtin, an unsupported construct, an unresolved symbol, or a
+  missing scenario input all surface as an error and abort the run — never a
+  silently-wrong value. Whole-project mode may opt in to
+  **`allow_default_inputs`** (scenario field or `--allow-default-inputs`):
+  unseeded channel reads then fall back to their type-correct startup defaults,
+  and **every substitution is reported** (channel, substituted value, first
+  reading script) — visible guessing, never silent. Arithmetic errors are not
+  inputs: integer division/modulo by zero always fails loud, opt-in or not.
+  (An unseeded *parameter* still reads as its type-correct tunable default —
+  parameters are calibration values with real defaults in M1 Tune, not runtime
+  inputs.)
 
 ### `--coverage`
 

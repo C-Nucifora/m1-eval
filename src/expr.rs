@@ -359,6 +359,9 @@ pub(crate) fn read_symbol(canon: &str, ctx: &mut EvalCtx) -> Result<Value, EvalE
                 let value_type = symbol.map(|s| s.value_type).unwrap_or(ValueType::Unknown);
                 let default = typed_io_input_default(value_type, ctx.project);
                 if let Some(trace) = ctx.trace.as_deref_mut() {
+                    // Report the substitution honestly: the channel, the value
+                    // GUESSED for it, and the script whose read triggered it.
+                    trace.mark_defaulted(canon, default.clone(), ctx.script_name);
                     trace.mark_external(canon);
                 }
                 Ok(default)
@@ -589,7 +592,7 @@ fn eval_binary(node: &Node, ctx: &mut EvalCtx) -> Result<Value, EvalError> {
     // The remaining operators (arithmetic, comparison, equality, bitwise/shift)
     // operate on the two evaluated values; share that core with the compound
     // assignment operators. An unhandled token reports its byte offset.
-    apply_binary_values(kind, &l, &r, ctx.env.default_unseeded_channels).map_err(|e| match e {
+    apply_binary_values(kind, &l, &r).map_err(|e| match e {
         EvalError::UnsupportedConstruct { kind, .. } => EvalError::UnsupportedConstruct {
             kind,
             at: op.byte_range().start,
@@ -604,22 +607,16 @@ fn eval_binary(node: &Node, ctx: &mut EvalCtx) -> Result<Value, EvalError> {
 /// assignment operators (`+=`, `&=`, …). Logical/short-circuit operators are
 /// intentionally excluded — they are handled in [`eval_binary`] before both
 /// operands are evaluated, and compound assignment never targets them.
-/// `div_by_zero_yields_zero` makes integer `/` and `%` by zero return `0` instead
-/// of failing loud — the documented M1 firmware behaviour, enabled in
-/// whole-project mode where the all-default offline input world can produce a
-/// degenerate zero divisor that real calibration/CAN data would not. `false`
-/// (single-function/cone mode) keeps the fail-loud guard so a genuine zero divisor
-/// in user-supplied inputs surfaces.
-pub(crate) fn apply_binary_values(
-    op: Kind,
-    l: &Value,
-    r: &Value,
-    div_by_zero_yields_zero: bool,
-) -> Result<Value, EvalError> {
+/// Integer `/` and `%` by zero always fail loud, in every mode: an arithmetic
+/// error is not a missing input, so it is never converted into a value — not
+/// even under the whole-project `allow_default_inputs` opt-in (whose scope is
+/// unseeded *reads* only). No firmware documentation substantiates a
+/// divide-by-zero-yields-zero behaviour; if that evidence ever appears, the
+/// behaviour belongs here unconditionally with the citation, not gated on
+/// offline defaulting.
+pub(crate) fn apply_binary_values(op: Kind, l: &Value, r: &Value) -> Result<Value, EvalError> {
     match op {
-        Kind::Plus | Kind::Minus | Kind::Star | Kind::Slash | Kind::Percent => {
-            arithmetic(op, l, r, div_by_zero_yields_zero)
-        }
+        Kind::Plus | Kind::Minus | Kind::Star | Kind::Slash | Kind::Percent => arithmetic(op, l, r),
         Kind::Lt | Kind::Gt | Kind::LtEq | Kind::GtEq => compare(op, l, r),
         Kind::Eq | Kind::EqEq => Ok(Value::Bool(values_equal(l, r)?)),
         Kind::Neq | Kind::BangEq => Ok(Value::Bool(!values_equal(l, r)?)),
@@ -634,12 +631,7 @@ pub(crate) fn apply_binary_values(
 /// Apply an arithmetic operator. Integer/unsigned operands stay integral (with
 /// the result kind chosen by `numeric_join`); any float operand promotes to
 /// float. Division/modulo by zero fail loud rather than producing NaN/inf.
-fn arithmetic(
-    op: Kind,
-    l: &Value,
-    r: &Value,
-    div_by_zero_yields_zero: bool,
-) -> Result<Value, EvalError> {
+fn arithmetic(op: Kind, l: &Value, r: &Value) -> Result<Value, EvalError> {
     let lt = value_type(l);
     let rt = value_type(r);
     let joined = numeric_join(lt, rt);
@@ -661,12 +653,12 @@ fn arithmetic(
         ValueType::Unsigned => {
             let a = as_u64(l)?;
             let b = as_u64(r)?;
-            int_op_u64(op, a, b, div_by_zero_yields_zero)
+            int_op_u64(op, a, b)
         }
         ValueType::Integer => {
             let a = as_i64(l)?;
             let b = as_i64(r)?;
-            int_op_i64(op, a, b, div_by_zero_yields_zero)
+            int_op_i64(op, a, b)
         }
         // One operand is non-numeric (Bool/Enum/String) or Unknown.
         _ => Err(EvalError::TypeError {
@@ -675,20 +667,20 @@ fn arithmetic(
     }
 }
 
-fn int_op_i64(op: Kind, a: i64, b: i64, div_by_zero_yields_zero: bool) -> Result<Value, EvalError> {
+fn int_op_i64(op: Kind, a: i64, b: i64) -> Result<Value, EvalError> {
     let out = match op {
         Kind::Plus => a.wrapping_add(b),
         Kind::Minus => a.wrapping_sub(b),
         Kind::Star => a.wrapping_mul(b),
         Kind::Slash => {
             if b == 0 {
-                return zero_divisor_result(div_by_zero_yields_zero).map(Value::Int);
+                return Err(div_by_zero());
             }
             a.wrapping_div(b)
         }
         Kind::Percent => {
             if b == 0 {
-                return zero_divisor_result(div_by_zero_yields_zero).map(Value::Int);
+                return Err(div_by_zero());
             }
             a.wrapping_rem(b)
         }
@@ -697,37 +689,26 @@ fn int_op_i64(op: Kind, a: i64, b: i64, div_by_zero_yields_zero: bool) -> Result
     Ok(Value::Int(out))
 }
 
-fn int_op_u64(op: Kind, a: u64, b: u64, div_by_zero_yields_zero: bool) -> Result<Value, EvalError> {
+fn int_op_u64(op: Kind, a: u64, b: u64) -> Result<Value, EvalError> {
     let out = match op {
         Kind::Plus => a.wrapping_add(b),
         Kind::Minus => a.wrapping_sub(b),
         Kind::Star => a.wrapping_mul(b),
         Kind::Slash => {
             if b == 0 {
-                return zero_divisor_result(div_by_zero_yields_zero).map(|z| Value::Uint(z as u64));
+                return Err(div_by_zero());
             }
             a.wrapping_div(b)
         }
         Kind::Percent => {
             if b == 0 {
-                return zero_divisor_result(div_by_zero_yields_zero).map(|z| Value::Uint(z as u64));
+                return Err(div_by_zero());
             }
             a.wrapping_rem(b)
         }
         _ => unreachable!(),
     };
     Ok(Value::Uint(out))
-}
-
-/// The result of an integer divide/modulo by zero. In whole-project mode it is the
-/// documented M1 firmware result `0` (the ECU never traps); otherwise it is a
-/// fail-loud [`EvalError`] so a genuine zero divisor in user inputs surfaces.
-fn zero_divisor_result(div_by_zero_yields_zero: bool) -> Result<i64, EvalError> {
-    if div_by_zero_yields_zero {
-        Ok(0)
-    } else {
-        Err(div_by_zero())
-    }
 }
 
 fn div_by_zero() -> EvalError {
@@ -1161,6 +1142,24 @@ mod tests {
         let mut h = Harness::new();
         assert!(matches!(
             rhs_value("1 / 0", &mut h),
+            Err(EvalError::TypeError { .. })
+        ));
+    }
+
+    #[test]
+    fn division_by_zero_fails_loud_even_with_default_inputs_enabled() {
+        // The allow-default-inputs opt-in covers unseeded READS only. An
+        // arithmetic error is not a missing input: integer divide/modulo by
+        // zero fails loud in every mode — it is never converted to 0 because
+        // offline defaulting happens to be on (2026-07-19 review, B6).
+        let mut h = Harness::new();
+        h.env.default_unseeded_channels = true;
+        assert!(matches!(
+            rhs_value("1 / 0", &mut h),
+            Err(EvalError::TypeError { .. })
+        ));
+        assert!(matches!(
+            rhs_value("7 % 0", &mut h),
             Err(EvalError::TypeError { .. })
         ));
     }
