@@ -38,9 +38,14 @@ pub struct ChannelDiff {
     pub counterfactual: Vec<f64>,
     /// `counterfactual - logged` at each tick.
     pub delta: Vec<f64>,
-    /// The maximum absolute delta over the grid (0.0 for an empty grid).
+    /// The maximum absolute delta over the grid (0.0 for an empty grid),
+    /// over the ticks where both sides are finite.
     pub max_abs_delta: f64,
-    /// Whether `max_abs_delta` exceeds the diff's `eps`.
+    /// Ticks where exactly one side is non-finite (finite↔NaN/±Inf) — the most
+    /// alarming kind of divergence, counted rather than silently dropped.
+    pub non_finite_mismatches: usize,
+    /// Whether `max_abs_delta` exceeds the diff's `eps` OR any finite↔non-finite
+    /// mismatch occurred.
     pub changed: bool,
 }
 
@@ -64,6 +69,13 @@ pub struct Diff {
     pub channels: BTreeMap<String, ChannelDiff>,
     /// The change threshold used to set each channel's `changed` flag.
     pub eps: f64,
+    /// The audited binding of each diffed trace channel to the log series it was
+    /// compared against (trace path → log channel name).
+    pub mapping: BTreeMap<String, String>,
+    /// Trace channels EXCLUDED from the diff because their fallback match was
+    /// ambiguous — more than one trace channel claimed the same log series via
+    /// the `Root.`-stripped/bare-leaf fallback. Reported, never silently bound.
+    pub ambiguous: Vec<String>,
 }
 
 impl Diff {
@@ -83,27 +95,60 @@ impl Diff {
     /// canonicalises log inputs). Other channels are skipped.
     pub fn between_eps(log: &Log, trace: &Trace, eps: f64) -> Diff {
         let time = trace.time.clone();
+
+        // Resolve every candidate binding first, then reject ambiguous fallback
+        // claims: two distinct trace channels bound to the SAME log series via
+        // the stripped/leaf fallback means at least one would diff against the
+        // wrong ground truth. An exact (verbatim) match always keeps its
+        // binding; only fallback claimants are excluded (and reported).
+        let mut bindings: Vec<(&String, &crate::scenario::InputSeries, bool)> = Vec::new();
+        for path in trace.channels.keys() {
+            if let Some((series, exact)) = match_log_series(log, path) {
+                bindings.push((path, series, exact));
+            }
+        }
+        let mut claims: BTreeMap<&str, usize> = BTreeMap::new();
+        for (_, series, exact) in &bindings {
+            if !exact {
+                *claims.entry(series.channel.as_str()).or_default() += 1;
+            }
+        }
+        let exact_names: std::collections::BTreeSet<&str> = bindings
+            .iter()
+            .filter(|(_, _, exact)| *exact)
+            .map(|(_, series, _)| series.channel.as_str())
+            .collect();
+        let mut ambiguous: Vec<String> = Vec::new();
+        let mut mapping = BTreeMap::new();
         let mut channels = BTreeMap::new();
 
-        for (path, col) in &trace.channels {
-            let Some(series) = match_log_series(log, path) else {
+        for (path, series, exact) in bindings {
+            let fallback_conflicted = !exact
+                && (claims.get(series.channel.as_str()).copied().unwrap_or(0) > 1
+                    || exact_names.contains(series.channel.as_str()));
+            if fallback_conflicted {
+                ambiguous.push(path.clone());
                 continue;
-            };
-            let Some(counterfactual) = column_as_f64(col) else {
+            }
+            let Some(counterfactual) = column_as_f64(&trace.channels[path]) else {
                 continue;
             };
             let logged: Vec<f64> = time.iter().map(|&t| sample_f64(series, t)).collect();
 
             let n = logged.len().min(counterfactual.len());
             let delta: Vec<f64> = (0..n).map(|i| counterfactual[i] - logged[i]).collect();
+            let non_finite_mismatches = (0..n)
+                .filter(|&i| logged[i].is_finite() != counterfactual[i].is_finite())
+                .count();
             let max_abs_delta = delta
                 .iter()
                 .copied()
                 .map(f64::abs)
                 .filter(|d| d.is_finite())
                 .fold(0.0_f64, f64::max);
-            let changed = max_abs_delta > eps;
+            let changed = max_abs_delta > eps || non_finite_mismatches > 0;
 
+            mapping.insert(path.clone(), series.channel.clone());
             channels.insert(
                 path.clone(),
                 ChannelDiff {
@@ -111,15 +156,19 @@ impl Diff {
                     counterfactual,
                     delta,
                     max_abs_delta,
+                    non_finite_mismatches,
                     changed,
                 },
             );
         }
+        ambiguous.sort();
 
         Diff {
             time,
             channels,
             eps,
+            mapping,
+            ambiguous,
         }
     }
 
@@ -148,6 +197,8 @@ impl Diff {
             s.push_str(&json_string(path));
             s.push_str(":{\"max_abs_delta\":");
             s.push_str(&num_json(d.max_abs_delta));
+            s.push_str(",\"non_finite_mismatches\":");
+            s.push_str(&d.non_finite_mismatches.to_string());
             s.push_str(",\"changed\":");
             s.push_str(if d.changed { "true" } else { "false" });
             s.push_str(",\"logged\":");
@@ -158,7 +209,23 @@ impl Diff {
             push_array(&mut s, &d.delta);
             s.push('}');
         }
-        s.push_str("}}");
+        s.push_str("},\"mapping\":{");
+        for (i, (path, log_name)) in self.mapping.iter().enumerate() {
+            if i > 0 {
+                s.push(',');
+            }
+            s.push_str(&json_string(path));
+            s.push(':');
+            s.push_str(&json_string(log_name));
+        }
+        s.push_str("},\"ambiguous\":[");
+        for (i, path) in self.ambiguous.iter().enumerate() {
+            if i > 0 {
+                s.push(',');
+            }
+            s.push_str(&json_string(path));
+        }
+        s.push_str("]}");
         s
     }
 
@@ -195,18 +262,20 @@ impl Diff {
 
 /// Find the log series matching a trace channel path: exact, then the `Root.`-
 /// stripped path, then the bare leaf name (logs commonly omit the implicit `Root.`
-/// group prefix the symbol table uses).
-fn match_log_series<'a>(log: &'a Log, path: &str) -> Option<&'a InputSeries> {
+/// group prefix the symbol table uses). The second tuple element is `true` for an
+/// exact (verbatim) match — fallback matches are subject to the caller's
+/// ambiguity rejection, exact matches are not.
+fn match_log_series<'a>(log: &'a Log, path: &str) -> Option<(&'a InputSeries, bool)> {
     if let Some(s) = log.series_for(path) {
-        return Some(s);
+        return Some((s, true));
     }
     if let Some(stripped) = path.strip_prefix("Root.")
         && let Some(s) = log.series_for(stripped)
     {
-        return Some(s);
+        return Some((s, false));
     }
     let leaf = path.rsplit('.').next().unwrap_or(path);
-    log.series_for(leaf)
+    log.series_for(leaf).map(|s| (s, false))
 }
 
 /// A whole column as `f64`, or `None` if any cell is non-numeric (bool/enum/string)
@@ -385,6 +454,105 @@ mod tests {
         let trace = trace_with(&[("Root.CF.Sensor", &[3.0])], &[0.0]);
         let diff = Diff::between(&log, &trace);
         assert_eq!(diff.channels["Root.CF.Sensor"].delta, vec![2.0]);
+    }
+
+    #[test]
+    fn finite_to_non_finite_divergence_is_changed() {
+        // The counterfactual turned a finite logged value into NaN/Infinity. The
+        // old max_abs_delta filtered non-finite deltas before folding, so the
+        // channel reported UNCHANGED — the most alarming divergence read as "no
+        // difference". A finite↔non-finite mismatch is a change, and the count
+        // of such ticks is reported.
+        let log = two_channel_log();
+        let trace = trace_with(
+            &[
+                ("Root.CF.Sensor", &[10.0, f64::NAN]),
+                ("Root.CF.Mid", &[25.0, f64::INFINITY]),
+            ],
+            &[0.0, 1.0],
+        );
+        let diff = Diff::between(&log, &trace);
+        let sensor = &diff.channels["Root.CF.Sensor"];
+        assert!(sensor.changed, "finite→NaN must flag changed");
+        assert_eq!(sensor.non_finite_mismatches, 1);
+        let mid = &diff.channels["Root.CF.Mid"];
+        assert!(mid.changed, "finite→Inf must flag changed");
+        assert_eq!(mid.non_finite_mismatches, 1);
+        assert_eq!(
+            diff.changed_channels(),
+            vec!["Root.CF.Mid", "Root.CF.Sensor"]
+        );
+    }
+
+    #[test]
+    fn ambiguous_leaf_fallback_is_rejected_and_reported() {
+        // Two distinct trace channels (Root.A.Value, Root.B.Value) both
+        // leaf-fall-back to the single logged series `Value`. Binding either one
+        // silently would diff at least one of them against the wrong ground
+        // truth: both are excluded from the numeric diff and reported as
+        // ambiguous instead.
+        let log = Log {
+            channels: vec![InputSeries {
+                channel: "Value".to_string(),
+                kind: InputKind::Series(vec![(0.0, Value::Float(1.0))]),
+            }],
+            meta: crate::log::LogMeta::default(),
+        };
+        let trace = trace_with(
+            &[("Root.A.Value", &[3.0]), ("Root.B.Value", &[4.0])],
+            &[0.0],
+        );
+        let diff = Diff::between(&log, &trace);
+        assert!(
+            !diff.channels.contains_key("Root.A.Value")
+                && !diff.channels.contains_key("Root.B.Value"),
+            "ambiguously-matched channels must not be silently diffed"
+        );
+        assert_eq!(
+            diff.ambiguous,
+            vec!["Root.A.Value".to_string(), "Root.B.Value".to_string()],
+            "the ambiguity is reported, not swallowed"
+        );
+    }
+
+    #[test]
+    fn exact_match_wins_over_a_conflicting_fallback() {
+        // The log carries `Value` exactly; the trace has BOTH a channel exactly
+        // named `Value` and another whose leaf falls back to it. The exact match
+        // keeps its binding; only the fallback claimant is ambiguous-excluded.
+        let log = Log {
+            channels: vec![InputSeries {
+                channel: "Value".to_string(),
+                kind: InputKind::Series(vec![(0.0, Value::Float(1.0))]),
+            }],
+            meta: crate::log::LogMeta::default(),
+        };
+        let trace = trace_with(&[("Value", &[3.0]), ("Root.B.Value", &[4.0])], &[0.0]);
+        let diff = Diff::between(&log, &trace);
+        assert!(
+            diff.channels.contains_key("Value"),
+            "the exact match keeps its binding"
+        );
+        assert_eq!(diff.ambiguous, vec!["Root.B.Value".to_string()]);
+    }
+
+    #[test]
+    fn mapping_table_is_reported() {
+        // Every bound trace-channel → log-channel pair is visible in the diff
+        // metadata, so a reviewer can audit exactly which series was compared.
+        let log = Log {
+            channels: vec![InputSeries {
+                channel: "Sensor".to_string(),
+                kind: InputKind::Series(vec![(0.0, Value::Float(1.0))]),
+            }],
+            meta: crate::log::LogMeta::default(),
+        };
+        let trace = trace_with(&[("Root.CF.Sensor", &[3.0])], &[0.0]);
+        let diff = Diff::between(&log, &trace);
+        assert_eq!(
+            diff.mapping.get("Root.CF.Sensor").map(String::as_str),
+            Some("Sensor")
+        );
     }
 
     #[test]

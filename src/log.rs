@@ -158,6 +158,50 @@ mod tests {
     use super::*;
     use crate::value::Value;
 
+    #[test]
+    fn duplicate_csv_headers_are_rejected() {
+        // Two columns named `Speed`: whichever the sampler later picked would be
+        // arbitrary. Fails loud naming the duplicate.
+        let csv = "time,Speed,Speed\n0.0,1.0,2.0\n";
+        let err = Log::from_csv(csv, "t").expect_err("duplicate headers must fail");
+        assert!(format!("{err}").contains("Speed"), "{err}");
+    }
+
+    #[test]
+    fn ragged_csv_row_width_is_rejected() {
+        // Row 2 carries more cells than the header declares — a shifted or
+        // corrupt export. (Fewer cells stays legal: trailing empty cells are the
+        // documented no-keyframe hold.)
+        let csv = "time,Speed\n0.0,1.0,99.0\n";
+        let err = Log::from_csv(csv, "t").expect_err("over-wide row must fail");
+        assert!(format!("{err}").to_lowercase().contains("row"), "{err}");
+    }
+
+    #[test]
+    fn non_finite_csv_time_is_rejected() {
+        let csv = "time,Speed\nNaN,1.0\n";
+        let err = Log::from_csv(csv, "t").expect_err("NaN time must fail");
+        assert!(format!("{err}").to_lowercase().contains("time"), "{err}");
+        let csv = "time,Speed\ninf,1.0\n";
+        Log::from_csv(csv, "t").expect_err("infinite time must fail");
+    }
+
+    #[test]
+    fn non_monotonic_csv_time_is_rejected() {
+        // The zero-order-hold sampler assumes ascending keyframes; accepting
+        // out-of-order times silently mis-samples every later lookup. Equal
+        // (duplicate) timestamps are rejected for the same reason.
+        let csv = "time,Speed\n0.0,1.0\n0.2,2.0\n0.1,3.0\n";
+        let err = Log::from_csv(csv, "t").expect_err("descending time must fail");
+        let msg = format!("{err}").to_lowercase();
+        assert!(
+            msg.contains("increas") || msg.contains("monotonic"),
+            "{err}"
+        );
+        let csv = "time,Speed\n0.0,1.0\n0.0,2.0\n";
+        Log::from_csv(csv, "t").expect_err("duplicate timestamp must fail");
+    }
+
     /// Build a hand-authored two-channel log: a `Sensor` ramp and an
     /// `Engine Speed` series (note the space in the channel name).
     fn hand_built_log() -> Log {

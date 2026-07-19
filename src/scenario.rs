@@ -239,11 +239,25 @@ pub(crate) fn parse_time_series_csv(
             at: 0,
         });
     }
+    // Duplicate headers: whichever column the sampler later picked would be
+    // arbitrary — fail loud naming the duplicate.
+    {
+        let mut seen = std::collections::BTreeSet::new();
+        for c in &cols[1..] {
+            if !seen.insert(c.as_str()) {
+                return Err(EvalError::UnsupportedConstruct {
+                    kind: format!("CSV declares the column {c:?} more than once"),
+                    at: 0,
+                });
+            }
+        }
+    }
     // One accumulator per non-time column, in header order.
     let mut columns: Vec<(String, Vec<(f64, Value)>)> =
         cols[1..].iter().map(|c| (c.clone(), Vec::new())).collect();
     let mut units: std::collections::BTreeMap<String, String> = std::collections::BTreeMap::new();
     let mut seen_data_row = false;
+    let mut prev_time: Option<f64> = None;
 
     for (row_idx, line) in lines.enumerate() {
         if line.trim().is_empty() {
@@ -271,12 +285,47 @@ pub(crate) fn parse_time_series_csv(
         }
         seen_data_row = true;
 
+        // A row wider than the header is a shifted or corrupt export. (Fewer
+        // cells stays legal: trailing empty cells are the documented
+        // no-keyframe hold.)
+        if cells.len() > cols.len() {
+            return Err(EvalError::UnsupportedConstruct {
+                kind: format!(
+                    "CSV row {} has {} cells but the header declares {} columns",
+                    row_idx + 2,
+                    cells.len(),
+                    cols.len()
+                ),
+                at: 0,
+            });
+        }
         let t = first
             .parse::<f64>()
             .map_err(|_| EvalError::UnsupportedConstruct {
                 kind: format!("CSV row {} has a non-numeric time", row_idx + 2),
                 at: 0,
             })?;
+        // The zero-order-hold sampler assumes strictly ascending finite
+        // keyframes; a NaN/infinite or out-of-order/duplicate timestamp would
+        // silently mis-sample every later lookup.
+        if !t.is_finite() {
+            return Err(EvalError::UnsupportedConstruct {
+                kind: format!("CSV row {} has a non-finite time {t}", row_idx + 2),
+                at: 0,
+            });
+        }
+        if let Some(prev) = prev_time
+            && t <= prev
+        {
+            return Err(EvalError::UnsupportedConstruct {
+                kind: format!(
+                    "CSV row {} time {t} is not strictly increasing (previous {prev})",
+                    row_idx + 2
+                ),
+                at: 0,
+            });
+        }
+        prev_time = Some(t);
         for (i, acc) in columns.iter_mut().enumerate() {
             let Some(cell) = cells.get(i + 1) else {
                 continue;
