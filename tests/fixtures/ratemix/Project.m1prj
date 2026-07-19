@@ -1,0 +1,30 @@
+<?xml version="1.0"?>
+<!-- Synthetic m1-eval ratemix fixture. No proprietary MoTeC content.        -->
+<!-- Rates 500 Hz and 200 Hz: NOT integer-divisible by each other, so the    -->
+<!-- whole-project scheduler must pick an exact common base (LCM = 1000 Hz). -->
+<!--                                                                         -->
+<!--   500 Hz: Root.RX.Fast Counter  increments Root.RX.Fast Count by 1/run  -->
+<!--   200 Hz: Root.RX.Mid Counter   increments Root.RX.Mid Count by 1/run   -->
+<!--           and integrates Seed into Root.RX.Mid Total (dt must be 5 ms)  -->
+<MoTeCM1BuildSession>
+ <Project Name="RateMix" TargetHardware="ecu120">
+  <ComponentStream><List>
+   <Component Classname="BuiltIn.GroupCompound" Name="Root.RX"/>
+   <Component Classname="BuiltIn.GroupCompound" Name="Root.Events"/>
+   <Component Classname="BuiltIn.EventKernel" Name="Root.Events.On 500Hz"/>
+   <Component Classname="BuiltIn.EventKernel" Name="Root.Events.On 200Hz"/>
+
+   <Component Classname="BuiltIn.Channel" Name="Root.RX.Seed"><Props Type="f32"/></Component>
+   <Component Classname="BuiltIn.Channel" Name="Root.RX.Fast Count"><Props Type="f32"/></Component>
+   <Component Classname="BuiltIn.Channel" Name="Root.RX.Mid Count"><Props Type="f32"/></Component>
+   <Component Classname="BuiltIn.Channel" Name="Root.RX.Mid Total"><Props Type="f32"/></Component>
+
+   <Component Classname="BuiltIn.FuncUser" Filename="RX.Fast Counter.m1scr" Name="Root.RX.Fast Counter">
+    <Props SelectedTrigger="Root.Events.On 500Hz"/>
+   </Component>
+   <Component Classname="BuiltIn.FuncUser" Filename="RX.Mid Counter.m1scr" Name="Root.RX.Mid Counter">
+    <Props SelectedTrigger="Root.Events.On 200Hz"/>
+   </Component>
+  </List></ComponentStream>
+ </Project>
+</MoTeCM1BuildSession>

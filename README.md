@@ -55,10 +55,14 @@ The multi-rate model:
   function with a resolvable periodic rate (500 / 200 / 50 / 10 / 2 Hz) is
   scheduled; an `On Startup` or untriggered function (rate `None`) is **not** run
   by the scheduler and is flagged *unscheduled* in `--coverage`.
-- **Base tick + rate divisors.** The run advances on one base tick grid
-  (`base_rate_hz`, defaulting to the fastest scheduled rate when unset). Each
-  function runs every `base_rate_hz / rate_hz` ticks: a 100 Hz function on a
-  100 Hz base runs every tick, a 50 Hz function every other tick.
+- **Base tick + exact rate divisors.** The run advances on one base tick grid.
+  When `base_rate_hz` is unset it defaults to the **least common multiple** of
+  the scheduled rates, so every function has an exact integer tick period —
+  rates {500, 200} Hz derive a 1000 Hz base, never a rounded 2.5-tick period. A
+  pinned base that cannot represent every scheduled rate exactly (or is below
+  the fastest rate) is **rejected loudly** rather than rounded. Each function
+  then runs every `base_rate_hz / rate_hz` ticks: a 100 Hz function on a 100 Hz
+  base runs every tick, a 50 Hz function every other tick.
 - **Rate-correct `dt`.** A function's stateful operators (`Integral.Normal`,
   filters, derivatives, timers) are stepped by *its own* period
   (`1 / rate_hz`) — a 50 Hz integrator accumulates with `dt = 0.02`, not the

@@ -1,0 +1,4 @@
+// Synthetic m1-eval ratemix fixture. No proprietary content.
+// 500 Hz: counts its own invocations — one increment per scheduled run, so
+// the final value IS the exact 500 Hz invocation count.
+Fast Count = Fast Count + 1.0;
