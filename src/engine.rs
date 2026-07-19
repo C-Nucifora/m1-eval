@@ -346,8 +346,10 @@ const = 6.0
             .get("Root.MR.Slow Echo")
             .expect("Slow Echo column");
         assert_eq!(echo, &vec![Value::Float(6.0); 4]);
-        // The On-Startup function never runs in whole-project mode.
-        assert!(!trace.channels.contains_key("Root.MR.Started"));
+        // The On-Startup function ran exactly once before the periodic loop;
+        // its marker holds across every tick.
+        let started = trace.channels.get("Root.MR.Started").expect("Started");
+        assert_eq!(started, &vec![Value::Float(1.0); 4]);
     }
 
     #[test]

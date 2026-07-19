@@ -29,6 +29,12 @@ pub struct Loaded {
     pub scripts: Vec<ParsedScript>,
     /// Numeric calibration values (parameters + table cells).
     pub calib: Calibration,
+    /// Function symbols whose `.m1prj` `SelectedTrigger` resolves to the
+    /// `On Startup` event kernel (trigger leaf `"On Startup"`, the convention
+    /// both real corpora follow). The whole-project runner executes these
+    /// exactly once before the periodic loop. `$(…)`-parameterised and
+    /// untriggered functions are NOT here — they stay unscheduled.
+    pub startup_fn_symbols: Vec<String>,
 }
 
 /// Load a project, its scripts, and (optionally) its calibration values.
@@ -74,11 +80,46 @@ pub fn load(project_path: &Path, cfg_path: Option<&Path>) -> Result<Loaded, Eval
         None => Calibration::default(),
     };
 
+    let startup_fn_symbols = startup_functions(&read_xml(project_path)?)?;
+
     Ok(Loaded {
         project,
         scripts,
         calib,
+        startup_fn_symbols,
     })
+}
+
+/// The full component names (function symbols) whose `SelectedTrigger` points at
+/// the `On Startup` event kernel — trigger path leaf `"On Startup"`, matching
+/// both synthetic fixtures and the real corpora (`…Events.On Startup`, possibly
+/// `Parent.`-prefixed). Parsed from the raw `.m1prj` because the typed symbol
+/// model deliberately collapses non-periodic triggers to `call_rate_hz = None`
+/// without recording which are startup. Fails loud on unparseable XML — the
+/// project just loaded through `m1-typecheck`, so a parse failure here is a
+/// genuine inconsistency, not a condition to guess through.
+fn startup_functions(xml: &str) -> Result<Vec<String>, EvalError> {
+    let doc = roxmltree::Document::parse(xml).map_err(|e| EvalError::UnsupportedConstruct {
+        kind: format!("project XML re-parse for startup triggers failed: {e}"),
+        at: 0,
+    })?;
+    let mut out = Vec::new();
+    for node in doc.descendants().filter(|n| n.has_tag_name("Component")) {
+        let Some(name) = node.attribute("Name") else {
+            continue;
+        };
+        let trigger = node
+            .children()
+            .find(|c| c.has_tag_name("Props"))
+            .and_then(|p| p.attribute("SelectedTrigger"));
+        if let Some(t) = trigger
+            && t.rsplit('.').next() == Some("On Startup")
+        {
+            out.push(name.to_string());
+        }
+    }
+    out.sort();
+    Ok(out)
 }
 
 /// Read a MoTeC XML file as text, decoding lossily so Windows-1252 exports do not

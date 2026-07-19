@@ -442,22 +442,28 @@ fn tick_loop(
     let mut state = StateStore::new();
     let mut trace = Trace::new();
 
-    // In **whole-project** mode there is no scenario driving the sensor/CAN inputs
-    // and no calibration seeding the tunables, so an unseeded *channel* read falls
-    // back to its type-correct startup default (flagged externally driven) rather
-    // than aborting the run — the channel-side analogue of the Tier-3 IO stubs.
-    // This covers every unseeded read uniformly: a hardware sensor channel, a CAN
-    // signal, a table-output `.Value` the auto-`Lookup` would compute, and a state
-    // channel read before its writer's first run. It propagates to inline
-    // user-function callees (they share this env). In `function`/`cone` mode the
-    // flag stays `false`, so a read of an unprovided input still fails loud — the
-    // scenario must drive every channel a single function reads.
-    env.default_unseeded_channels = matches!(scenario.mode, RunMode::WholeProject);
+    // Unseeded-channel defaulting is the scenario's EXPLICIT opt-in
+    // (`allow_default_inputs = true`, whole-project mode only): an unseeded
+    // channel read then falls back to its type-correct startup default, and
+    // every substitution is reported on the trace (channel, value, first
+    // reader). Strict fail-loud is the baseline in every mode — a missing input
+    // aborts the run rather than quietly becoming a guessed number.
+    env.default_unseeded_channels =
+        matches!(scenario.mode, RunMode::WholeProject) && scenario.allow_default_inputs;
 
     // The union of every channel the schedule writes, computed once: on a tick a
     // function holds (does not run), we repeat its last value from `env` for these
-    // channels so the trace stays a dense grid (zero-order hold).
-    let scheduled_writes = schedule_writes(loaded, schedule);
+    // channels so the trace stays a dense grid (zero-order hold). Startup
+    // functions' writes are included so their once-written outputs appear (and
+    // hold) as trace columns from the first tick.
+    let startup = startup_schedule(loaded, scenario);
+    let mut scheduled_writes = schedule_writes(loaded, schedule);
+    for sched in &startup {
+        let io = io_sets(sched.script, &loaded.project, sched.group.as_deref());
+        for w in io.writes {
+            scheduled_writes.insert(w);
+        }
+    }
 
     // Canonicalise each scenario input/override channel once, against the first
     // scheduled function's scope (all scheduled functions share the project; the
@@ -466,6 +472,41 @@ fn tick_loop(
     let scope_fn = schedule.first().and_then(|s| s.sched.fn_symbol.as_deref());
     let inputs = canonicalise(&scenario.inputs, loaded, scope_group, scope_fn);
     let overrides = canonicalise(&scenario.overrides, loaded, scope_group, scope_fn);
+
+    // Run every On-Startup function exactly once, before the periodic grid —
+    // the ECU's initialisation pass. Inputs/overrides are seeded at t = 0 first
+    // so startup code can read scenario-driven channels; writes land in the
+    // shared env (no trace tick is open yet) and surface via the zero-order
+    // hold from tick 0 on. dt is the base period — startup code has no rate of
+    // its own, and its stateful operators see one nominal step.
+    if !startup.is_empty() {
+        for (path, series) in &inputs {
+            env.set(path.clone(), series.sample(0.0));
+        }
+        for (path, series) in &overrides {
+            env.set(path.clone(), series.sample(0.0));
+        }
+        for sched in &startup {
+            let root = sched.script.cst.root();
+            let mut ctx = EvalCtx {
+                project: &loaded.project,
+                calib: &loaded.calib,
+                env: &mut env,
+                state: &mut state,
+                group: sched.group.as_deref(),
+                fn_symbol: sched.fn_symbol.as_deref(),
+                script_name: &sched.script.name,
+                dt: 1.0 / base_rate_hz,
+                scripts: &loaded.scripts,
+                depth: 0,
+                // No trace: no tick is open yet, and record_channel appends
+                // blindly — a startup record would desync columns from the time
+                // axis. Startup writes surface via the tick-0 zero-order hold.
+                trace: None,
+            };
+            exec_script(&root, &mut ctx)?;
+        }
+    }
 
     for i in 0..ticks {
         let t = i as f64 / base_rate_hz;
@@ -545,6 +586,34 @@ struct RunPlan {
     /// `1 / rate_hz` — the time since this function's previous run, handed to its
     /// stateful operators so accumulation is rate-correct.
     dt: f64,
+}
+
+/// The On-Startup functions to run once before the periodic loop, in
+/// writer-before-reader order — whole-project mode only (function/cone modes
+/// pin a single explicit target and model no initialisation pass). Each
+/// `startup_fn_symbols` entry (from the loader's trigger scan) is matched back
+/// to its parsed script; ordering reuses the same single-group topological
+/// machinery as the periodic schedule (nominal rate, stripped after ordering).
+fn startup_schedule<'a>(loaded: &'a Loaded, scenario: &Scenario) -> Vec<Scheduled<'a>> {
+    if !matches!(scenario.mode, RunMode::WholeProject) || loaded.startup_fn_symbols.is_empty() {
+        return Vec::new();
+    }
+    let mut rated: Vec<ScheduledRated> = loaded
+        .scripts
+        .iter()
+        .filter_map(|script| {
+            let fn_symbol = loaded.project.function_symbol_for_script(&script.name)?;
+            if !loaded.startup_fn_symbols.contains(&fn_symbol) {
+                return None;
+            }
+            Some(ScheduledRated {
+                sched: scheduled_for(loaded, script),
+                rate_hz: 1.0,
+            })
+        })
+        .collect();
+    order_by_dependency_then_rate(loaded, &mut rated);
+    rated.into_iter().map(|r| r.sched).collect()
 }
 
 /// The union of every channel any scheduled function writes (canonical paths),
@@ -1317,6 +1386,7 @@ mod tests {
         let toml = r#"
 mode = "whole-project"
 duration_s = 0.01
+allow_default_inputs = true
 
 [[inputs]]
 channel = "Root.RX.Seed"
@@ -1342,6 +1412,7 @@ const = 3.0
         let toml = r#"
 mode = "whole-project"
 duration_s = 1.0
+allow_default_inputs = true
 
 [[inputs]]
 channel = "Root.RX.Seed"
@@ -1362,6 +1433,94 @@ const = 3.0
         assert!(
             (total - 2.985).abs() < 1e-9,
             "exact dt=5 ms trapezoidal accumulation, got {total}"
+        );
+    }
+
+    #[test]
+    fn whole_project_is_strict_by_default_on_unseeded_channels() {
+        // ratemix's counters read their own (unseeded) channels. Whole-project
+        // mode used to silently substitute type-correct defaults for every
+        // unseeded read; strict fail-loud is now the default and defaulting is
+        // the scenario's explicit opt-in (`allow_default_inputs = true`).
+        let loaded = ratemix();
+        let toml = r#"
+mode = "whole-project"
+duration_s = 0.01
+
+[[inputs]]
+channel = "Root.RX.Seed"
+const = 3.0
+"#;
+        let scenario = Scenario::from_toml_str(toml).unwrap();
+        let err = run(&loaded, &scenario).expect_err("unseeded channel must fail loud");
+        assert!(
+            matches!(err, EvalError::MissingInput { .. }),
+            "expected MissingInput, got {err:?}"
+        );
+    }
+
+    #[test]
+    fn allow_default_inputs_defaults_and_reports_substitutions() {
+        // With the explicit opt-in, unseeded channel reads fall back to their
+        // type-correct startup defaults — and every substitution is REPORTED on
+        // the trace: channel, substituted value, and the first reading script.
+        let loaded = ratemix();
+        let toml = r#"
+mode = "whole-project"
+duration_s = 0.01
+allow_default_inputs = true
+
+[[inputs]]
+channel = "Root.RX.Seed"
+const = 3.0
+"#;
+        let scenario = Scenario::from_toml_str(toml).unwrap();
+        let trace = run(&loaded, &scenario).expect("opt-in defaulted run succeeds");
+        let fast = trace
+            .defaulted
+            .get("Root.RX.Fast Count")
+            .expect("Fast Count substitution reported");
+        assert_eq!(fast.value, Value::Float(0.0));
+        assert_eq!(fast.first_reader, "RX.Fast Counter.m1scr");
+        assert!(
+            trace.defaulted.contains_key("Root.RX.Mid Count"),
+            "Mid Count substitution reported: {:?}",
+            trace.defaulted.keys().collect::<Vec<_>>()
+        );
+        // The seeded input is NOT a substitution.
+        assert!(!trace.defaulted.contains_key("Root.RX.Seed"));
+    }
+
+    #[test]
+    fn startup_functions_run_once_before_the_periodic_loop() {
+        // The multirate fixture's Root.MR.Init (On Startup) writes Started = 1.
+        // Whole-project mode used to skip startup functions entirely; they now
+        // run exactly once, before the first periodic tick, and their outputs
+        // hold (zero-order) across the whole trace.
+        let loaded = multirate();
+        let toml = r#"
+mode = "whole-project"
+duration_s = 0.05
+base_rate_hz = 100.0
+
+[[inputs]]
+channel = "Root.MR.Seed"
+const = 3.0
+
+[[inputs]]
+channel = "Root.MR.Slow Out"
+const = 6.0
+"#;
+        let scenario = Scenario::from_toml_str(toml).unwrap();
+        let trace = run(&loaded, &scenario).expect("whole-project run succeeds");
+        let started = trace
+            .channels
+            .get("Root.MR.Started")
+            .expect("startup-written channel appears in the trace");
+        assert_eq!(started.len(), 5, "held across every tick");
+        assert!(
+            started.iter().all(|v| *v == Value::Float(1.0)),
+            "startup ran once and its output holds: {started:?}"
         );
     }
 
@@ -1521,11 +1680,12 @@ const = 6.0
         assert!(shared.iter().all(|v| *v == Value::Float(7.0)), "{shared:?}");
         assert!(fast.iter().all(|v| *v == Value::Float(70.0)), "{fast:?}");
 
-        // The startup function never runs in whole-project mode, so its channel
-        // is never written by the schedule.
+        // The startup function runs exactly once before the periodic loop, so
+        // its marker channel is present and holds its startup value.
+        let started = trace.channels.get("Root.MR.Started").expect("Started");
         assert!(
-            !trace.channels.contains_key("Root.MR.Started"),
-            "startup channel must not be produced"
+            started.iter().all(|v| *v == Value::Float(1.0)),
+            "startup marker holds: {started:?}"
         );
     }
 

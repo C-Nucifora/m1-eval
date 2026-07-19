@@ -279,10 +279,11 @@ fn whole_project_flag_runs_every_scheduled_channel() {
         header.contains("Root.MR.Slow Echo"),
         "header missing slow channel: {header}"
     );
-    // The On-Startup function never runs, so its channel is absent.
+    // The On-Startup function ran once before the periodic loop; its marker
+    // channel appears and holds 1 on every tick.
     assert!(
-        !csv.contains("Root.MR.Started"),
-        "startup channel must not appear: {csv}"
+        csv.contains("Root.MR.Started"),
+        "startup channel must appear: {csv}"
     );
 }
 

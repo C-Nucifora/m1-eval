@@ -44,6 +44,21 @@ pub struct Trace {
     /// Tier-3 stub) rather than computed by the engine. Metadata only — these
     /// channels still appear in [`Trace::channels`].
     pub external: BTreeSet<String>,
+    /// Unseeded inputs substituted with a type-correct startup default under the
+    /// scenario's explicit `allow_default_inputs` opt-in, keyed by canonical
+    /// channel path. Metadata only (not part of the JSON/CSV trace body): the
+    /// honest record of every value the run GUESSED rather than computed.
+    pub defaulted: BTreeMap<String, DefaultedInput>,
+}
+
+/// One reported default substitution: what value was substituted and which
+/// script read it first.
+#[derive(Debug, Clone, PartialEq)]
+pub struct DefaultedInput {
+    /// The substituted (type-correct startup default) value.
+    pub value: Value,
+    /// The script whose read first triggered the substitution.
+    pub first_reader: String,
 }
 
 impl Trace {
@@ -70,6 +85,17 @@ impl Trace {
     /// `(script, byte_offset)` identity) for the current tick.
     pub fn record_expr(&mut self, site: (String, usize), value: Value) {
         self.exprs.entry(site).or_default().push(value);
+    }
+
+    /// Record a default-substituted input (first reader wins — later reads of
+    /// the same channel do not overwrite the original report).
+    pub fn mark_defaulted(&mut self, path: impl Into<String>, value: Value, reader: &str) {
+        self.defaulted
+            .entry(path.into())
+            .or_insert_with(|| DefaultedInput {
+                value,
+                first_reader: reader.to_string(),
+            });
     }
 
     /// Flag a channel as externally driven (scenario-fed or a Tier-3 stub).

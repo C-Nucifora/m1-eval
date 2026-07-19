@@ -134,6 +134,11 @@ pub struct Scenario {
     /// Channels pinned to a constant or series, layered *over* the inputs and
     /// any computed value. Same shape as [`Scenario::inputs`].
     pub overrides: Vec<InputSeries>,
+    /// Whole-project mode only: substitute type-correct startup defaults for
+    /// unseeded channel reads (each substitution is reported on the trace)
+    /// instead of failing loud. **Off by default** — strict fail-loud is the
+    /// baseline; defaulting is an explicit, visible opt-in.
+    pub allow_default_inputs: bool,
 }
 
 impl Scenario {
@@ -351,6 +356,10 @@ struct RawScenario {
     inputs: Vec<RawInput>,
     #[serde(default)]
     overrides: Vec<RawInput>,
+    /// Opt-in unseeded-channel defaulting for whole-project mode (strict
+    /// fail-loud when absent/false).
+    #[serde(default)]
+    allow_default_inputs: bool,
 }
 
 /// A raw input/override entry: a channel plus exactly one of `const`/`series`.
@@ -456,6 +465,7 @@ impl RawScenario {
             duration_s: self.duration_s,
             base_rate_hz: self.base_rate_hz,
             overrides,
+            allow_default_inputs: self.allow_default_inputs,
         })
     }
 }
