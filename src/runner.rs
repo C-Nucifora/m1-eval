@@ -15,12 +15,14 @@
 //! The grid advances at `base_rate_hz` (tick step `1 / base_rate_hz`). For the
 //! single-function and cone runners every function shares that base rate, so it
 //! runs every tick with the base step. For the whole-project runner each function
-//! runs only on the base ticks its **rate divisor** (`round(base / rate)`) selects
-//! and is stepped by its **own** period (`dt = 1 / rate`), so a 50 Hz function on
+//! runs only on the base ticks its **rate divisor** (the exact integer
+//! `base / rate`; an inexact ratio is rejected) selects and is stepped by its
+//! **own** period (`dt = 1 / rate`), so a 50 Hz function on
 //! a 100 Hz base runs every other tick and integrates with `dt = 0.02`. Functions
 //! not run on a tick hold their last-written channels (zero-order hold). When the
-//! whole-project scenario pins no `base_rate_hz`, the base defaults to the fastest
-//! scheduled rate.
+//! whole-project scenario pins no `base_rate_hz`, the base defaults to the least
+//! common multiple of the scheduled rates, so every function has an exact integer
+//! tick period.
 //!
 //! The loop, in order, each tick:
 //!
@@ -127,24 +129,110 @@ fn require_base_rate(scenario: &Scenario) -> Result<f64, EvalError> {
 }
 
 /// Resolve the whole-project base tick rate. When the scenario pins a positive
-/// `base_rate_hz` it is used verbatim; when it is absent (0.0, the "auto"
-/// sentinel) the base defaults to the **fastest** scheduled rate so every
-/// function divides the base cleanly and the fastest loop runs every tick. An
-/// empty schedule with no pinned base has no rate to derive — fail loud.
+/// `base_rate_hz` it is used verbatim (the tick loop then rejects it unless
+/// every scheduled rate divides it exactly); when it is absent (0.0, the "auto"
+/// sentinel) the base is the **least common multiple** of the scheduled rates,
+/// so every function has an exact integer tick period — e.g. rates {500, 200}
+/// yield a 1000 Hz base, never a rounded 2.5-tick period. An empty schedule
+/// with no pinned base has no rate to derive — fail loud.
 fn resolve_base_rate(scenario: &Scenario, schedule: &[ScheduledRated]) -> Result<f64, EvalError> {
     if scenario.base_rate_hz > 0.0 {
         return Ok(scenario.base_rate_hz);
     }
-    schedule
-        .iter()
-        .map(|r| r.rate_hz)
-        .fold(None::<f64>, |acc, r| Some(acc.map_or(r, |m| m.max(r))))
-        .ok_or_else(|| EvalError::UnsupportedConstruct {
+    if schedule.is_empty() {
+        return Err(EvalError::UnsupportedConstruct {
             kind:
                 "whole-project run has no scheduled functions and no base_rate_hz to default from"
                     .to_string(),
             at: 0,
-        })
+        });
+    }
+    let mut lcm_mhz: u64 = 1;
+    for r in schedule {
+        let mhz = millihertz(r.rate_hz).ok_or_else(|| EvalError::UnsupportedConstruct {
+            kind: format!(
+                "cannot schedule rate {} Hz exactly (not representable in whole millihertz)",
+                r.rate_hz
+            ),
+            at: 0,
+        })?;
+        lcm_mhz = lcm_mhz / gcd(lcm_mhz, mhz) * mhz;
+        // 1 MHz cap: beyond this the tick grid explodes; ask for an explicit base.
+        if lcm_mhz > 1_000_000_000 {
+            return Err(EvalError::UnsupportedConstruct {
+                kind: "no practical exact common base for the scheduled rates (lcm exceeds \
+                       1 MHz); pin base_rate_hz to a rate every scheduled rate divides exactly"
+                    .to_string(),
+                at: 0,
+            });
+        }
+    }
+    Ok(lcm_mhz as f64 / 1000.0)
+}
+
+/// A rate as exact integer millihertz, or `None` when it is not representable
+/// (non-positive, non-finite, or fractional below 1 mHz). Integer millihertz is
+/// the exact arithmetic domain for divisor/LCM computation: project rates are
+/// whole Hz in practice, and 1 mHz resolution covers slow event rates without
+/// floating-point rounding.
+fn millihertz(rate_hz: f64) -> Option<u64> {
+    if !rate_hz.is_finite() || rate_hz <= 0.0 {
+        return None;
+    }
+    let m = rate_hz * 1000.0;
+    let r = m.round();
+    if r >= 1.0 && (m - r).abs() < 1e-6 {
+        Some(r as u64)
+    } else {
+        None
+    }
+}
+
+/// Greatest common divisor (Euclid). `gcd(a, 0) = a`.
+fn gcd(mut a: u64, mut b: u64) -> u64 {
+    while b != 0 {
+        (a, b) = (b, a % b);
+    }
+    a
+}
+
+/// The exact tick divisor for `rate_hz` on a `base_rate_hz` grid, or an error
+/// when the base cannot represent the rate exactly. Replaces the old
+/// `round(base/rate)` divisor, which silently ran a 200 Hz function every 3
+/// ticks of a 500 Hz base (~166.7 Hz) while handing it dt = 5 ms. A rate
+/// faster than the base is rejected by the same exactness rule (its divisor
+/// would be fractional below 1), so a base below the fastest scheduled rate
+/// fails loud instead of clamping to every-tick.
+fn exact_divisor(
+    base_rate_hz: f64,
+    rate_hz: f64,
+    fn_symbol: Option<&str>,
+) -> Result<usize, EvalError> {
+    let who = fn_symbol.unwrap_or("<function>");
+    let (base_mhz, rate_mhz) = match (millihertz(base_rate_hz), millihertz(rate_hz)) {
+        (Some(b), Some(r)) => (b, r),
+        _ => {
+            return Err(EvalError::UnsupportedConstruct {
+                kind: format!(
+                    "cannot schedule {who}: base {base_rate_hz} Hz / rate {rate_hz} Hz \
+                     not representable in whole millihertz"
+                ),
+                at: 0,
+            });
+        }
+    };
+    if base_mhz % rate_mhz != 0 {
+        return Err(EvalError::UnsupportedConstruct {
+            kind: format!(
+                "base_rate_hz {base_rate_hz} Hz cannot schedule {who} at {rate_hz} Hz exactly: \
+                 {base_rate_hz}/{rate_hz} is not an integer tick period. Use a base every \
+                 scheduled rate divides exactly (e.g. their least common multiple), or omit \
+                 base_rate_hz to derive one automatically"
+            ),
+            at: 0,
+        });
+    }
+    Ok((base_mhz / rate_mhz) as usize)
 }
 
 /// One scheduled function together with its periodic execution rate in Hz, as
@@ -304,7 +392,8 @@ fn order_by_dependency_then_rate(loaded: &Loaded, rated: &mut Vec<ScheduledRated
 ///
 /// The grid advances at `base_rate_hz` (tick step `1 / base_rate_hz`). Each
 /// scheduled function runs only on the base ticks its **rate divisor** selects —
-/// `divisor = round(base_rate_hz / rate_hz)` — and when it runs it is handed its
+/// the exact integer `base_rate_hz / rate_hz` (a base that cannot represent a
+/// rate exactly is rejected, see [`exact_divisor`]) — and when it runs it is handed its
 /// **own** period as `dt = 1 / rate_hz`, the time elapsed since *its* last run,
 /// not the base step. So a 50 Hz function on a 100 Hz base runs every other tick
 /// and its stateful operators (e.g. `Integral.Normal`) integrate with `dt = 0.02`.
@@ -324,18 +413,20 @@ fn tick_loop(
     let ticks = tick_count(scenario.duration_s, base_rate_hz);
 
     // Precompute each function's rate divisor (how many base ticks between runs)
-    // and its per-run dt (its own period). `divisor` is at least 1 — a function
-    // whose rate exceeds the base still runs every tick rather than zero ticks.
+    // and its per-run dt (its own period). Divisors are exact integers — a base
+    // that cannot represent a scheduled rate exactly is rejected loudly rather
+    // than rounded (the old `round(base/rate)` ran a 200 Hz function at
+    // ~166.7 Hz on a 500 Hz base while handing it dt = 5 ms).
     let plans: Vec<RunPlan> = schedule
         .iter()
         .map(|r| {
-            let divisor = (base_rate_hz / r.rate_hz).round().max(1.0) as usize;
-            RunPlan {
+            let divisor = exact_divisor(base_rate_hz, r.rate_hz, r.sched.fn_symbol.as_deref())?;
+            Ok(RunPlan {
                 divisor,
                 dt: 1.0 / r.rate_hz,
-            }
+            })
         })
-        .collect();
+        .collect::<Result<_, EvalError>>()?;
 
     let mut env = Env::new();
     let mut state = StateStore::new();
@@ -438,8 +529,8 @@ fn tick_loop(
 /// One function's per-tick execution plan: how many base ticks between runs and
 /// the per-run time step (its own period).
 struct RunPlan {
-    /// `round(base_rate_hz / rate_hz)`, at least 1 — the function runs on every
-    /// base tick `i` where `i % divisor == 0`.
+    /// The exact integer `base_rate_hz / rate_hz` (from [`exact_divisor`]) — the
+    /// function runs on every base tick `i` where `i % divisor == 0`.
     divisor: usize,
     /// `1 / rate_hz` — the time since this function's previous run, handed to its
     /// stateful operators so accumulation is rate-correct.
@@ -1170,6 +1261,117 @@ mod tests {
         load(&dir.join("Project.m1prj"), None).expect("multirate fixture loads")
     }
 
+    fn ratemix() -> Loaded {
+        let dir = Path::new(env!("CARGO_MANIFEST_DIR")).join("tests/fixtures/ratemix");
+        load(&dir.join("Project.m1prj"), None).expect("ratemix fixture loads")
+    }
+
+    #[test]
+    fn auto_base_is_lcm_of_scheduled_rates() {
+        // 500 Hz and 200 Hz do not divide each other: neither rate can serve as
+        // the base without a fractional divisor. The auto base must be their
+        // least common multiple (1000 Hz) so both have exact integer periods.
+        // A 0.01 s run therefore spans 10 ticks (not 5 at a 500 Hz base).
+        let loaded = ratemix();
+        let toml = r#"
+mode = "whole-project"
+duration_s = 0.01
+
+[[inputs]]
+channel = "Root.RX.Seed"
+const = 3.0
+"#;
+        let scenario = Scenario::from_toml_str(toml).unwrap();
+        let trace = run(&loaded, &scenario).expect("auto-base ratemix run succeeds");
+        assert_eq!(trace.time.len(), 10, "auto base = lcm(500, 200) = 1000 Hz");
+    }
+
+    #[test]
+    fn exact_invocation_counts_and_dt_at_500_and_200_hz() {
+        // Over exactly one second the 500 Hz counter must run exactly 500 times
+        // and the 200 Hz counter exactly 200 times — the rounded-divisor
+        // scheduler ran the 200 Hz function 167 times (round(500/200) = 3) on a
+        // 500 Hz base. Each function counts its own invocations.
+        //
+        // Exact dt: trapezoidal Integral.Normal of a constant Seed = 3 advances
+        // by Seed*dt per run from the second run on (run k holds 3*dt*k), so
+        // after 200 runs Mid Total = 3.0 * 0.005 * 199 = 2.985 exactly — only
+        // when dt is exactly 5 ms AND the invocation count is exactly 200.
+        let loaded = ratemix();
+        let toml = r#"
+mode = "whole-project"
+duration_s = 1.0
+
+[[inputs]]
+channel = "Root.RX.Seed"
+const = 3.0
+"#;
+        let scenario = Scenario::from_toml_str(toml).unwrap();
+        let trace = run(&loaded, &scenario).expect("ratemix run succeeds");
+
+        let last_f64 = |name: &str| -> f64 {
+            match trace.channels.get(name).expect(name).last().expect(name) {
+                Value::Float(x) => *x,
+                other => panic!("expected float for {name}, got {other:?}"),
+            }
+        };
+        assert_eq!(last_f64("Root.RX.Fast Count"), 500.0, "500 Hz runs/second");
+        assert_eq!(last_f64("Root.RX.Mid Count"), 200.0, "200 Hz runs/second");
+        let total = last_f64("Root.RX.Mid Total");
+        assert!(
+            (total - 2.985).abs() < 1e-9,
+            "exact dt=5 ms trapezoidal accumulation, got {total}"
+        );
+    }
+
+    #[test]
+    fn pinned_base_not_exactly_divisible_is_rejected() {
+        // A pinned 500 Hz base cannot represent a 200 Hz function exactly
+        // (500/200 = 2.5): the run must fail loud rather than round the divisor
+        // and silently run the function at ~166.7 Hz.
+        let loaded = ratemix();
+        let toml = r#"
+mode = "whole-project"
+duration_s = 0.01
+base_rate_hz = 500.0
+
+[[inputs]]
+channel = "Root.RX.Seed"
+const = 3.0
+"#;
+        let scenario = Scenario::from_toml_str(toml).unwrap();
+        let err = run(&loaded, &scenario).expect_err("500 Hz base with a 200 Hz rate must fail");
+        let msg = format!("{err}");
+        assert!(
+            msg.contains("200") && msg.contains("500"),
+            "error names the incompatible rate and base: {msg}"
+        );
+    }
+
+    #[test]
+    fn pinned_base_below_fastest_rate_is_rejected() {
+        // A 50 Hz base cannot schedule the multirate fixture's 100 Hz functions:
+        // the old scheduler clamped the divisor to 1 and silently ran them at
+        // 50 Hz. It must fail loud instead.
+        let loaded = multirate();
+        let toml = r#"
+mode = "whole-project"
+duration_s = 0.1
+base_rate_hz = 50.0
+
+[[inputs]]
+channel = "Root.MR.Seed"
+const = 3.0
+"#;
+        let scenario = Scenario::from_toml_str(toml).unwrap();
+        let err = run(&loaded, &scenario).expect_err("base below fastest rate must fail");
+        let msg = format!("{err}");
+        assert!(
+            msg.contains("100") && msg.contains("50"),
+            "error names the too-fast rate and the base: {msg}"
+        );
+    }
+
     #[test]
     fn enumerate_scheduled_keeps_periodic_excludes_startup() {
         // The multirate fixture has four periodic functions (two 50 Hz, two
@@ -1430,10 +1632,10 @@ const = 4.0
     }
 
     #[test]
-    fn base_rate_defaults_to_fastest_scheduled_rate_when_unset() {
+    fn base_rate_defaults_to_lcm_of_scheduled_rates_when_unset() {
         // With base_rate_hz omitted (0.0 = "auto"), the whole-project runner uses
-        // the fastest scheduled rate (100 Hz here) as the base tick. So a 0.05 s
-        // run produces 5 ticks (not e.g. 2 or 3 at some slower default), the
+        // the least common multiple of the scheduled rates as the base tick —
+        // lcm(100, 50) = 100 Hz here, so a 0.05 s run produces 5 ticks, the
         // 100 Hz functions run every tick, and the 50 Hz ones run every other.
         let loaded = multirate();
         let toml = r#"
@@ -1455,7 +1657,7 @@ const = 6.0
         assert_eq!(
             trace.time.len(),
             5,
-            "auto base = fastest scheduled rate (100 Hz)"
+            "auto base = lcm of scheduled rates (100 Hz)"
         );
         // The fast group ran every tick: Slow Out = Seed*2 = 6 on the even ticks
         // it ran; Fast Writer reads it (stale-tolerant) and writes Fast Shared.

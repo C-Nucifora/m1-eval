@@ -49,8 +49,9 @@ target = "Engine.Update"     # function name (function mode) or channel (cone mo
 duration_s = 1.0             # run length in seconds; ticks span [0, duration_s)
 base_rate_hz = 100.0         # base tick rate; dt = 1 / base_rate_hz. In
                              # whole-project mode this is the base grid and each
-                             # function runs every base_rate_hz / rate_hz ticks;
-                             # when 0/absent it defaults to the fastest scheduled rate
+                             # function runs every base_rate_hz / rate_hz ticks
+                             # (must divide exactly — an inexact ratio is rejected);
+                             # when 0/absent it defaults to the lcm of the scheduled rates
 
 # Inputs the engine is *given* rather than computes. Each entry is a constant
 # or a (t_seconds, value) time series sampled by zero-order hold.

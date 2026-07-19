@@ -341,7 +341,8 @@ struct RawScenario {
     target: Option<String>,
     duration_s: f64,
     /// Base tick rate in Hz. Optional: when omitted (or `0`) in `whole-project`
-    /// mode the runner uses the fastest scheduled rate as the base tick. The
+    /// mode the runner derives the least common multiple of the scheduled rates
+    /// as the base tick (so every rate has an exact integer period). The
     /// `function`/`cone` modes still require a positive value (they have no
     /// schedule to derive a default from).
     #[serde(default)]
@@ -411,8 +412,8 @@ impl RawScenario {
                 });
             }
         };
-        // `whole-project` accepts a missing/zero base rate (the runner defaults
-        // it to the fastest scheduled rate). Every other mode needs an explicit
+        // `whole-project` accepts a missing/zero base rate (the runner derives
+        // the lcm of the scheduled rates). Every other mode needs an explicit
         // positive base tick — there is no schedule to derive one from. A
         // negative rate is always invalid.
         if self.base_rate_hz < 0.0 {
@@ -638,7 +639,7 @@ const = 20.0
     #[test]
     fn whole_project_mode_parses_without_base_rate() {
         // Whole-project mode may omit `base_rate_hz` entirely: the runner then
-        // defaults the base tick to the fastest scheduled rate. The parsed
+        // derives the base tick (lcm of the scheduled rates). The parsed
         // scenario carries 0.0 as the "auto" sentinel.
         let toml = r#"
 mode = "whole-project"
