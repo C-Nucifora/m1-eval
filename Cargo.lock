@@ -292,7 +292,7 @@ dependencies = [
 
 [[package]]
 name = "m1-eval"
-version = "0.3.1"
+version = "0.3.2"
 dependencies = [
  "assert_cmd",
  "clap",
@@ -309,8 +309,8 @@ dependencies = [
 
 [[package]]
 name = "m1-typecheck"
-version = "0.46.0"
-source = "git+https://github.com/C-Nucifora/m1-typecheck.git?tag=v0.46.0#469ce2a78fcb42f435cb7a0fad5c6617c1b44694"
+version = "0.47.0"
+source = "git+https://github.com/C-Nucifora/m1-typecheck.git?tag=v0.47.0#91f4407536853e86a005fbb2cb102032686a6411"
 dependencies = [
  "clap",
  "m1-core",
