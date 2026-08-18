@@ -486,6 +486,9 @@ fn tick_loop(
         for (path, series) in &overrides {
             env.set(path.clone(), series.sample(0.0));
         }
+        for io in &scenario.io {
+            env.set_io_override(io.call.clone(), io.sample(0.0));
+        }
         for sched in &startup {
             let root = sched.script.cst.root();
             let mut ctx = EvalCtx {
@@ -523,6 +526,13 @@ fn tick_loop(
         for (path, series) in &overrides {
             let value = crate::expr::coerce_for_channel(path, series.sample(t), &loaded.project);
             env.set(path.clone(), value);
+        }
+        // IO-call overrides are resampled on the same grid. The key is a call
+        // spelling (`"Object.Method"`), not a symbol path — no canonicalisation,
+        // no channel-type coercion; the evaluator's IO dispatch reads it back
+        // verbatim (`Env::io_override`) before any documented or typed stub.
+        for io in &scenario.io {
+            env.set_io_override(io.call.clone(), io.sample(t));
         }
 
         // 2. Open the tick.
@@ -1383,6 +1393,7 @@ mod tests {
                 kind: InputKind::Const(Value::Int(2)),
             }],
             overrides: vec![],
+            io: vec![],
             allow_default_inputs: false,
         };
         let trace = run(&loaded, &scenario).expect("enum-seeded run evaluates");
