@@ -23,7 +23,8 @@ m1-eval [--project P] [--config C]
 | `--scenario <PATH>` | The scenario file (TOML or JSON; parser chosen by extension) describing how to drive the run. |
 | `--function <NAME>` | Override the scenario's mode: run this single function each tick. Mutually exclusive with `--target` and `--whole-project`. |
 | `--target <CHANNEL>` | Override the scenario's mode: run this target channel plus its upstream dependency cone. Mutually exclusive with `--function` and `--whole-project`. |
-| `--whole-project` | Override the scenario's mode: run the whole-project multi-rate scheduler (every periodically-scheduled function at its own rate). Mutually exclusive with `--function` and `--target`. |
+| `--whole-project` | Override the scenario's mode: run the whole-project multi-rate scheduler (every periodically-scheduled function at its own rate; `On Startup` functions run once first). Mutually exclusive with `--function` and `--target`. |
+| `--allow-default-inputs` | Whole-project mode: substitute type-correct startup defaults for unseeded channel reads instead of failing loud. Every substitution is reported on stderr. Strict fail-loud is the default. |
 | `--out <PATH>` | Where to write the trace. Format follows the extension: `.csv` writes CSV, anything else (including `.json`) writes JSON. Without `--out`, the trace prints to stdout as JSON. |
 | `--log <PATH>` | Counterfactual replay: a recorded MoTeC log held as ground truth (`.csv`, or `.ld` with `--features ld`). Triggers a counterfactual run instead of a scenario run. |
 | `--override <CH=expr>` | Pin a logged channel to a constant or expression for the counterfactual run, recomputing only its downstream cone. Repeatable (override several channels). Requires `--log`. |
@@ -49,8 +50,12 @@ target = "Engine.Update"     # function name (function mode) or channel (cone mo
 duration_s = 1.0             # run length in seconds; ticks span [0, duration_s)
 base_rate_hz = 100.0         # base tick rate; dt = 1 / base_rate_hz. In
                              # whole-project mode this is the base grid and each
-                             # function runs every base_rate_hz / rate_hz ticks;
-                             # when 0/absent it defaults to the fastest scheduled rate
+                             # function runs every base_rate_hz / rate_hz ticks
+                             # (must divide exactly — an inexact ratio is rejected);
+                             # when 0/absent it defaults to the lcm of the scheduled rates
+allow_default_inputs = false # whole-project only: opt-in default substitution
+                             # for unseeded channel reads (reported; strict
+                             # fail-loud when absent/false)
 
 # Inputs the engine is *given* rather than computes. Each entry is a constant
 # or a (t_seconds, value) time series sampled by zero-order hold.

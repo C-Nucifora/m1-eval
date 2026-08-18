@@ -73,6 +73,13 @@ struct Args {
     #[arg(long)]
     whole_project: bool,
 
+    /// Whole-project mode: substitute type-correct startup defaults for
+    /// unseeded channel reads instead of failing loud. Every substitution is
+    /// reported on stderr (channel, value, first reading script). Strict
+    /// fail-loud is the default.
+    #[arg(long)]
+    allow_default_inputs: bool,
+
     /// Where to write the trace. Format is inferred from the extension
     /// (.json or .csv); without --out the trace prints to stdout as JSON.
     #[arg(long)]
@@ -269,6 +276,9 @@ fn main() {
             args.target,
             args.whole_project,
         );
+        // The CLI flag is an OR over the scenario's own opt-in — it can enable
+        // defaulting, never silently disable what the scenario asked for.
+        scenario.allow_default_inputs |= args.allow_default_inputs;
 
         let trace = match engine.run(&scenario) {
             Ok(t) => t,
@@ -277,6 +287,21 @@ fn main() {
                 process::exit(1);
             }
         };
+
+        // Honest accounting: every input the run GUESSED (type-correct startup
+        // default under the explicit opt-in) is reported, not silently absorbed.
+        if !trace.defaulted.is_empty() {
+            eprintln!(
+                "m1-eval: {} unseeded input(s) substituted with startup defaults (--allow-default-inputs):",
+                trace.defaulted.len()
+            );
+            for (path, d) in &trace.defaulted {
+                eprintln!(
+                    "  {path} = {:?} (first read by {})",
+                    d.value, d.first_reader
+                );
+            }
+        }
 
         match args.out {
             Some(out) => {

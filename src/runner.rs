@@ -15,12 +15,14 @@
 //! The grid advances at `base_rate_hz` (tick step `1 / base_rate_hz`). For the
 //! single-function and cone runners every function shares that base rate, so it
 //! runs every tick with the base step. For the whole-project runner each function
-//! runs only on the base ticks its **rate divisor** (`round(base / rate)`) selects
-//! and is stepped by its **own** period (`dt = 1 / rate`), so a 50 Hz function on
+//! runs only on the base ticks its **rate divisor** (the exact integer
+//! `base / rate`; an inexact ratio is rejected) selects and is stepped by its
+//! **own** period (`dt = 1 / rate`), so a 50 Hz function on
 //! a 100 Hz base runs every other tick and integrates with `dt = 0.02`. Functions
 //! not run on a tick hold their last-written channels (zero-order hold). When the
-//! whole-project scenario pins no `base_rate_hz`, the base defaults to the fastest
-//! scheduled rate.
+//! whole-project scenario pins no `base_rate_hz`, the base defaults to the least
+//! common multiple of the scheduled rates, so every function has an exact integer
+//! tick period.
 //!
 //! The loop, in order, each tick:
 //!
@@ -127,24 +129,120 @@ fn require_base_rate(scenario: &Scenario) -> Result<f64, EvalError> {
 }
 
 /// Resolve the whole-project base tick rate. When the scenario pins a positive
-/// `base_rate_hz` it is used verbatim; when it is absent (0.0, the "auto"
-/// sentinel) the base defaults to the **fastest** scheduled rate so every
-/// function divides the base cleanly and the fastest loop runs every tick. An
-/// empty schedule with no pinned base has no rate to derive — fail loud.
+/// `base_rate_hz` it is used verbatim (the tick loop then rejects it unless
+/// every scheduled rate divides it exactly); when it is absent (0.0, the "auto"
+/// sentinel) the base is the **least common multiple** of the scheduled rates,
+/// so every function has an exact integer tick period — e.g. rates {500, 200}
+/// yield a 1000 Hz base, never a rounded 2.5-tick period. An empty schedule
+/// with no pinned base has no rate to derive — fail loud.
 fn resolve_base_rate(scenario: &Scenario, schedule: &[ScheduledRated]) -> Result<f64, EvalError> {
     if scenario.base_rate_hz > 0.0 {
         return Ok(scenario.base_rate_hz);
     }
-    schedule
-        .iter()
-        .map(|r| r.rate_hz)
-        .fold(None::<f64>, |acc, r| Some(acc.map_or(r, |m| m.max(r))))
-        .ok_or_else(|| EvalError::UnsupportedConstruct {
+    if schedule.is_empty() {
+        return Err(EvalError::UnsupportedConstruct {
             kind:
                 "whole-project run has no scheduled functions and no base_rate_hz to default from"
                     .to_string(),
             at: 0,
-        })
+        });
+    }
+    lcm_rate_hz(schedule.iter().map(|r| r.rate_hz)).ok_or_else(|| EvalError::UnsupportedConstruct {
+        kind: "no practical exact common base for the scheduled rates (a rate is not \
+               representable in whole millihertz, or the lcm exceeds 1 MHz); pin \
+               base_rate_hz to a rate every scheduled rate divides exactly"
+            .to_string(),
+        at: 0,
+    })
+}
+
+/// The least common multiple of `rates` as an exact base rate in Hz — the
+/// smallest grid every rate divides with an integer tick period. `None` when
+/// the iterator is empty, a rate is not representable in whole millihertz, or
+/// the lcm exceeds the 1 MHz cap (beyond which the tick grid explodes).
+pub(crate) fn lcm_rate_hz(rates: impl IntoIterator<Item = f64>) -> Option<f64> {
+    let mut lcm_mhz: u64 = 0;
+    for r in rates {
+        let mhz = millihertz(r)?;
+        lcm_mhz = if lcm_mhz == 0 {
+            mhz
+        } else {
+            lcm_mhz / gcd(lcm_mhz, mhz) * mhz
+        };
+        if lcm_mhz > 1_000_000_000 {
+            return None;
+        }
+    }
+    if lcm_mhz == 0 {
+        None
+    } else {
+        Some(lcm_mhz as f64 / 1000.0)
+    }
+}
+
+/// A rate as exact integer millihertz, or `None` when it is not representable
+/// (non-positive, non-finite, or fractional below 1 mHz). Integer millihertz is
+/// the exact arithmetic domain for divisor/LCM computation: project rates are
+/// whole Hz in practice, and 1 mHz resolution covers slow event rates without
+/// floating-point rounding.
+fn millihertz(rate_hz: f64) -> Option<u64> {
+    if !rate_hz.is_finite() || rate_hz <= 0.0 {
+        return None;
+    }
+    let m = rate_hz * 1000.0;
+    let r = m.round();
+    if r >= 1.0 && (m - r).abs() < 1e-6 {
+        Some(r as u64)
+    } else {
+        None
+    }
+}
+
+/// Greatest common divisor (Euclid). `gcd(a, 0) = a`.
+fn gcd(mut a: u64, mut b: u64) -> u64 {
+    while b != 0 {
+        (a, b) = (b, a % b);
+    }
+    a
+}
+
+/// The exact tick divisor for `rate_hz` on a `base_rate_hz` grid, or an error
+/// when the base cannot represent the rate exactly. Replaces the old
+/// `round(base/rate)` divisor, which silently ran a 200 Hz function every 3
+/// ticks of a 500 Hz base (~166.7 Hz) while handing it dt = 5 ms. A rate
+/// faster than the base is rejected by the same exactness rule (its divisor
+/// would be fractional below 1), so a base below the fastest scheduled rate
+/// fails loud instead of clamping to every-tick.
+fn exact_divisor(
+    base_rate_hz: f64,
+    rate_hz: f64,
+    fn_symbol: Option<&str>,
+) -> Result<usize, EvalError> {
+    let who = fn_symbol.unwrap_or("<function>");
+    let (base_mhz, rate_mhz) = match (millihertz(base_rate_hz), millihertz(rate_hz)) {
+        (Some(b), Some(r)) => (b, r),
+        _ => {
+            return Err(EvalError::UnsupportedConstruct {
+                kind: format!(
+                    "cannot schedule {who}: base {base_rate_hz} Hz / rate {rate_hz} Hz \
+                     not representable in whole millihertz"
+                ),
+                at: 0,
+            });
+        }
+    };
+    if base_mhz % rate_mhz != 0 {
+        return Err(EvalError::UnsupportedConstruct {
+            kind: format!(
+                "base_rate_hz {base_rate_hz} Hz cannot schedule {who} at {rate_hz} Hz exactly: \
+                 {base_rate_hz}/{rate_hz} is not an integer tick period. Use a base every \
+                 scheduled rate divides exactly (e.g. their least common multiple), or omit \
+                 base_rate_hz to derive one automatically"
+            ),
+            at: 0,
+        });
+    }
+    Ok((base_mhz / rate_mhz) as usize)
 }
 
 /// One scheduled function together with its periodic execution rate in Hz, as
@@ -304,7 +402,8 @@ fn order_by_dependency_then_rate(loaded: &Loaded, rated: &mut Vec<ScheduledRated
 ///
 /// The grid advances at `base_rate_hz` (tick step `1 / base_rate_hz`). Each
 /// scheduled function runs only on the base ticks its **rate divisor** selects —
-/// `divisor = round(base_rate_hz / rate_hz)` — and when it runs it is handed its
+/// the exact integer `base_rate_hz / rate_hz` (a base that cannot represent a
+/// rate exactly is rejected, see [`exact_divisor`]) — and when it runs it is handed its
 /// **own** period as `dt = 1 / rate_hz`, the time elapsed since *its* last run,
 /// not the base step. So a 50 Hz function on a 100 Hz base runs every other tick
 /// and its stateful operators (e.g. `Integral.Normal`) integrate with `dt = 0.02`.
@@ -324,39 +423,47 @@ fn tick_loop(
     let ticks = tick_count(scenario.duration_s, base_rate_hz);
 
     // Precompute each function's rate divisor (how many base ticks between runs)
-    // and its per-run dt (its own period). `divisor` is at least 1 — a function
-    // whose rate exceeds the base still runs every tick rather than zero ticks.
+    // and its per-run dt (its own period). Divisors are exact integers — a base
+    // that cannot represent a scheduled rate exactly is rejected loudly rather
+    // than rounded (the old `round(base/rate)` ran a 200 Hz function at
+    // ~166.7 Hz on a 500 Hz base while handing it dt = 5 ms).
     let plans: Vec<RunPlan> = schedule
         .iter()
         .map(|r| {
-            let divisor = (base_rate_hz / r.rate_hz).round().max(1.0) as usize;
-            RunPlan {
+            let divisor = exact_divisor(base_rate_hz, r.rate_hz, r.sched.fn_symbol.as_deref())?;
+            Ok(RunPlan {
                 divisor,
                 dt: 1.0 / r.rate_hz,
-            }
+            })
         })
-        .collect();
+        .collect::<Result<_, EvalError>>()?;
 
     let mut env = Env::new();
     let mut state = StateStore::new();
     let mut trace = Trace::new();
 
-    // In **whole-project** mode there is no scenario driving the sensor/CAN inputs
-    // and no calibration seeding the tunables, so an unseeded *channel* read falls
-    // back to its type-correct startup default (flagged externally driven) rather
-    // than aborting the run — the channel-side analogue of the Tier-3 IO stubs.
-    // This covers every unseeded read uniformly: a hardware sensor channel, a CAN
-    // signal, a table-output `.Value` the auto-`Lookup` would compute, and a state
-    // channel read before its writer's first run. It propagates to inline
-    // user-function callees (they share this env). In `function`/`cone` mode the
-    // flag stays `false`, so a read of an unprovided input still fails loud — the
-    // scenario must drive every channel a single function reads.
-    env.default_unseeded_channels = matches!(scenario.mode, RunMode::WholeProject);
+    // Unseeded-channel defaulting is the scenario's EXPLICIT opt-in
+    // (`allow_default_inputs = true`, whole-project mode only): an unseeded
+    // channel read then falls back to its type-correct startup default, and
+    // every substitution is reported on the trace (channel, value, first
+    // reader). Strict fail-loud is the baseline in every mode — a missing input
+    // aborts the run rather than quietly becoming a guessed number.
+    env.default_unseeded_channels =
+        matches!(scenario.mode, RunMode::WholeProject) && scenario.allow_default_inputs;
 
     // The union of every channel the schedule writes, computed once: on a tick a
     // function holds (does not run), we repeat its last value from `env` for these
-    // channels so the trace stays a dense grid (zero-order hold).
-    let scheduled_writes = schedule_writes(loaded, schedule);
+    // channels so the trace stays a dense grid (zero-order hold). Startup
+    // functions' writes are included so their once-written outputs appear (and
+    // hold) as trace columns from the first tick.
+    let startup = startup_schedule(loaded, scenario);
+    let mut scheduled_writes = schedule_writes(loaded, schedule);
+    for sched in &startup {
+        let io = io_sets(sched.script, &loaded.project, sched.group.as_deref());
+        for w in io.writes {
+            scheduled_writes.insert(w);
+        }
+    }
 
     // Canonicalise each scenario input/override channel once, against the first
     // scheduled function's scope (all scheduled functions share the project; the
@@ -365,6 +472,41 @@ fn tick_loop(
     let scope_fn = schedule.first().and_then(|s| s.sched.fn_symbol.as_deref());
     let inputs = canonicalise(&scenario.inputs, loaded, scope_group, scope_fn);
     let overrides = canonicalise(&scenario.overrides, loaded, scope_group, scope_fn);
+
+    // Run every On-Startup function exactly once, before the periodic grid —
+    // the ECU's initialisation pass. Inputs/overrides are seeded at t = 0 first
+    // so startup code can read scenario-driven channels; writes land in the
+    // shared env (no trace tick is open yet) and surface via the zero-order
+    // hold from tick 0 on. dt is the base period — startup code has no rate of
+    // its own, and its stateful operators see one nominal step.
+    if !startup.is_empty() {
+        for (path, series) in &inputs {
+            env.set(path.clone(), series.sample(0.0));
+        }
+        for (path, series) in &overrides {
+            env.set(path.clone(), series.sample(0.0));
+        }
+        for sched in &startup {
+            let root = sched.script.cst.root();
+            let mut ctx = EvalCtx {
+                project: &loaded.project,
+                calib: &loaded.calib,
+                env: &mut env,
+                state: &mut state,
+                group: sched.group.as_deref(),
+                fn_symbol: sched.fn_symbol.as_deref(),
+                script_name: &sched.script.name,
+                dt: 1.0 / base_rate_hz,
+                scripts: &loaded.scripts,
+                depth: 0,
+                // No trace: no tick is open yet, and record_channel appends
+                // blindly — a startup record would desync columns from the time
+                // axis. Startup writes surface via the tick-0 zero-order hold.
+                trace: None,
+            };
+            exec_script(&root, &mut ctx)?;
+        }
+    }
 
     for i in 0..ticks {
         let t = i as f64 / base_rate_hz;
@@ -444,12 +586,40 @@ fn tick_loop(
 /// One function's per-tick execution plan: how many base ticks between runs and
 /// the per-run time step (its own period).
 struct RunPlan {
-    /// `round(base_rate_hz / rate_hz)`, at least 1 — the function runs on every
-    /// base tick `i` where `i % divisor == 0`.
+    /// The exact integer `base_rate_hz / rate_hz` (from [`exact_divisor`]) — the
+    /// function runs on every base tick `i` where `i % divisor == 0`.
     divisor: usize,
     /// `1 / rate_hz` — the time since this function's previous run, handed to its
     /// stateful operators so accumulation is rate-correct.
     dt: f64,
+}
+
+/// The On-Startup functions to run once before the periodic loop, in
+/// writer-before-reader order — whole-project mode only (function/cone modes
+/// pin a single explicit target and model no initialisation pass). Each
+/// `startup_fn_symbols` entry (from the loader's trigger scan) is matched back
+/// to its parsed script; ordering reuses the same single-group topological
+/// machinery as the periodic schedule (nominal rate, stripped after ordering).
+fn startup_schedule<'a>(loaded: &'a Loaded, scenario: &Scenario) -> Vec<Scheduled<'a>> {
+    if !matches!(scenario.mode, RunMode::WholeProject) || loaded.startup_fn_symbols.is_empty() {
+        return Vec::new();
+    }
+    let mut rated: Vec<ScheduledRated> = loaded
+        .scripts
+        .iter()
+        .filter_map(|script| {
+            let fn_symbol = loaded.project.function_symbol_for_script(&script.name)?;
+            if !loaded.startup_fn_symbols.contains(&fn_symbol) {
+                return None;
+            }
+            Some(ScheduledRated {
+                sched: scheduled_for(loaded, script),
+                rate_hz: 1.0,
+            })
+        })
+        .collect();
+    order_by_dependency_then_rate(loaded, &mut rated);
+    rated.into_iter().map(|r| r.sched).collect()
 }
 
 /// The union of every channel any scheduled function writes (canonical paths),
@@ -867,14 +1037,41 @@ pub fn run_counterfactual(
     // The union of channels the cone writes, so a cone function that does not run
     // on a tick holds its last value (zero-order hold) — reusing the schedule-write
     // hold machinery the tick loop already relies on.
+    //
+    // Each cone function keeps its **declared** project rate (its trigger's
+    // `call_rate_hz`): a 10 Hz state machine in the cone runs every 10th tick of
+    // a 100 Hz replay with dt = 0.1 s, exactly as scheduled on the ECU — not
+    // once per base tick, which over-ran slow filters/integrators/debounce
+    // logic 10x. A function without a resolvable periodic rate (no trigger)
+    // falls back to the base rate, preserving the pre-rate behaviour for
+    // untriggered fixtures.
     let rated: Vec<ScheduledRated> = cone
         .into_iter()
-        .map(|sched| ScheduledRated {
-            sched,
-            rate_hz: base_rate_hz,
+        .map(|sched| {
+            let rate_hz = sched
+                .fn_symbol
+                .as_deref()
+                .and_then(|f| loaded.project.symbols().get(f))
+                .and_then(|s| s.call_rate_hz)
+                .unwrap_or(base_rate_hz);
+            ScheduledRated { sched, rate_hz }
         })
         .collect();
     let scheduled_writes = schedule_writes(loaded, &rated);
+
+    // Exact per-function divisors and dt on the replay grid — the same exactness
+    // rule as the whole-project scheduler: a base that cannot represent a cone
+    // rate exactly is rejected loudly rather than rounded.
+    let plans: Vec<RunPlan> = rated
+        .iter()
+        .map(|r| {
+            let divisor = exact_divisor(base_rate_hz, r.rate_hz, r.sched.fn_symbol.as_deref())?;
+            Ok(RunPlan {
+                divisor,
+                dt: 1.0 / r.rate_hz,
+            })
+        })
+        .collect::<Result<_, EvalError>>()?;
 
     let ticks = tick_count(duration_s, base_rate_hz);
     let mut env = Env::new();
@@ -948,10 +1145,14 @@ pub fn run_counterfactual(
         // 3. Open the tick.
         trace.push_tick(t);
 
-        // 4. Run only the cone functions, writer-before-reader. Each recomputes its
+        // 4. Run only the cone functions, writer-before-reader, each gated to its
+        //    own declared rate with its own period as dt. Each recomputes its
         //    downstream channel from the overridden inputs; everything else holds
         //    its logged (or overridden) value.
-        for rated in &rated {
+        for (rated, plan) in rated.iter().zip(plans.iter()) {
+            if i % plan.divisor != 0 {
+                continue;
+            }
             let sched = &rated.sched;
             let root = sched.script.cst.root();
             let mut ctx = EvalCtx {
@@ -962,7 +1163,7 @@ pub fn run_counterfactual(
                 group: sched.group.as_deref(),
                 fn_symbol: sched.fn_symbol.as_deref(),
                 script_name: &sched.script.name,
-                dt: 1.0 / base_rate_hz,
+                dt: plan.dt,
                 scripts: &loaded.scripts,
                 depth: 0,
                 trace: Some(&mut trace),
@@ -1202,6 +1403,207 @@ mod tests {
         load(&dir.join("Project.m1prj"), None).expect("multirate fixture loads")
     }
 
+    fn ratemix() -> Loaded {
+        let dir = Path::new(env!("CARGO_MANIFEST_DIR")).join("tests/fixtures/ratemix");
+        load(&dir.join("Project.m1prj"), None).expect("ratemix fixture loads")
+    }
+
+    #[test]
+    fn auto_base_is_lcm_of_scheduled_rates() {
+        // 500 Hz and 200 Hz do not divide each other: neither rate can serve as
+        // the base without a fractional divisor. The auto base must be their
+        // least common multiple (1000 Hz) so both have exact integer periods.
+        // A 0.01 s run therefore spans 10 ticks (not 5 at a 500 Hz base).
+        let loaded = ratemix();
+        let toml = r#"
+mode = "whole-project"
+duration_s = 0.01
+allow_default_inputs = true
+
+[[inputs]]
+channel = "Root.RX.Seed"
+const = 3.0
+"#;
+        let scenario = Scenario::from_toml_str(toml).unwrap();
+        let trace = run(&loaded, &scenario).expect("auto-base ratemix run succeeds");
+        assert_eq!(trace.time.len(), 10, "auto base = lcm(500, 200) = 1000 Hz");
+    }
+
+    #[test]
+    fn exact_invocation_counts_and_dt_at_500_and_200_hz() {
+        // Over exactly one second the 500 Hz counter must run exactly 500 times
+        // and the 200 Hz counter exactly 200 times — the rounded-divisor
+        // scheduler ran the 200 Hz function 167 times (round(500/200) = 3) on a
+        // 500 Hz base. Each function counts its own invocations.
+        //
+        // Exact dt: trapezoidal Integral.Normal of a constant Seed = 3 advances
+        // by Seed*dt per run from the second run on (run k holds 3*dt*k), so
+        // after 200 runs Mid Total = 3.0 * 0.005 * 199 = 2.985 exactly — only
+        // when dt is exactly 5 ms AND the invocation count is exactly 200.
+        let loaded = ratemix();
+        let toml = r#"
+mode = "whole-project"
+duration_s = 1.0
+allow_default_inputs = true
+
+[[inputs]]
+channel = "Root.RX.Seed"
+const = 3.0
+"#;
+        let scenario = Scenario::from_toml_str(toml).unwrap();
+        let trace = run(&loaded, &scenario).expect("ratemix run succeeds");
+
+        let last_f64 = |name: &str| -> f64 {
+            match trace.channels.get(name).expect(name).last().expect(name) {
+                Value::Float(x) => *x,
+                other => panic!("expected float for {name}, got {other:?}"),
+            }
+        };
+        assert_eq!(last_f64("Root.RX.Fast Count"), 500.0, "500 Hz runs/second");
+        assert_eq!(last_f64("Root.RX.Mid Count"), 200.0, "200 Hz runs/second");
+        let total = last_f64("Root.RX.Mid Total");
+        assert!(
+            (total - 2.985).abs() < 1e-9,
+            "exact dt=5 ms trapezoidal accumulation, got {total}"
+        );
+    }
+
+    #[test]
+    fn whole_project_is_strict_by_default_on_unseeded_channels() {
+        // ratemix's counters read their own (unseeded) channels. Whole-project
+        // mode used to silently substitute type-correct defaults for every
+        // unseeded read; strict fail-loud is now the default and defaulting is
+        // the scenario's explicit opt-in (`allow_default_inputs = true`).
+        let loaded = ratemix();
+        let toml = r#"
+mode = "whole-project"
+duration_s = 0.01
+
+[[inputs]]
+channel = "Root.RX.Seed"
+const = 3.0
+"#;
+        let scenario = Scenario::from_toml_str(toml).unwrap();
+        let err = run(&loaded, &scenario).expect_err("unseeded channel must fail loud");
+        assert!(
+            matches!(err, EvalError::MissingInput { .. }),
+            "expected MissingInput, got {err:?}"
+        );
+    }
+
+    #[test]
+    fn allow_default_inputs_defaults_and_reports_substitutions() {
+        // With the explicit opt-in, unseeded channel reads fall back to their
+        // type-correct startup defaults — and every substitution is REPORTED on
+        // the trace: channel, substituted value, and the first reading script.
+        let loaded = ratemix();
+        let toml = r#"
+mode = "whole-project"
+duration_s = 0.01
+allow_default_inputs = true
+
+[[inputs]]
+channel = "Root.RX.Seed"
+const = 3.0
+"#;
+        let scenario = Scenario::from_toml_str(toml).unwrap();
+        let trace = run(&loaded, &scenario).expect("opt-in defaulted run succeeds");
+        let fast = trace
+            .defaulted
+            .get("Root.RX.Fast Count")
+            .expect("Fast Count substitution reported");
+        assert_eq!(fast.value, Value::Float(0.0));
+        assert_eq!(fast.first_reader, "RX.Fast Counter.m1scr");
+        assert!(
+            trace.defaulted.contains_key("Root.RX.Mid Count"),
+            "Mid Count substitution reported: {:?}",
+            trace.defaulted.keys().collect::<Vec<_>>()
+        );
+        // The seeded input is NOT a substitution.
+        assert!(!trace.defaulted.contains_key("Root.RX.Seed"));
+    }
+
+    #[test]
+    fn startup_functions_run_once_before_the_periodic_loop() {
+        // The multirate fixture's Root.MR.Init (On Startup) writes Started = 1.
+        // Whole-project mode used to skip startup functions entirely; they now
+        // run exactly once, before the first periodic tick, and their outputs
+        // hold (zero-order) across the whole trace.
+        let loaded = multirate();
+        let toml = r#"
+mode = "whole-project"
+duration_s = 0.05
+base_rate_hz = 100.0
+
+[[inputs]]
+channel = "Root.MR.Seed"
+const = 3.0
+
+[[inputs]]
+channel = "Root.MR.Slow Out"
+const = 6.0
+"#;
+        let scenario = Scenario::from_toml_str(toml).unwrap();
+        let trace = run(&loaded, &scenario).expect("whole-project run succeeds");
+        let started = trace
+            .channels
+            .get("Root.MR.Started")
+            .expect("startup-written channel appears in the trace");
+        assert_eq!(started.len(), 5, "held across every tick");
+        assert!(
+            started.iter().all(|v| *v == Value::Float(1.0)),
+            "startup ran once and its output holds: {started:?}"
+        );
+    }
+
+    #[test]
+    fn pinned_base_not_exactly_divisible_is_rejected() {
+        // A pinned 500 Hz base cannot represent a 200 Hz function exactly
+        // (500/200 = 2.5): the run must fail loud rather than round the divisor
+        // and silently run the function at ~166.7 Hz.
+        let loaded = ratemix();
+        let toml = r#"
+mode = "whole-project"
+duration_s = 0.01
+base_rate_hz = 500.0
+
+[[inputs]]
+channel = "Root.RX.Seed"
+const = 3.0
+"#;
+        let scenario = Scenario::from_toml_str(toml).unwrap();
+        let err = run(&loaded, &scenario).expect_err("500 Hz base with a 200 Hz rate must fail");
+        let msg = format!("{err}");
+        assert!(
+            msg.contains("200") && msg.contains("500"),
+            "error names the incompatible rate and base: {msg}"
+        );
+    }
+
+    #[test]
+    fn pinned_base_below_fastest_rate_is_rejected() {
+        // A 50 Hz base cannot schedule the multirate fixture's 100 Hz functions:
+        // the old scheduler clamped the divisor to 1 and silently ran them at
+        // 50 Hz. It must fail loud instead.
+        let loaded = multirate();
+        let toml = r#"
+mode = "whole-project"
+duration_s = 0.1
+base_rate_hz = 50.0
+
+[[inputs]]
+channel = "Root.MR.Seed"
+const = 3.0
+"#;
+        let scenario = Scenario::from_toml_str(toml).unwrap();
+        let err = run(&loaded, &scenario).expect_err("base below fastest rate must fail");
+        let msg = format!("{err}");
+        assert!(
+            msg.contains("100") && msg.contains("50"),
+            "error names the too-fast rate and the base: {msg}"
+        );
+    }
+
     #[test]
     fn enumerate_scheduled_keeps_periodic_excludes_startup() {
         // The multirate fixture has four periodic functions (two 50 Hz, two
@@ -1310,11 +1712,12 @@ const = 6.0
         assert!(shared.iter().all(|v| *v == Value::Float(7.0)), "{shared:?}");
         assert!(fast.iter().all(|v| *v == Value::Float(70.0)), "{fast:?}");
 
-        // The startup function never runs in whole-project mode, so its channel
-        // is never written by the schedule.
+        // The startup function runs exactly once before the periodic loop, so
+        // its marker channel is present and holds its startup value.
+        let started = trace.channels.get("Root.MR.Started").expect("Started");
         assert!(
-            !trace.channels.contains_key("Root.MR.Started"),
-            "startup channel must not be produced"
+            started.iter().all(|v| *v == Value::Float(1.0)),
+            "startup marker holds: {started:?}"
         );
     }
 
@@ -1462,10 +1865,10 @@ const = 4.0
     }
 
     #[test]
-    fn base_rate_defaults_to_fastest_scheduled_rate_when_unset() {
+    fn base_rate_defaults_to_lcm_of_scheduled_rates_when_unset() {
         // With base_rate_hz omitted (0.0 = "auto"), the whole-project runner uses
-        // the fastest scheduled rate (100 Hz here) as the base tick. So a 0.05 s
-        // run produces 5 ticks (not e.g. 2 or 3 at some slower default), the
+        // the least common multiple of the scheduled rates as the base tick —
+        // lcm(100, 50) = 100 Hz here, so a 0.05 s run produces 5 ticks, the
         // 100 Hz functions run every tick, and the 50 Hz ones run every other.
         let loaded = multirate();
         let toml = r#"
@@ -1487,7 +1890,7 @@ const = 6.0
         assert_eq!(
             trace.time.len(),
             5,
-            "auto base = fastest scheduled rate (100 Hz)"
+            "auto base = lcm of scheduled rates (100 Hz)"
         );
         // The fast group ran every tick: Slow Out = Seed*2 = 6 on the even ticks
         // it ran; Fast Writer reads it (stale-tolerant) and writes Fast Shared.
@@ -1862,6 +2265,100 @@ base_rate_hz = 100.0
         // (c) Other is unrelated to the override cone: it passes through at its
         //     logged value (42) — C never runs in the cone.
         assert_eq!(floats(&trace, "Root.CF.Other"), vec![42.0, 42.0, 42.0]);
+    }
+
+    #[test]
+    fn counterfactual_preserves_declared_function_rates() {
+        // The cfrate fixture schedules Root.CR.Slow at 10 Hz. A counterfactual
+        // replay over a 100 Hz log must still run it at 10 Hz — every 10th base
+        // tick, with dt = 0.1 s — not once per base tick at dt = 0.01 s. The old
+        // implementation assigned every cone function the counterfactual base
+        // rate, so slow state machines/integrators ran 10x too often.
+        //
+        // Slow Ramp is a trapezoidal Integral.Normal of the constant 1: run k
+        // holds dt*k, so over a 1 s replay at 10 Hz it ends at 0.1*9 = 0.9 with
+        // exactly 9 plateau transitions (10 runs). The base-rate bug would end
+        // at 0.01*99 = 0.99 with 99 transitions.
+        let dir = Path::new(env!("CARGO_MANIFEST_DIR")).join("tests/fixtures/cfrate");
+        let loaded = load(&dir.join("Project.m1prj"), None).expect("cfrate fixture loads");
+        let n = 100;
+        let sensor = InputSeries {
+            channel: "Root.CR.Sensor".to_string(),
+            kind: InputKind::Series(
+                (0..n)
+                    .map(|i| (i as f64 * 0.01, Value::Float(5.0)))
+                    .collect(),
+            ),
+        };
+        let log = Log {
+            channels: vec![sensor],
+            meta: LogMeta {
+                source: "synthetic-cfrate".to_string(),
+                duration_s: 1.0,
+                channel_count: 1,
+                units: BTreeMap::new(),
+            },
+        };
+        let overrides = vec![Override::parse("Root.CR.Sensor=7.0").expect("parses")];
+        let cfg = CounterfactualCfg {
+            base_rate_hz: 100.0,
+            duration_s: 1.0,
+        };
+        let trace = run_counterfactual(&loaded, &log, &overrides, &cfg).expect("cf runs");
+
+        assert_eq!(trace.time.len(), 100, "1 s @ 100 Hz base grid");
+        let ramp = floats(&trace, "Root.CR.Slow Ramp");
+        let transitions = ramp.windows(2).filter(|w| w[1] != w[0]).count();
+        assert_eq!(
+            transitions, 9,
+            "10 Hz function runs 10 times over 1 s (9 ramp transitions), got {transitions}"
+        );
+        let last = *ramp.last().unwrap();
+        assert!(
+            (last - 0.9).abs() < 1e-9,
+            "dt = 0.1 s per run: final ramp 0.9, got {last}"
+        );
+        // The cone recompute itself still applies every run: Slow Echo reflects
+        // the overridden Sensor, held between runs.
+        let echo = floats(&trace, "Root.CR.Slow Echo");
+        assert!(
+            echo.iter().all(|v| *v == 14.0),
+            "Slow Echo = overridden Sensor * 2 on every tick (held between runs)"
+        );
+    }
+
+    #[test]
+    fn counterfactual_base_that_cannot_represent_a_cone_rate_is_rejected() {
+        // A counterfactual base the cone's declared rate does not divide exactly
+        // must fail loud, mirroring the whole-project scheduler's exactness rule.
+        // 25 Hz cannot represent the 10 Hz function (25/10 = 2.5).
+        let dir = Path::new(env!("CARGO_MANIFEST_DIR")).join("tests/fixtures/cfrate");
+        let loaded = load(&dir.join("Project.m1prj"), None).expect("cfrate fixture loads");
+        let sensor = InputSeries {
+            channel: "Root.CR.Sensor".to_string(),
+            kind: InputKind::Series(vec![(0.0, Value::Float(5.0))]),
+        };
+        let log = Log {
+            channels: vec![sensor],
+            meta: LogMeta {
+                source: "synthetic-cfrate".to_string(),
+                duration_s: 1.0,
+                channel_count: 1,
+                units: BTreeMap::new(),
+            },
+        };
+        let overrides = vec![Override::parse("Root.CR.Sensor=7.0").expect("parses")];
+        let cfg = CounterfactualCfg {
+            base_rate_hz: 25.0,
+            duration_s: 1.0,
+        };
+        let err = run_counterfactual(&loaded, &log, &overrides, &cfg)
+            .expect_err("25 Hz base with a 10 Hz cone function must fail");
+        let msg = format!("{err}");
+        assert!(
+            msg.contains("25") && msg.contains("cannot schedule"),
+            "error names the base and the exactness failure: {msg}"
+        );
     }
 
     #[test]

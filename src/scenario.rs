@@ -134,6 +134,11 @@ pub struct Scenario {
     /// Channels pinned to a constant or series, layered *over* the inputs and
     /// any computed value. Same shape as [`Scenario::inputs`].
     pub overrides: Vec<InputSeries>,
+    /// Whole-project mode only: substitute type-correct startup defaults for
+    /// unseeded channel reads (each substitution is reported on the trace)
+    /// instead of failing loud. **Off by default** — strict fail-loud is the
+    /// baseline; defaulting is an explicit, visible opt-in.
+    pub allow_default_inputs: bool,
 }
 
 impl Scenario {
@@ -234,11 +239,25 @@ pub(crate) fn parse_time_series_csv(
             at: 0,
         });
     }
+    // Duplicate headers: whichever column the sampler later picked would be
+    // arbitrary — fail loud naming the duplicate.
+    {
+        let mut seen = std::collections::BTreeSet::new();
+        for c in &cols[1..] {
+            if !seen.insert(c.as_str()) {
+                return Err(EvalError::UnsupportedConstruct {
+                    kind: format!("CSV declares the column {c:?} more than once"),
+                    at: 0,
+                });
+            }
+        }
+    }
     // One accumulator per non-time column, in header order.
     let mut columns: Vec<(String, Vec<(f64, Value)>)> =
         cols[1..].iter().map(|c| (c.clone(), Vec::new())).collect();
     let mut units: std::collections::BTreeMap<String, String> = std::collections::BTreeMap::new();
     let mut seen_data_row = false;
+    let mut prev_time: Option<f64> = None;
 
     for (row_idx, line) in lines.enumerate() {
         if line.trim().is_empty() {
@@ -266,12 +285,47 @@ pub(crate) fn parse_time_series_csv(
         }
         seen_data_row = true;
 
+        // A row wider than the header is a shifted or corrupt export. (Fewer
+        // cells stays legal: trailing empty cells are the documented
+        // no-keyframe hold.)
+        if cells.len() > cols.len() {
+            return Err(EvalError::UnsupportedConstruct {
+                kind: format!(
+                    "CSV row {} has {} cells but the header declares {} columns",
+                    row_idx + 2,
+                    cells.len(),
+                    cols.len()
+                ),
+                at: 0,
+            });
+        }
         let t = first
             .parse::<f64>()
             .map_err(|_| EvalError::UnsupportedConstruct {
                 kind: format!("CSV row {} has a non-numeric time", row_idx + 2),
                 at: 0,
             })?;
+        // The zero-order-hold sampler assumes strictly ascending finite
+        // keyframes; a NaN/infinite or out-of-order/duplicate timestamp would
+        // silently mis-sample every later lookup.
+        if !t.is_finite() {
+            return Err(EvalError::UnsupportedConstruct {
+                kind: format!("CSV row {} has a non-finite time {t}", row_idx + 2),
+                at: 0,
+            });
+        }
+        if let Some(prev) = prev_time
+            && t <= prev
+        {
+            return Err(EvalError::UnsupportedConstruct {
+                kind: format!(
+                    "CSV row {} time {t} is not strictly increasing (previous {prev})",
+                    row_idx + 2
+                ),
+                at: 0,
+            });
+        }
+        prev_time = Some(t);
         for (i, acc) in columns.iter_mut().enumerate() {
             let Some(cell) = cells.get(i + 1) else {
                 continue;
@@ -341,7 +395,8 @@ struct RawScenario {
     target: Option<String>,
     duration_s: f64,
     /// Base tick rate in Hz. Optional: when omitted (or `0`) in `whole-project`
-    /// mode the runner uses the fastest scheduled rate as the base tick. The
+    /// mode the runner derives the least common multiple of the scheduled rates
+    /// as the base tick (so every rate has an exact integer period). The
     /// `function`/`cone` modes still require a positive value (they have no
     /// schedule to derive a default from).
     #[serde(default)]
@@ -350,6 +405,10 @@ struct RawScenario {
     inputs: Vec<RawInput>,
     #[serde(default)]
     overrides: Vec<RawInput>,
+    /// Opt-in unseeded-channel defaulting for whole-project mode (strict
+    /// fail-loud when absent/false).
+    #[serde(default)]
+    allow_default_inputs: bool,
 }
 
 /// A raw input/override entry: a channel plus exactly one of `const`/`series`.
@@ -411,8 +470,8 @@ impl RawScenario {
                 });
             }
         };
-        // `whole-project` accepts a missing/zero base rate (the runner defaults
-        // it to the fastest scheduled rate). Every other mode needs an explicit
+        // `whole-project` accepts a missing/zero base rate (the runner derives
+        // the lcm of the scheduled rates). Every other mode needs an explicit
         // positive base tick — there is no schedule to derive one from. A
         // negative rate is always invalid.
         if self.base_rate_hz < 0.0 {
@@ -455,6 +514,7 @@ impl RawScenario {
             duration_s: self.duration_s,
             base_rate_hz: self.base_rate_hz,
             overrides,
+            allow_default_inputs: self.allow_default_inputs,
         })
     }
 }
@@ -638,7 +698,7 @@ const = 20.0
     #[test]
     fn whole_project_mode_parses_without_base_rate() {
         // Whole-project mode may omit `base_rate_hz` entirely: the runner then
-        // defaults the base tick to the fastest scheduled rate. The parsed
+        // derives the base tick (lcm of the scheduled rates). The parsed
         // scenario carries 0.0 as the "auto" sentinel.
         let toml = r#"
 mode = "whole-project"

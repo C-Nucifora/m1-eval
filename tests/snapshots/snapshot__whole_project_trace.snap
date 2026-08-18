@@ -1,5 +1,6 @@
 ---
 source: tests/snapshot.rs
+assertion_line: 115
 expression: trace.to_json()
 ---
-{"time":[0,0.01,0.02,0.03,0.04,0.05],"channels":{"Root.MR.Fast Out":[50,50,50,50,50,50],"Root.MR.Fast Shared":[5,5,5,5,5,5],"Root.MR.Seed":[2,2,2,2,2,2],"Root.MR.Slow Echo":[4,4,4,4,4,4],"Root.MR.Slow Out":[4,4,4,4,4,4],"Root.MR.Slow Total":[0,0,0.04,0.04,0.08,0.08]},"external":["Root.MR.Seed"]}
+{"time":[0,0.01,0.02,0.03,0.04,0.05],"channels":{"Root.MR.Fast Out":[50,50,50,50,50,50],"Root.MR.Fast Shared":[5,5,5,5,5,5],"Root.MR.Seed":[2,2,2,2,2,2],"Root.MR.Slow Echo":[4,4,4,4,4,4],"Root.MR.Slow Out":[4,4,4,4,4,4],"Root.MR.Slow Total":[0,0,0.04,0.04,0.08,0.08],"Root.MR.Started":[1,1,1,1,1,1]},"external":["Root.MR.Seed"]}

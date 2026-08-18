@@ -1,0 +1,5 @@
+// Synthetic m1-eval cfrate fixture. No proprietary content.
+// 4 Hz: reads Sensor, so it joins the counterfactual cone. Together with the
+// 10 Hz function the fixture's rates do NOT divide each other's fastest —
+// lcm(10, 4) = 20 Hz — exercising the lcm default base.
+Four Echo = Sensor + 1.0;

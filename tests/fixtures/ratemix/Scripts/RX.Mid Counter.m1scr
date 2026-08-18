@@ -1,0 +1,5 @@
+// Synthetic m1-eval ratemix fixture. No proprietary content.
+// 200 Hz: counts invocations and trapezoidally integrates Seed. The scheduler
+// must run this exactly 200 times per second AND hand it dt = 5 ms.
+Mid Count = Mid Count + 1.0;
+Mid Total = Integral.Normal(Seed, -1000000.0, 1000000.0, false, 0.0);

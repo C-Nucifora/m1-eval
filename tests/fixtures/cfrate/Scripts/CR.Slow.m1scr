@@ -1,0 +1,7 @@
+// Synthetic m1-eval cfrate fixture. No proprietary content.
+// 10 Hz: reads Sensor (so an override on Sensor pulls this function into the
+// counterfactual cone) and ramps a stateful integral of the constant 1 — the
+// ramp advances by exactly dt per run, so its trace exposes both the true
+// invocation count (plateau transitions) and the dt handed to the function.
+Slow Echo = Sensor * 2.0;
+Slow Ramp = Integral.Normal(1.0, -1000000.0, 1000000.0, false, 0.0);

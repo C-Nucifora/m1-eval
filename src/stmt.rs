@@ -116,8 +116,7 @@ fn exec_assignment(node: &Node, ctx: &mut EvalCtx) -> Result<(), EvalError> {
     // first, applies the corresponding binary operator, then writes the result.
     let final_value = if m1_core::is_compound_assign(op.kind()) {
         let current = read_dest(&dest, ctx)?;
-        let div_by_zero_yields_zero = ctx.env.default_unseeded_channels;
-        apply_compound(op.kind(), &current, &rhs, div_by_zero_yields_zero)?
+        apply_compound(op.kind(), &current, &rhs)?
     } else {
         rhs
     };
@@ -272,12 +271,7 @@ fn write_dest(dest: &Dest, value: Value, ctx: &mut EvalCtx) {
 /// Apply a compound-assignment operator to the current value and the rhs. The
 /// arithmetic/bitwise semantics match the expression evaluator's binary
 /// operators (delegated through a fresh binary-op evaluation).
-fn apply_compound(
-    op: Kind,
-    current: &Value,
-    rhs: &Value,
-    div_by_zero_yields_zero: bool,
-) -> Result<Value, EvalError> {
+fn apply_compound(op: Kind, current: &Value, rhs: &Value) -> Result<Value, EvalError> {
     // Map each compound operator to its underlying binary operator, then reuse the
     // expression evaluator's binary semantics so the result typing/coercions stay
     // consistent (`numeric_join`, integral-only bitwise, div-by-zero handling).
@@ -299,7 +293,7 @@ fn apply_compound(
             });
         }
     };
-    expr::apply_binary_values(binop, current, rhs, div_by_zero_yields_zero)
+    expr::apply_binary_values(binop, current, rhs)
 }
 
 // ---- Task 21: if/else, when/is, expand/to, local/static local, block ----
