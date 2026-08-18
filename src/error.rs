@@ -17,6 +17,42 @@ pub enum EvalError {
     MissingInput { channel: String },
     /// Wrong argument count/kind for a builtin call.
     BadCall { detail: String },
+    /// An error wrapped with *where* it happened: the script whose execution
+    /// failed and the tick instant (`None` for the once-only startup pass).
+    /// Execution boundaries attach this so a fail-loud abort names the deepest
+    /// failing script and time instead of surfacing bare.
+    InScript {
+        script: String,
+        t: Option<f64>,
+        source: Box<EvalError>,
+    },
+}
+
+impl EvalError {
+    /// Wrap this error with the script it escaped from and the tick instant it
+    /// happened at (`None` = the startup pass). If a deeper execution boundary
+    /// already attached context, preserve it so there is exactly one layer and
+    /// it names the script where the error actually arose.
+    pub(crate) fn in_script(self, script: &str, t: Option<f64>) -> EvalError {
+        match self {
+            already @ EvalError::InScript { .. } => already,
+            source => EvalError::InScript {
+                script: script.to_string(),
+                t,
+                source: Box::new(source),
+            },
+        }
+    }
+
+    /// The innermost error, looking through any [`EvalError::InScript`] context
+    /// layer — match on this when deciding *what* went wrong rather than
+    /// *where* it happened.
+    pub fn root_cause(&self) -> &EvalError {
+        match self {
+            EvalError::InScript { source, .. } => source.root_cause(),
+            other => other,
+        }
+    }
 }
 
 impl std::fmt::Display for EvalError {
@@ -35,7 +71,71 @@ impl std::fmt::Display for EvalError {
             EvalError::TypeError { detail } => write!(f, "type error: {detail}"),
             EvalError::MissingInput { channel } => write!(f, "missing scenario input: {channel}"),
             EvalError::BadCall { detail } => write!(f, "bad call: {detail}"),
+            EvalError::InScript { script, t, source } => match t {
+                Some(t) => write!(f, "in {script} at t = {t:.3} s: {source}"),
+                None => write!(f, "in {script} at startup: {source}"),
+            },
         }
     }
 }
-impl std::error::Error for EvalError {}
+impl std::error::Error for EvalError {
+    fn source(&self) -> Option<&(dyn std::error::Error + 'static)> {
+        match self {
+            EvalError::InScript { source, .. } => Some(source.as_ref()),
+            _ => None,
+        }
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn in_script_displays_tick_time_and_inner_error() {
+        let err = EvalError::TypeError {
+            detail: "division or modulo by zero".to_string(),
+        }
+        .in_script("ECU.Update.m1scr", Some(0.125));
+        assert_eq!(
+            err.to_string(),
+            "in ECU.Update.m1scr at t = 0.125 s: type error: division or modulo by zero"
+        );
+    }
+
+    #[test]
+    fn root_cause_looks_through_the_context_layer() {
+        let inner = EvalError::MissingInput {
+            channel: "Root.Demo.Speed".to_string(),
+        };
+        let wrapped = inner.clone().in_script("Demo.Update.m1scr", Some(0.0));
+        assert_eq!(wrapped.root_cause(), &inner);
+        // An unwrapped error is its own root cause.
+        assert_eq!(inner.root_cause(), &inner);
+    }
+
+    #[test]
+    fn outer_boundary_preserves_deeper_script_context() {
+        let inner = EvalError::TypeError {
+            detail: "bad operand".to_string(),
+        }
+        .in_script("Helper.Compute.m1scr", Some(0.25));
+        let outer = inner.clone().in_script("Caller.Update.m1scr", Some(0.25));
+        assert_eq!(
+            outer, inner,
+            "the deepest failing script remains authoritative"
+        );
+    }
+
+    #[test]
+    fn in_script_displays_startup_phase_when_no_tick_is_open() {
+        let err = EvalError::MissingInput {
+            channel: "Root.Demo.Speed".to_string(),
+        }
+        .in_script("MR.Init.m1scr", None);
+        assert_eq!(
+            err.to_string(),
+            "in MR.Init.m1scr at startup: missing scenario input: Root.Demo.Speed"
+        );
+    }
+}

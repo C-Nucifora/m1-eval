@@ -114,6 +114,11 @@ These follow the shared toolchain contract (`m1-tools/docs/cli.md`):
 So `$? != 0` means "do not trust the output." The engine **fails loud**: it never
 emits a guessed or default number in place of something it cannot evaluate.
 
+A fail-loud evaluation error also says **where** it happened — the failing
+script and the tick instant (`in ECU.Update.m1scr at t = 0.125 s: type error:
+division or modulo by zero`, or `at startup` for the once-only initialisation
+pass) — so a multi-script whole-project abort points at the script to inspect.
+
 ## Counterfactual replay (`--log` / `--override` / `--diff`)
 
 `--log` imports a recorded run as **ground truth**: every logged channel is held

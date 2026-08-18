@@ -165,6 +165,14 @@ pub fn call(
     //    operator state all persist across the call, keyed by the callee's own
     //    symbol/script — so isolation is automatic). The result is captured so the
     //    caller frame is always restored, even on an error.
+    // A trace tick is already open for normal and counterfactual execution.
+    // Capture its instant before borrowing the trace mutably for the callee.
+    // During the once-only startup pass no trace exists, so `None` retains the
+    // explicit `at startup` rendering.
+    let t = ctx
+        .trace
+        .as_deref()
+        .and_then(|trace| trace.time.last().copied());
     let exec_result = {
         let mut callee_ctx = EvalCtx {
             project: ctx.project,
@@ -179,7 +187,7 @@ pub fn call(
             depth: ctx.depth + 1,
             trace: ctx.trace.as_deref_mut(),
         };
-        exec_script(&callee_root, &mut callee_ctx)
+        exec_script(&callee_root, &mut callee_ctx).map_err(|e| e.in_script(&callee_script_name, t))
     };
 
     // 4. Read the return value (the `Out` slot), then 5. restore the caller frame.
@@ -188,7 +196,9 @@ pub fn call(
     ctx.env.locals = saved_locals;
     ctx.env.out = saved_out;
 
-    // Surface a callee error only after the caller frame is restored.
+    // Surface a callee error only after the caller frame is restored. It already
+    // carries the callee script context; outer inline-call and runner boundaries
+    // preserve that deepest context rather than replacing or nesting it.
     exec_result?;
 
     Ok(Some(return_value.unwrap_or_else(unit)))
@@ -340,8 +350,15 @@ mod tests {
         // `Recur.Loop` calls itself unconditionally (`Out = Recur.Loop(In.n)`).
         // Without a guard this overflows the stack; the depth guard turns it into
         // a fail-loud UnsupportedConstruct instead.
-        match h.call("Root.Recur.Loop", &[Value::Float(1.0)]) {
-            Err(EvalError::UnsupportedConstruct { kind, .. }) => {
+        let err = h
+            .call("Root.Recur.Loop", &[Value::Float(1.0)])
+            .expect_err("unbounded recursion fails loud");
+        assert!(
+            err.to_string().contains("Recur.Loop.m1scr"),
+            "callee context names the recursively failing script: {err}"
+        );
+        match err.root_cause() {
+            EvalError::UnsupportedConstruct { kind, .. } => {
                 assert!(
                     kind.contains("recursive"),
                     "expected a recursion error, got {kind:?}"
