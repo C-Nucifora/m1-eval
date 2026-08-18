@@ -4,8 +4,9 @@
 //! A scenario chooses the run mode (which runner, against which function or
 //! target channel), the time grid (`duration_s` + `base_rate_hz`), the input
 //! sources for the channels the engine does not itself compute (constants or
-//! piecewise time series), and any channel overrides that pin a value over the
-//! top of everything else.
+//! piecewise time series), any channel overrides that pin a value over the
+//! top of everything else, and any IO-call overrides (`[[io]]`) that drive a
+//! hardware-backed builtin read directly.
 //!
 //! ## Wire formats
 //!
@@ -30,6 +31,10 @@
 //! [[overrides]]
 //! channel = "Root.Demo.Output"
 //! const = 0.0
+//!
+//! [[io]]
+//! call = "CanComms.GetFloat"          # a Tier-3 IO call spelling, not a path
+//! series = [[0.0, 12.5], [0.5, 99.0]]
 //! ```
 //!
 //! ## Time-series resampling
@@ -84,15 +89,48 @@ pub enum InputKind {
     Series(Vec<(f64, Value)>),
 }
 
-impl InputSeries {
-    /// Sample this input at tick time `t` (seconds). A constant returns its value
-    /// at every `t`; a series returns the most recent keyframe value at or before
-    /// `t` (zero-order hold), or the first keyframe before the series begins.
+impl InputKind {
+    /// Sample this source at tick time `t` (seconds). A constant returns its
+    /// value at every `t`; a series returns the most recent keyframe value at or
+    /// before `t` (zero-order hold), or the first keyframe before the series
+    /// begins.
     pub fn sample(&self, t: f64) -> Value {
-        match &self.kind {
+        match self {
             InputKind::Const(v) => v.clone(),
             InputKind::Series(points) => sample_series(points, t),
         }
+    }
+}
+
+impl InputSeries {
+    /// Sample this input at tick time `t` (seconds) — see [`InputKind::sample`].
+    pub fn sample(&self, t: f64) -> Value {
+        self.kind.sample(t)
+    }
+}
+
+/// One scenario-driven Tier-3 IO call override: the call spelling plus the
+/// value the call returns over time. Sampled per tick exactly like an input;
+/// the evaluator's IO dispatch consults these overrides before any documented
+/// or generic typed stub ([`crate::env::Env::io_override`]), so the scenario —
+/// not the offline default — supplies what the hardware "reads".
+#[derive(Debug, Clone, PartialEq)]
+pub struct IoSeries {
+    /// The IO call this drives, spelled `"Object.Method"` (e.g.
+    /// `"CanComms.GetFloat"`, `"System.FlashSize"`, `"DBC PC.Dash
+    /// Switches.Receive"`) — the same key the coverage report and trace use for
+    /// Tier-3 calls. It is a call spelling, not a symbol path: never
+    /// canonicalised, spaces preserved verbatim.
+    pub call: String,
+    /// Whether it is a constant or a time series.
+    pub kind: InputKind,
+}
+
+impl IoSeries {
+    /// Sample this override at tick time `t` (seconds) — see
+    /// [`InputKind::sample`].
+    pub fn sample(&self, t: f64) -> Value {
+        self.kind.sample(t)
     }
 }
 
@@ -134,6 +172,10 @@ pub struct Scenario {
     /// Channels pinned to a constant or series, layered *over* the inputs and
     /// any computed value. Same shape as [`Scenario::inputs`].
     pub overrides: Vec<InputSeries>,
+    /// Scenario-driven Tier-3 IO call overrides (`[[io]]`): what a
+    /// hardware-backed builtin call returns, keyed by its `"Object.Method"`
+    /// spelling and resampled every tick. See [`IoSeries`].
+    pub io: Vec<IoSeries>,
     /// Whole-project mode only: substitute type-correct startup defaults for
     /// unseeded channel reads (each substitution is reported on the trace)
     /// instead of failing loud. **Off by default** — strict fail-loud is the
@@ -405,6 +447,8 @@ struct RawScenario {
     inputs: Vec<RawInput>,
     #[serde(default)]
     overrides: Vec<RawInput>,
+    #[serde(default)]
+    io: Vec<RawIo>,
     /// Opt-in unseeded-channel defaulting for whole-project mode (strict
     /// fail-loud when absent/false).
     #[serde(default)]
@@ -415,6 +459,18 @@ struct RawScenario {
 #[derive(Debug, Deserialize)]
 struct RawInput {
     channel: String,
+    #[serde(default)]
+    #[serde(rename = "const")]
+    constant: Option<RawValue>,
+    #[serde(default)]
+    series: Option<Vec<(f64, RawValue)>>,
+}
+
+/// A raw `[[io]]` entry: an IO call spelling plus exactly one of
+/// `const`/`series` — the same value shape as an input, keyed by `call`.
+#[derive(Debug, Deserialize)]
+struct RawIo {
+    call: String,
     #[serde(default)]
     #[serde(rename = "const")]
     constant: Option<RawValue>,
@@ -508,53 +564,75 @@ impl RawScenario {
             .into_iter()
             .map(RawInput::into_input)
             .collect::<Result<Vec<_>, _>>()?;
+        let io = self
+            .io
+            .into_iter()
+            .map(RawIo::into_io)
+            .collect::<Result<Vec<_>, _>>()?;
         Ok(Scenario {
             mode,
             inputs,
             duration_s: self.duration_s,
             base_rate_hz: self.base_rate_hz,
             overrides,
+            io,
             allow_default_inputs: self.allow_default_inputs,
         })
     }
 }
 
+/// Validate a raw `const`/`series` pair into an [`InputKind`]: exactly one of
+/// the two must be set, and a series must be non-empty. `what`/`name` label the
+/// entry in the fail-loud message (`input "Root.Demo.Gain"`, `io
+/// "CanComms.GetFloat"`).
+fn raw_kind(
+    what: &str,
+    name: &str,
+    constant: Option<RawValue>,
+    series: Option<Vec<(f64, RawValue)>>,
+) -> Result<InputKind, EvalError> {
+    match (constant, series) {
+        (Some(c), None) => Ok(InputKind::Const(c.into_value())),
+        (None, Some(points)) => {
+            if points.is_empty() {
+                return Err(EvalError::UnsupportedConstruct {
+                    kind: format!("{what} {name:?} has an empty series"),
+                    at: 0,
+                });
+            }
+            Ok(InputKind::Series(
+                points
+                    .into_iter()
+                    .map(|(t, v)| (t, v.into_value()))
+                    .collect(),
+            ))
+        }
+        (Some(_), Some(_)) => Err(EvalError::UnsupportedConstruct {
+            kind: format!("{what} {name:?} sets both `const` and `series` (choose one)"),
+            at: 0,
+        }),
+        (None, None) => Err(EvalError::UnsupportedConstruct {
+            kind: format!("{what} {name:?} sets neither `const` nor `series`"),
+            at: 0,
+        }),
+    }
+}
+
 impl RawInput {
     fn into_input(self) -> Result<InputSeries, EvalError> {
-        let kind = match (self.constant, self.series) {
-            (Some(c), None) => InputKind::Const(c.into_value()),
-            (None, Some(points)) => {
-                if points.is_empty() {
-                    return Err(EvalError::UnsupportedConstruct {
-                        kind: format!("input {:?} has an empty series", self.channel),
-                        at: 0,
-                    });
-                }
-                InputKind::Series(
-                    points
-                        .into_iter()
-                        .map(|(t, v)| (t, v.into_value()))
-                        .collect(),
-                )
-            }
-            (Some(_), Some(_)) => {
-                return Err(EvalError::UnsupportedConstruct {
-                    kind: format!(
-                        "input {:?} sets both `const` and `series` (choose one)",
-                        self.channel
-                    ),
-                    at: 0,
-                });
-            }
-            (None, None) => {
-                return Err(EvalError::UnsupportedConstruct {
-                    kind: format!("input {:?} sets neither `const` nor `series`", self.channel),
-                    at: 0,
-                });
-            }
-        };
+        let kind = raw_kind("input", &self.channel, self.constant, self.series)?;
         Ok(InputSeries {
             channel: self.channel,
+            kind,
+        })
+    }
+}
+
+impl RawIo {
+    fn into_io(self) -> Result<IoSeries, EvalError> {
+        let kind = raw_kind("io", &self.call, self.constant, self.series)?;
+        Ok(IoSeries {
+            call: self.call,
             kind,
         })
     }
@@ -778,5 +856,77 @@ duration_s = 1.0
 base_rate_hz = 0.0
 "#;
         assert!(Scenario::from_toml_str(toml).is_err());
+    }
+
+    #[test]
+    fn parses_io_overrides() {
+        let toml = r#"
+mode = "whole-project"
+duration_s = 1.0
+
+[[io]]
+call = "DBC PC.Dash Switches.Receive"
+const = true
+
+[[io]]
+call = "System.FlashSize"
+series = [[0.0, 4194304], [0.5, 8388608]]
+"#;
+        let sc = Scenario::from_toml_str(toml).expect("valid scenario");
+        assert_eq!(sc.io.len(), 2);
+
+        // The constant override holds its value at every t.
+        let receive = sc
+            .io
+            .iter()
+            .find(|o| o.call == "DBC PC.Dash Switches.Receive")
+            .unwrap();
+        assert_eq!(receive.sample(0.0), Value::Bool(true));
+        assert_eq!(receive.sample(0.9), Value::Bool(true));
+
+        // The series override steps by zero-order hold, like an input.
+        let flash = sc.io.iter().find(|o| o.call == "System.FlashSize").unwrap();
+        assert_eq!(flash.sample(0.0), Value::Int(4_194_304));
+        assert_eq!(flash.sample(0.49), Value::Int(4_194_304));
+        assert_eq!(flash.sample(0.5), Value::Int(8_388_608));
+    }
+
+    #[test]
+    fn io_override_rejects_both_const_and_series() {
+        let toml = r#"
+mode = "whole-project"
+duration_s = 1.0
+
+[[io]]
+call = "CanComms.GetFloat"
+const = 1.0
+series = [[0.0, 2.0]]
+"#;
+        assert!(Scenario::from_toml_str(toml).is_err());
+    }
+
+    #[test]
+    fn io_override_rejects_neither_const_nor_series() {
+        let toml = r#"
+mode = "whole-project"
+duration_s = 1.0
+
+[[io]]
+call = "CanComms.GetFloat"
+"#;
+        assert!(Scenario::from_toml_str(toml).is_err());
+    }
+
+    #[test]
+    fn io_override_in_json_parses_the_same_shape() {
+        let json = r#"{
+            "mode": "whole-project",
+            "duration_s": 0.5,
+            "io": [{ "call": "CanComms.GetFloat", "const": 12.5 }]
+        }"#;
+        let sc = Scenario::from_json_str(json).expect("valid JSON scenario");
+        assert_eq!(sc.io.len(), 1);
+        assert_eq!(sc.io[0].call, "CanComms.GetFloat");
+        assert_eq!(sc.io[0].sample(0.0), Value::Float(12.5));
     }
 }
