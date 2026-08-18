@@ -369,12 +369,18 @@ fn tick_loop(
     for i in 0..ticks {
         let t = i as f64 / base_rate_hz;
 
-        // 1. Seed inputs (resampled at t), then layer overrides on top.
+        // 1. Seed inputs (resampled at t), then layer overrides on top. A
+        //    numeric value seeded into an enum-typed channel is coerced to the
+        //    member with that declared value — the same rule the imperative
+        //    channel `.Set` applies — so script comparisons against member
+        //    literals see a typed enum, not a bare number.
         for (path, series) in &inputs {
-            env.set(path.clone(), series.sample(t));
+            let value = crate::expr::coerce_for_channel(path, series.sample(t), &loaded.project);
+            env.set(path.clone(), value);
         }
         for (path, series) in &overrides {
-            env.set(path.clone(), series.sample(t));
+            let value = crate::expr::coerce_for_channel(path, series.sample(t), &loaded.project);
+            env.set(path.clone(), value);
         }
 
         // 2. Open the tick.
@@ -883,9 +889,12 @@ pub fn run_counterfactual(
         let t = i as f64 / base_rate_hz;
 
         // 1. Seed every logged channel from the log (zero-order hold) — the ground
-        //    truth (precedence: log over calibration).
+        //    truth (precedence: log over calibration). Logged values are numeric;
+        //    one landing on an enum-typed channel is coerced to the member with
+        //    that declared value, exactly as scenario inputs and `.Set` are.
         for (path, series) in &log_inputs {
-            env.set(path.clone(), series.sample(t));
+            let value = crate::expr::coerce_for_channel(path, series.sample(t), &loaded.project);
+            env.set(path.clone(), value);
         }
 
         // 2. Layer the overrides on top (precedence: override over log). A constant
@@ -1155,6 +1164,29 @@ mod tests {
     use crate::loader::load;
     use crate::scenario::{InputKind, Scenario};
     use std::path::Path;
+
+    #[test]
+    fn scenario_input_coerces_into_enum_channel() {
+        // Seeding an enum-typed channel with a plain scenario integer must
+        // coerce it to the member with that declared value — the same rule the
+        // imperative channel `.Set` applies — so script comparisons against
+        // member literals work. Drive State declares Precharging = 2.
+        let dir = Path::new(env!("CARGO_MANIFEST_DIR")).join("tests/fixtures/enums");
+        let loaded = load(&dir.join("Project.m1prj"), None).expect("enums fixture loads");
+        let scenario = Scenario {
+            mode: RunMode::Function("Demo.Report".to_string()),
+            duration_s: 0.02,
+            base_rate_hz: 100.0,
+            inputs: vec![InputSeries {
+                channel: "Root.Demo.Mode".to_string(),
+                kind: InputKind::Const(Value::Int(2)),
+            }],
+            overrides: vec![],
+        };
+        let trace = run(&loaded, &scenario).expect("enum-seeded run evaluates");
+        let flag = trace.channels.get("Root.Demo.Flag").expect("Flag traced");
+        assert_eq!(flag.last().and_then(|v| v.as_f64().ok()), Some(1.0));
+    }
 
     fn mini() -> Loaded {
         let dir = Path::new(env!("CARGO_MANIFEST_DIR")).join("tests/fixtures/mini");
