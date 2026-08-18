@@ -1383,6 +1383,7 @@ mod tests {
                 kind: InputKind::Const(Value::Int(2)),
             }],
             overrides: vec![],
+            allow_default_inputs: false,
         };
         let trace = run(&loaded, &scenario).expect("enum-seeded run evaluates");
         let flag = trace.channels.get("Root.Demo.Flag").expect("Flag traced");

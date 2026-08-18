@@ -8,6 +8,8 @@
    <Component Classname="BuiltIn.Channel" Name="Root.Demo.Output"><Props Type="f32"/></Component>
    <Component Classname="BuiltIn.Parameter" Name="Root.Demo.Gain"><Props Type="f32"/></Component>
    <Component Classname="BuiltIn.Table" Name="Root.Demo.Map"><Props Type="f32"/></Component>
+   <Component Classname="BuiltIn.GroupCompound" Name="Root.Demo.Sensor Compound"><Props UseDefValue="true" DefValue="This.Sensor"/></Component>
+   <Component Classname="BuiltIn.Channel" Name="Root.Demo.Sensor Compound.Sensor"><Props Type="f32"/></Component>
    <Component Classname="BuiltIn.FuncUser" Filename="Demo.Update.m1scr" Name="Root.Demo.Update"/>
   </List></ComponentStream>
  </Project>
