@@ -19,8 +19,8 @@ pub enum EvalError {
     BadCall { detail: String },
     /// An error wrapped with *where* it happened: the script whose execution
     /// failed and the tick instant (`None` for the once-only startup pass).
-    /// The runner attaches this at its execution boundary so a fail-loud abort
-    /// names the failing script and time instead of surfacing bare.
+    /// Execution boundaries attach this so a fail-loud abort names the deepest
+    /// failing script and time instead of surfacing bare.
     InScript {
         script: String,
         t: Option<f64>,
@@ -30,13 +30,17 @@ pub enum EvalError {
 
 impl EvalError {
     /// Wrap this error with the script it escaped from and the tick instant it
-    /// happened at (`None` = the startup pass). Runner-boundary context only —
-    /// inner evaluation never wraps, so there is exactly one layer.
+    /// happened at (`None` = the startup pass). If a deeper execution boundary
+    /// already attached context, preserve it so there is exactly one layer and
+    /// it names the script where the error actually arose.
     pub(crate) fn in_script(self, script: &str, t: Option<f64>) -> EvalError {
-        EvalError::InScript {
-            script: script.to_string(),
-            t,
-            source: Box::new(self),
+        match self {
+            already @ EvalError::InScript { .. } => already,
+            source => EvalError::InScript {
+                script: script.to_string(),
+                t,
+                source: Box::new(source),
+            },
         }
     }
 
@@ -108,6 +112,19 @@ mod tests {
         assert_eq!(wrapped.root_cause(), &inner);
         // An unwrapped error is its own root cause.
         assert_eq!(inner.root_cause(), &inner);
+    }
+
+    #[test]
+    fn outer_boundary_preserves_deeper_script_context() {
+        let inner = EvalError::TypeError {
+            detail: "bad operand".to_string(),
+        }
+        .in_script("Helper.Compute.m1scr", Some(0.25));
+        let outer = inner.clone().in_script("Caller.Update.m1scr", Some(0.25));
+        assert_eq!(
+            outer, inner,
+            "the deepest failing script remains authoritative"
+        );
     }
 
     #[test]

@@ -1420,6 +1420,7 @@ mod tests {
                 ]),
             }],
             overrides: vec![],
+            io: vec![],
             allow_default_inputs: false,
         };
         let err = run(&loaded, &scenario).expect_err("string arithmetic fails loud");
@@ -1449,6 +1450,7 @@ mod tests {
             base_rate_hz: 100.0,
             inputs: vec![],
             overrides: vec![],
+            io: vec![],
             allow_default_inputs: false,
         };
         let err = run(&loaded, &scenario).expect_err("unseeded input fails loud");
@@ -1461,6 +1463,40 @@ mod tests {
             msg.contains("missing scenario input"),
             "inner error preserved: {msg}"
         );
+    }
+
+    #[test]
+    fn eval_error_names_nested_failing_script() {
+        // Caller.Update invokes Helper.Compute inline. Passing a string reaches
+        // the helper and fails in its arithmetic, so the context must name the
+        // helper script where the error actually arose, not the outer caller.
+        let dir = Path::new(env!("CARGO_MANIFEST_DIR")).join("tests/fixtures/userfn");
+        let loaded = load(&dir.join("Project.m1prj"), None).expect("userfn fixture loads");
+        let scenario = Scenario::from_toml_str(
+            r#"
+mode = "function"
+target = "Caller.Update"
+duration_s = 0.01
+base_rate_hz = 100.0
+
+[[inputs]]
+channel = "Root.Caller.Input"
+const = "oops"
+"#,
+        )
+        .expect("scenario parses");
+
+        let err = run(&loaded, &scenario).expect_err("helper arithmetic fails loud");
+        let msg = err.to_string();
+        assert!(
+            msg.contains("Helper.Compute.m1scr") && msg.contains("t = 0.000 s"),
+            "error names the nested script and current tick: {msg}"
+        );
+        assert!(
+            !msg.contains("Caller.Update.m1scr"),
+            "outer runner context must not replace or wrap the callee: {msg}"
+        );
+        assert!(msg.contains("type error"), "inner error preserved: {msg}");
     }
 
     fn mini() -> Loaded {
