@@ -504,7 +504,7 @@ fn tick_loop(
                 // axis. Startup writes surface via the tick-0 zero-order hold.
                 trace: None,
             };
-            exec_script(&root, &mut ctx)?;
+            exec_script(&root, &mut ctx).map_err(|e| e.in_script(&sched.script.name, None))?;
         }
     }
 
@@ -550,7 +550,7 @@ fn tick_loop(
                 depth: 0,
                 trace: Some(&mut trace),
             };
-            exec_script(&root, &mut ctx)?;
+            exec_script(&root, &mut ctx).map_err(|e| e.in_script(&sched.script.name, Some(t)))?;
         }
 
         // 4. Record any channel a scheduled function *holds* this tick (it did not
@@ -1168,7 +1168,7 @@ pub fn run_counterfactual(
                 depth: 0,
                 trace: Some(&mut trace),
             };
-            exec_script(&root, &mut ctx)?;
+            exec_script(&root, &mut ctx).map_err(|e| e.in_script(&sched.script.name, Some(t)))?;
         }
 
         // 5. Record every channel that did not record this tick by holding its env
@@ -1390,6 +1390,68 @@ mod tests {
         assert_eq!(flag.last().and_then(|v| v.as_f64().ok()), Some(1.0));
     }
 
+    #[test]
+    fn eval_error_names_failing_script_and_tick_time() {
+        // A fail-loud abort must say WHERE it happened: the script and the tick
+        // instant. Drive Speed with a series that turns non-numeric at t = 0.5 s
+        // — the first three ticks evaluate, then `Speed * Gain` is arithmetic
+        // on a string, and the error names Demo.Update at that tick (not tick 0).
+        let loaded = mini();
+        let scenario = Scenario {
+            mode: RunMode::Function("Demo.Update".to_string()),
+            duration_s: 1.0,
+            base_rate_hz: 10.0,
+            inputs: vec![InputSeries {
+                channel: "Root.Demo.Speed".to_string(),
+                kind: InputKind::Series(vec![
+                    (0.0, Value::Float(1.0)),
+                    (0.5, Value::Str("oops".to_string())),
+                ]),
+            }],
+            overrides: vec![],
+            allow_default_inputs: false,
+        };
+        let err = run(&loaded, &scenario).expect_err("string arithmetic fails loud");
+        let msg = err.to_string();
+        assert!(
+            msg.contains("Demo.Update.m1scr"),
+            "error names the failing script: {msg}"
+        );
+        assert!(
+            msg.contains("t = 0.500 s"),
+            "error names the failing tick instant: {msg}"
+        );
+        assert!(msg.contains("type error"), "inner error preserved: {msg}");
+        // The inner error stays reachable for callers that match on it.
+        let source = std::error::Error::source(&err).expect("wrapped error has a source");
+        assert!(source.to_string().contains("type error"));
+    }
+
+    #[test]
+    fn missing_input_error_names_script_at_first_tick() {
+        // An unseeded strict-mode read fails loud on the first tick — and the
+        // error still says which script was reading.
+        let loaded = mini();
+        let scenario = Scenario {
+            mode: RunMode::Function("Demo.Update".to_string()),
+            duration_s: 0.02,
+            base_rate_hz: 100.0,
+            inputs: vec![],
+            overrides: vec![],
+            allow_default_inputs: false,
+        };
+        let err = run(&loaded, &scenario).expect_err("unseeded input fails loud");
+        let msg = err.to_string();
+        assert!(
+            msg.contains("Demo.Update.m1scr") && msg.contains("t = 0.000 s"),
+            "error names script and first tick: {msg}"
+        );
+        assert!(
+            msg.contains("missing scenario input"),
+            "inner error preserved: {msg}"
+        );
+    }
+
     fn mini() -> Loaded {
         let dir = Path::new(env!("CARGO_MANIFEST_DIR")).join("tests/fixtures/mini");
         load(
@@ -1487,7 +1549,7 @@ const = 3.0
         let scenario = Scenario::from_toml_str(toml).unwrap();
         let err = run(&loaded, &scenario).expect_err("unseeded channel must fail loud");
         assert!(
-            matches!(err, EvalError::MissingInput { .. }),
+            matches!(err.root_cause(), EvalError::MissingInput { .. }),
             "expected MissingInput, got {err:?}"
         );
     }
