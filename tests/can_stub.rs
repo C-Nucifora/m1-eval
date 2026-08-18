@@ -105,3 +105,78 @@ base_rate_hz = 100.0
         Some(&vec![Value::Float(0.0); 3])
     );
 }
+
+#[test]
+fn scenario_io_overrides_drive_can_reads_per_tick() {
+    let engine = can_stub_engine();
+
+    // An `[[io]]` override replaces the documented stub for a Tier-3 IO call:
+    // the scenario, not the offline default, supplies what the bus "reads". A
+    // series is resampled every tick (zero-order hold), so the value the script
+    // sees can change mid-run — here at t = 0.03 s.
+    let scenario = Scenario::from_toml_str(
+        r#"
+mode = "whole-project"
+duration_s = 0.05
+base_rate_hz = 100.0
+
+[[io]]
+call = "CanComms.GetFloat"
+series = [[0.0, 12.5], [0.03, 99.0]]
+"#,
+    )
+    .expect("io-override scenario parses");
+
+    let trace = engine.run(&scenario).expect("io-driven run completes");
+
+    // 5 ticks at 100 Hz: 12.5 on t = 0.00/0.01/0.02, then 99.0 on t = 0.03/0.04.
+    let bus_value = trace
+        .channels
+        .get("Root.CanDemo.Bus Value")
+        .expect("Bus Value channel present in the trace");
+    assert_eq!(
+        bus_value,
+        &vec![
+            Value::Float(12.5),
+            Value::Float(12.5),
+            Value::Float(12.5),
+            Value::Float(99.0),
+            Value::Float(99.0),
+        ],
+        "Bus Value follows the [[io]] series, resampled each tick"
+    );
+
+    // A scenario-driven IO call is still simulated input, not evaluated output.
+    assert!(
+        trace.is_external("CanComms.GetFloat"),
+        "an overridden IO call stays flagged externally driven"
+    );
+}
+
+#[test]
+fn scenario_io_override_feeds_single_function_mode() {
+    let engine = can_stub_engine();
+
+    // The same seeding applies outside whole-project mode: a single-function
+    // run reads the overridden value instead of the documented stub.
+    let scenario = Scenario::from_toml_str(
+        r#"
+mode = "function"
+target = "Root.CanDemo.Read"
+duration_s = 0.02
+base_rate_hz = 100.0
+
+[[io]]
+call = "CanComms.GetFloat"
+const = 7.25
+"#,
+    )
+    .expect("io-override scenario parses");
+
+    let trace = engine.run(&scenario).expect("io-driven run completes");
+    assert_eq!(
+        trace.channels.get("Root.CanDemo.Bus Value"),
+        Some(&vec![Value::Float(7.25); 2]),
+        "Bus Value reads the [[io]] const in function mode"
+    );
+}

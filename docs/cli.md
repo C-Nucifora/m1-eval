@@ -71,6 +71,20 @@ series = [[0.0, 0.0], [0.5, 4000.0]]
 [[overrides]]
 channel = "Root.Engine.Output"
 const = 0.0
+
+# IO overrides drive a hardware-backed builtin call directly: the value the
+# call returns, keyed by its "Object.Method" spelling (a call key, not a
+# channel path — never canonicalised). Resampled every tick like an input,
+# and consulted before any documented or generic typed stub — so a scenario
+# can feed a CAN read (`Receive`/`GetBit`) or a system read (FlashSize)
+# without seeding the decoded channels around the reading script.
+[[io]]
+call = "DBC PC.Dash Switches.Receive"
+const = true
+
+[[io]]
+call = "System.FlashSize"
+const = 8388608
 ```
 
 Identifiers may contain spaces (e.g. `Cooling Fan.Output`); channel names are
