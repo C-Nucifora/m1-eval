@@ -32,6 +32,7 @@ use m1_core::{Field, Kind, Node};
 use m1_typecheck::Project;
 use m1_typecheck::symbols::SymbolKind;
 use m1_typecheck::types::{ValueType, numeric_join, type_of_number_literal};
+use std::collections::{HashMap, HashSet};
 
 /// Everything an expression needs to evaluate against: the typed project model,
 /// the calibration values, the mutable value/state stores, the lexical context
@@ -322,6 +323,20 @@ fn enum_member_literal(path: &str, ctx: &EvalCtx) -> Option<Value> {
 /// [`crate::builtins::io_stub`]); it never invents a *meaningful* number, only the
 /// determinate zero/false/empty of the parameter's type.
 pub(crate) fn read_symbol(canon: &str, ctx: &mut EvalCtx) -> Result<Value, EvalError> {
+    read_symbol_inner(canon, ctx, &mut HashSet::new())
+}
+
+fn read_symbol_inner(
+    canon: &str,
+    ctx: &mut EvalCtx,
+    seen: &mut HashSet<String>,
+) -> Result<Value, EvalError> {
+    if !seen.insert(canon.to_string()) {
+        return Err(EvalError::TypeError {
+            detail: format!("cyclic default-value path while reading symbol {canon:?}"),
+        });
+    }
+
     // An explicit `Env` override (a pinned channel, a previously written value)
     // always wins — that is how computed channels read back what an earlier
     // statement wrote, and how scenario inputs are seeded.
@@ -388,6 +403,26 @@ pub(crate) fn read_symbol(canon: &str, ctx: &mut EvalCtx) -> Result<Value, EvalE
             }
             Ok(default)
         }
+        // A GroupCompound may explicitly declare which nested symbol supplies
+        // its scalar value (`UseDefValue="true" DefValue="This.Sensor"`). Resolve
+        // that path in the group's own scope, then read through to the target.
+        // The target may itself be a value-providing object or group, so retain
+        // the cycle guard across the recursive read.
+        Some(SymbolKind::Group) if symbol.and_then(|s| s.default_value.as_deref()).is_some() => {
+            let default_value = symbol
+                .and_then(|s| s.default_value.as_deref())
+                .expect("guarded above")
+                .to_string();
+            let locals = HashMap::new();
+            let Target::Symbol(value_path) =
+                classify(&default_value, Some(canon), None, ctx.project, &locals)
+            else {
+                return Err(EvalError::UnresolvedSymbol {
+                    name: format!("{canon} default value {default_value:?}"),
+                });
+            };
+            read_symbol_inner(&value_path, ctx, seen)
+        }
         // A symbol read directly by name whose value lives on its auto-created
         // `.Value` child: a `GroupCompound` value-compound (`Driveline.Accumulator
         // .Maximum Cell Temp`, marked `DefValue="This.Value"`), a `Table`
@@ -408,7 +443,7 @@ pub(crate) fn read_symbol(canon: &str, ctx: &mut EvalCtx) -> Result<Value, EvalE
                 .is_some() =>
         {
             let value_path = format!("{canon}.Value");
-            read_symbol(&value_path, ctx)
+            read_symbol_inner(&value_path, ctx, seen)
         }
         // Tables/groups/untyped objects/functions are not scalar values.
         Some(_) => Err(EvalError::TypeError {
@@ -1059,6 +1094,17 @@ mod tests {
         // now wins over the default.
         h.calib.params.insert("Demo.Gain".to_string(), 2.5);
         assert_eq!(rhs_value("Gain", &mut h).unwrap(), Value::Float(2.5));
+    }
+
+    #[test]
+    fn group_default_value_reads_declared_nested_symbol() {
+        let mut h = Harness::new();
+        h.env
+            .set("Root.Demo.Sensor Compound.Sensor", Value::Float(87.5));
+        assert_eq!(
+            rhs_value("Sensor Compound", &mut h).unwrap(),
+            Value::Float(87.5)
+        );
     }
 
     #[test]

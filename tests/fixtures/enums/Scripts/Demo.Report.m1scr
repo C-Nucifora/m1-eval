@@ -1,0 +1,3 @@
+// Synthetic M1 script for m1-eval scenario enum-coercion tests. No proprietary content.
+// Reads the enum-typed Mode channel and compares against a member literal.
+Flag = (Mode eq Drive State.Precharging) ? 1 : 0;

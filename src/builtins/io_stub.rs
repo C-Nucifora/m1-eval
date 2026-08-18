@@ -167,15 +167,25 @@ pub fn project_object_call(
         "TxOpen" => Value::Uint(0),
         // A CAN signal `.Receive()` is false offline — no frame has arrived.
         "Receive" => Value::Bool(false),
-        // A scaled CAN signal read has no offline value; the documented stub is 0.
-        "GetScaled" => Value::Float(0.0),
+        // A scaled or floating-point CAN signal read has no offline value; the
+        // documented stub is 0.
+        "GetScaled" | "GetFloat" => Value::Float(0.0),
         // A raw unsigned CAN signal read stubs to 0.
         "GetUnsignedInteger" => Value::Uint(0),
+        // A raw signed CAN signal read stubs to 0.
+        "GetInteger" => Value::Int(0),
+        // A single bus bit read is false offline — no frame has set it.
+        "GetBit" => Value::Bool(false),
         // Void writers: a CAN transmit / bit set / service-bits push / output set
         // / buzzer actuation is a no-op offline. Return the unit value so an
         // expression statement evaluating the call succeeds.
-        "Tx" | "TxInitialise" | "Init" | "SetBit" | "SetUnsignedInteger" | "Update"
-        | "SetState" | "Buzze" => Value::Bool(true),
+        // `Set` here is the package/reference output-drive write (`ASSI
+        // Yellow.Drive.Set(...)` on a Reference with an auto-channel target); a
+        // real channel `.Set` never reaches this route — `try_channel_set`
+        // claims it first.
+        "Tx" | "TxInitialise" | "Init" | "SetBit" | "SetUnsignedInteger" | "SetInteger"
+        | "SetScaled" | "SetFloat" | "SetFromBaseUnit" | "Set" | "Update" | "SetState"
+        | "Buzze" => Value::Bool(true),
         // Any other method on the object has no determinate offline value.
         _ => {
             return Err(EvalError::UnsupportedBuiltin {
@@ -198,8 +208,16 @@ pub const PROJECT_OBJECT_STUB_METHODS: &[&str] = &[
     "Init",
     "SetBit",
     "SetUnsignedInteger",
+    "SetInteger",
+    "SetScaled",
+    "SetFloat",
+    "SetFromBaseUnit",
+    "Set",
     "GetScaled",
+    "GetFloat",
     "GetUnsignedInteger",
+    "GetInteger",
+    "GetBit",
     "Receive",
     "Update",
     "SetState",
@@ -493,5 +511,50 @@ mod tests {
         );
         // A method not in the registry → None (the caller fails loud).
         assert_eq!(typed_io_default("CanComms", "NotARealMethod"), None);
+    }
+
+    #[test]
+    fn project_can_reader_stubs_are_typed() {
+        let mut h = Harness::new();
+        // A DBC CAN signal reader has no offline value; each stubs to the
+        // type-correct zero of its M1 return type, flagged externally driven.
+        assert_eq!(
+            h.io("DashVals.Aux Switch", "GetInteger", &[]).unwrap(),
+            Value::Int(0)
+        );
+        assert_eq!(
+            h.io("DashVals.Aux Switch", "GetBit", &[]).unwrap(),
+            Value::Bool(false)
+        );
+        assert_eq!(
+            h.io("DashVals.Aux Switch", "GetFloat", &[]).unwrap(),
+            Value::Float(0.0)
+        );
+        assert!(h.trace.is_external("DashVals.Aux Switch.GetInteger"));
+        assert!(h.trace.is_external("DashVals.Aux Switch.GetBit"));
+        assert!(h.trace.is_external("DashVals.Aux Switch.GetFloat"));
+    }
+
+    #[test]
+    fn project_can_writer_stubs_are_noops() {
+        let mut h = Harness::new();
+        // A DBC CAN signal write is a no-op offline: each returns the unit value
+        // so an expression-statement call succeeds, flagged externally driven.
+        for method in ["SetInteger", "SetScaled", "SetFloat", "SetFromBaseUnit"] {
+            assert_eq!(
+                h.io(
+                    "DashVals.Aux Switch",
+                    method,
+                    &[Value::Uint(0), Value::Int(1)],
+                )
+                .unwrap(),
+                Value::Bool(true),
+                "{method} should stub to the unit value"
+            );
+            assert!(
+                h.trace
+                    .is_external(&format!("DashVals.Aux Switch.{method}"))
+            );
+        }
     }
 }

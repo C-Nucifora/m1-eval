@@ -428,6 +428,29 @@ Output = i;
     }
 
     #[test]
+    fn this_anchored_user_function_call_is_supported() {
+        // `This.Sub.Checkup();` in Caller.Kick.m1scr names the FuncUserParam
+        // Root.Caller.Sub.Checkup through the `This` anchor. The walk must
+        // expand `This` against the script's group before classification, or the
+        // call misreports as an unsupported builtin (the AV-M1 Checkup case).
+        let dir = std::path::Path::new(env!("CARGO_MANIFEST_DIR")).join("tests/fixtures/userfn");
+        let loaded =
+            crate::loader::load(&dir.join("Project.m1prj"), None).expect("userfn fixture loads");
+        let report = CoverageReport::analyse_in(&loaded.scripts, Some(&loaded.project));
+
+        let supported: Vec<&str> = report.supported.iter().map(|i| i.name.as_str()).collect();
+        assert!(
+            supported.contains(&"This.Sub.Checkup"),
+            "This.Sub.Checkup should be Supported, got supported={supported:?}"
+        );
+        let unsupported: Vec<&str> = report.unsupported.iter().map(|i| i.name.as_str()).collect();
+        assert!(
+            !unsupported.contains(&"This.Sub.Checkup"),
+            "unsupported={unsupported:?}"
+        );
+    }
+
+    #[test]
     fn group_compound_update_without_project_context_is_still_stubbed() {
         // Without a project (the project-free `analyse`), a `<obj>.Update` call
         // keeps its method-name classification (Stubbed) — the conservative

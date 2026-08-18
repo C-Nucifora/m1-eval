@@ -294,6 +294,19 @@ mod tests {
     }
 
     #[test]
+    fn this_anchored_nested_callee_resolves() {
+        let mut h = Harness::new();
+        // `This.Sub.Checkup()` from group Root.Caller names the FuncUserParam
+        // Root.Caller.Sub.Checkup (no Signature, zero args) — the exact shape of
+        // AV-M1's `This.AV.DFMM.Checkup();`. The `This` anchor must expand to
+        // the enclosing group before classification.
+        assert_eq!(
+            h.call("This.Sub.Checkup", &[]).unwrap(),
+            Some(Value::Float(7.0))
+        );
+    }
+
+    #[test]
     fn non_function_path_falls_through() {
         let mut h = Harness::new();
         // A project channel is not a user function — Ok(None) so dispatch falls

@@ -6,6 +6,9 @@
    <Component Classname="BuiltIn.Channel" Name="Root.Caller.Input"><Props Type="f32"/></Component>
    <Component Classname="BuiltIn.Channel" Name="Root.Caller.Output"><Props Type="f32"/></Component>
    <Component Classname="BuiltIn.FuncUser" Filename="Caller.Update.m1scr" Name="Root.Caller.Update"/>
+   <Component Classname="BuiltIn.FuncUser" Filename="Caller.Kick.m1scr" Name="Root.Caller.Kick"/>
+   <Component Classname="BuiltIn.GroupCompound" Name="Root.Caller.Sub"/>
+   <Component Classname="BuiltIn.FuncUserParam" Filename="Caller.Sub.Checkup.m1scr" Name="Root.Caller.Sub.Checkup"/>
    <Component Classname="BuiltIn.GroupCompound" Name="Root.Helper"/>
    <Component Classname="BuiltIn.FuncUserParam" Filename="Helper.Compute.m1scr" Name="Root.Helper.Compute">
     <Signature ReturnType="f32"><Params><Param Name="x" Type="f32"/></Params></Signature>
