@@ -63,6 +63,13 @@ pub fn dispatch(
     {
         return Ok(value);
     }
+    // 1b. Table `.Get(site)` — a raw read of one body cell by flat site index
+    //     (row-major), no interpolation. Same object classification as Lookup.
+    if method == "Get"
+        && let Some(value) = try_table_get(object, args, ctx)?
+    {
+        return Ok(value);
+    }
 
     // 2. Pure library objects. Validate arity against the intrinsic signatures
     //    first (a wrong arg count is a BadCall, an unknown method an
@@ -121,6 +128,10 @@ pub fn dispatch(
                     let x = args[1].as_f64()?;
                     Ok(Value::Float(y.atan2(x)))
                 }
+                // `Math.fabs` also appears in real ECU scripts (AV-M1
+                // Control.Update): a plain absolute value, same routing
+                // rationale as `atan2`.
+                "fabs" => Ok(Value::Float(args[0].as_f64()?.abs())),
                 _ => Err(unsupported(object, method)),
             }
         }
@@ -374,6 +385,89 @@ fn try_table_lookup(
     Ok(Some(Value::Float(value)))
 }
 
+/// Attempt a table `.Get(site)` — a raw read of one body cell by flat site
+/// index (row-major, matching [`crate::calib::CalTable`]'s documented layout),
+/// with no interpolation. Returns `Ok(Some(value))` when `object` resolves to a
+/// project table with calibration cells; `Ok(None)` when `object` is not a
+/// table (so the caller continues to library-object dispatch). The site must be
+/// a single non-negative integral index inside the body — out of range fails
+/// loud as a [`EvalError::BadCall`] (a raw site read has no clamping semantics
+/// to borrow), and a missing calibration follows the same rules as `.Lookup()`.
+fn try_table_get(
+    object: &str,
+    args: &[Value],
+    ctx: &mut EvalCtx,
+) -> Result<Option<Value>, EvalError> {
+    // Resolve the object spelling to a canonical symbol path in the current
+    // scope; only a Table symbol has a `.Get()`.
+    let target = classify(
+        object,
+        ctx.group,
+        ctx.fn_symbol,
+        ctx.project,
+        &ctx.env.locals,
+    );
+    let Target::Symbol(canon) = target else {
+        return Ok(None);
+    };
+    let is_table = ctx
+        .project
+        .symbols()
+        .get(&canon)
+        .map(|s| s.kind == SymbolKind::Table)
+        .unwrap_or(false);
+    if !is_table {
+        return Ok(None);
+    }
+
+    // The cells live in the calibration, keyed by the name the `.m1cfg` wrote —
+    // canonical path first, then the `Root.`-stripped form (mirrors `.Lookup()`).
+    let table = match ctx
+        .calib
+        .table(&canon)
+        .or_else(|| canon.strip_prefix("Root.").and_then(|p| ctx.calib.table(p)))
+    {
+        Some(table) => table,
+        // Same calibration-fallback rules as `.Lookup()`: whole-project mode
+        // reads the externally-driven default rather than aborting the run;
+        // strict modes fail loud.
+        None if ctx.env.default_unseeded_channels => {
+            if let Some(trace) = ctx.trace.as_deref_mut() {
+                trace.mark_external(canon.clone());
+            }
+            return Ok(Some(Value::Float(0.0)));
+        }
+        None => {
+            return Err(EvalError::MissingCalibration {
+                path: canon.clone(),
+            });
+        }
+    };
+
+    // Exactly one site argument, integral and inside the body.
+    if args.len() != 1 {
+        return Err(EvalError::BadCall {
+            detail: format!("{object}.Get expects 1 site argument, got {}", args.len()),
+        });
+    }
+    let site = args[0].as_f64()?;
+    if site < 0.0 || site.fract() != 0.0 {
+        return Err(EvalError::BadCall {
+            detail: format!("{object}.Get site must be a non-negative integer, got {site}"),
+        });
+    }
+    let index = site as usize;
+    match table.body.get(index) {
+        Some(v) => Ok(Some(Value::Float(*v))),
+        None => Err(EvalError::BadCall {
+            detail: format!(
+                "{object}.Get site {index} out of range for a {}-cell table body",
+                table.body.len()
+            ),
+        }),
+    }
+}
+
 /// Validate the argument count of a library-object call against the intrinsic
 /// signature registry. The method must exist on the object (else
 /// [`EvalError::UnsupportedBuiltin`]) and `argc` must match some overload's
@@ -521,7 +615,7 @@ const STUB_OBJECTS: &[&str] = &["CanComms", "Serial", "System", "Logging"];
 /// their object is not a whole stub object. `Math.atan2` is the calibration-only
 /// `Math` object surfaced in an ECU script: it is routed (to `y.atan2(x)`) but
 /// flagged external/stubbed so coverage stays honest about its provenance.
-const STUB_METHODS: &[(&str, &str)] = &[("Math", "atan2")];
+const STUB_METHODS: &[(&str, &str)] = &[("Math", "atan2"), ("Math", "fabs")];
 
 /// Classify a builtin `object.method` for the coverage report.
 ///
@@ -530,7 +624,10 @@ const STUB_METHODS: &[(&str, &str)] = &[("Math", "atan2")];
 /// (coverage cannot see the calibration, so it reports the construct as supported
 /// and the runtime fails loud if the specific object is not a table).
 pub fn classify_builtin(object: &str, method: &str) -> BuiltinSupport {
-    if method == "Lookup" {
+    // `Lookup` (interpolation) and `Get` (raw site read) are the table paths,
+    // resolved at runtime against a project table symbol — classified on the
+    // method alone; the runtime fails loud if the object is not a table.
+    if method == "Lookup" || method == "Get" {
         return BuiltinSupport::Supported;
     }
     // Object-name-independent project-object methods (`AsInteger` enum accessor,
@@ -784,6 +881,22 @@ mod tests {
     }
 
     #[test]
+    fn math_fabs_is_classified_stubbed() {
+        // Same provenance rationale as atan2: routed, but calibration-only.
+        assert_eq!(classify_builtin("Math", "fabs"), BuiltinSupport::Stubbed);
+    }
+
+    #[test]
+    fn table_get_is_classified_supported() {
+        // `.Get` is the raw-site-read path, resolved at runtime against a
+        // project table symbol — classified on the method alone, like Lookup.
+        assert_eq!(
+            classify_builtin("Demo.Map", "Get"),
+            BuiltinSupport::Supported
+        );
+    }
+
+    #[test]
     fn math_unknown_method_is_unsupported() {
         let mut h = Harness::new();
         // Only `atan2` is routed from the calibration-only Math object; anything
@@ -843,6 +956,71 @@ mod tests {
         let mut h = Harness::empty_calib();
         // The table symbol resolves, but no calibration cells were loaded.
         match h.call("Map", "Lookup", &[Value::Float(0.0), Value::Float(0.0)]) {
+            Err(EvalError::MissingCalibration { .. }) => {}
+            other => panic!("expected MissingCalibration, got {other:?}"),
+        }
+    }
+
+    #[test]
+    fn math_fabs_routes_to_abs() {
+        let mut h = Harness::new();
+        // `Math.fabs` appears in real ECU scripts (Control.Update in AV-M1);
+        // route it to a plain absolute value like Calculate.Absolute.
+        assert_eq!(
+            h.call("Math", "fabs", &[Value::Float(-3.5)]).unwrap(),
+            Value::Float(3.5)
+        );
+    }
+
+    // ---- table .Get() (raw site read) ----
+
+    #[test]
+    fn table_get_reads_flat_site() {
+        let mut h = Harness::new();
+        // `.Get(i)` is a raw read of body cell i (row-major, no interpolation).
+        // Demo.Map's body is (10,20,30,40).
+        assert_eq!(
+            h.call("Map", "Get", &[Value::Int(0)]).unwrap(),
+            Value::Float(10.0)
+        );
+        assert_eq!(
+            h.call("Map", "Get", &[Value::Int(2)]).unwrap(),
+            Value::Float(30.0)
+        );
+        assert_eq!(
+            h.call("Map", "Get", &[Value::Uint(3)]).unwrap(),
+            Value::Float(40.0)
+        );
+    }
+
+    #[test]
+    fn table_get_out_of_range_is_bad_call() {
+        let mut h = Harness::new();
+        // A site past the body, or a negative site, fails loud — never clamps:
+        // a raw site read has no clamping semantics to borrow.
+        match h.call("Map", "Get", &[Value::Int(4)]) {
+            Err(EvalError::BadCall { .. }) => {}
+            other => panic!("expected BadCall, got {other:?}"),
+        }
+        match h.call("Map", "Get", &[Value::Int(-1)]) {
+            Err(EvalError::BadCall { .. }) => {}
+            other => panic!("expected BadCall, got {other:?}"),
+        }
+    }
+
+    #[test]
+    fn table_get_wrong_arity_is_bad_call() {
+        let mut h = Harness::new();
+        match h.call("Map", "Get", &[]) {
+            Err(EvalError::BadCall { .. }) => {}
+            other => panic!("expected BadCall, got {other:?}"),
+        }
+    }
+
+    #[test]
+    fn table_get_without_calibration_is_missing() {
+        let mut h = Harness::empty_calib();
+        match h.call("Map", "Get", &[Value::Int(0)]) {
             Err(EvalError::MissingCalibration { .. }) => {}
             other => panic!("expected MissingCalibration, got {other:?}"),
         }
@@ -1170,6 +1348,28 @@ mod tests {
             Value::Bool(true)
         );
         assert!(h.trace.is_external("Fan Output.SetState"));
+    }
+
+    #[test]
+    fn output_drive_reference_set_is_a_void_stub() {
+        let mut h = ProjectObjHarness::new();
+        // `.Set` on a package/reference output member (`ASSI Yellow.Drive.Set(...)`
+        // in AV-M1, a `BuiltIn.Reference` with `TargetCreation="AutoChannel"`) is
+        // a hardware output-drive command: a void writer offline. A real channel
+        // `.Set` never reaches this route — `try_channel_set` claims it first.
+        assert_eq!(
+            h.call(
+                "Fan Output",
+                "Set",
+                &[Value::Enum {
+                    id: 1,
+                    member: "High Side".to_string(),
+                }],
+            )
+            .unwrap(),
+            Value::Bool(true)
+        );
+        assert!(h.trace.is_external("Fan Output.Set"));
     }
 
     #[test]
