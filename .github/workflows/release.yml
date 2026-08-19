@@ -27,6 +27,7 @@ jobs:
     outputs:
       version: ${{ steps.version.outputs.version }}
       should_release: ${{ steps.version.outputs.should_release }}
+      source_sha: ${{ steps.version.outputs.source_sha }}
     steps:
       - uses: actions/checkout@v7
       - id: version
@@ -41,6 +42,7 @@ jobs:
             exit 1
           fi
           echo "version=$VERSION" >> "$GITHUB_OUTPUT"
+          SOURCE_SHA="$GITHUB_SHA"
 
           LATEST_TAG=$(gh api "repos/$GITHUB_REPOSITORY/releases/latest" \
             --jq .tag_name 2>/dev/null || true)
@@ -50,6 +52,7 @@ jobs:
             NEWEST=$(printf '%s\n%s\n' "$LATEST_VERSION" "$VERSION" | sort -V | tail -1)
             if [ "$NEWEST" != "$VERSION" ]; then
               echo "should_release=false" >> "$GITHUB_OUTPUT"
+              echo "source_sha=$SOURCE_SHA" >> "$GITHUB_OUTPUT"
               echo "Cargo version $VERSION is older than latest release $LATEST_TAG — nothing to do."
               exit 0
             fi
@@ -58,6 +61,9 @@ jobs:
           TAG="v$VERSION"
           required="m1-eval-x86_64-unknown-linux-gnu m1-eval-aarch64-apple-darwin m1-eval-x86_64-pc-windows-msvc.exe SHA256SUMS"
           if gh release view "$TAG" --repo "$GITHUB_REPOSITORY" >/dev/null 2>&1; then
+            # An incomplete release must be repaired from the immutable tag,
+            # not from whichever later main commit happened to trigger this run.
+            SOURCE_SHA=$(gh api "repos/$GITHUB_REPOSITORY/commits/$TAG" --jq .sha)
             assets=$(gh release view "$TAG" --repo "$GITHUB_REPOSITORY" \
               --json assets --jq '.assets[].name')
             missing=
@@ -78,6 +84,7 @@ jobs:
             echo "should_release=true" >> "$GITHUB_OUTPUT"
             echo "Will release $TAG (latest: ${LATEST_TAG:-none})."
           fi
+          echo "source_sha=$SOURCE_SHA" >> "$GITHUB_OUTPUT"
 
   test:
     name: Test release
@@ -88,6 +95,8 @@ jobs:
       contents: read
     steps:
       - uses: actions/checkout@v7
+        with:
+          ref: ${{ needs.check.outputs.source_sha }}
       - uses: dtolnay/rust-toolchain@stable
       - uses: Swatinem/rust-cache@v2
       - name: Test default feature set
@@ -121,6 +130,8 @@ jobs:
     runs-on: ${{ matrix.os }}
     steps:
       - uses: actions/checkout@v7
+        with:
+          ref: ${{ needs.check.outputs.source_sha }}
       - uses: dtolnay/rust-toolchain@stable
         with:
           targets: ${{ matrix.target }}
@@ -166,12 +177,13 @@ jobs:
         env:
           GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
           TAG: v${{ needs.check.outputs.version }}
+          SOURCE_SHA: ${{ needs.check.outputs.source_sha }}
         shell: bash
         run: |
           (cd out && sha256sum -- * > SHA256SUMS)
 
           gh api "repos/$GITHUB_REPOSITORY/releases/generate-notes" \
-            -f tag_name="$TAG" -f target_commitish="$GITHUB_SHA" \
+            -f tag_name="$TAG" -f target_commitish="$SOURCE_SHA" \
             --jq .body > body.md || echo "_Generated notes unavailable._" > body.md
           cat >> body.md <<'NOTES'
 
@@ -211,7 +223,7 @@ jobs:
           else
             gh release create "$TAG" out/* \
               --repo "$GITHUB_REPOSITORY" \
-              --target "$GITHUB_SHA" \
+              --target "$SOURCE_SHA" \
               --title "m1-eval $TAG" \
               --notes-file body.md
           fi
