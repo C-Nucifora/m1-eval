@@ -1,0 +1,229 @@
+name: Release binaries
+
+# Publishes the m1-eval CLI as prebuilt binaries (Linux/macOS/Windows) on a
+# GitHub Release named after the crate version. A release is cut automatically
+# when Cargo.toml contains a version newer than the latest GitHub Release; a
+# partial release of the current version is repaired on the next run. The
+# workflow can also be run manually.
+
+on:
+  push:
+    branches: [main]
+  workflow_dispatch:
+
+permissions:
+  contents: read
+
+# Serialize release runs and never cancel one while it is publishing. A queued
+# run safely no-ops once the release is complete (m1-tools#27).
+concurrency:
+  group: ${{ github.workflow }}-release
+  cancel-in-progress: false
+
+jobs:
+  check:
+    name: Check version
+    runs-on: ubuntu-latest
+    outputs:
+      version: ${{ steps.version.outputs.version }}
+      should_release: ${{ steps.version.outputs.should_release }}
+      source_sha: ${{ steps.version.outputs.source_sha }}
+    steps:
+      - uses: actions/checkout@v7
+      - id: version
+        name: Compare Cargo version with latest release
+        env:
+          GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+        shell: bash
+        run: |
+          VERSION=$(sed -nE 's/^version = "([^"]+)"/\1/p' Cargo.toml | head -1)
+          if [ -z "$VERSION" ]; then
+            echo "Could not read the package version from Cargo.toml." >&2
+            exit 1
+          fi
+          echo "version=$VERSION" >> "$GITHUB_OUTPUT"
+          SOURCE_SHA="$GITHUB_SHA"
+
+          LATEST_TAG=$(gh api "repos/$GITHUB_REPOSITORY/releases/latest" \
+            --jq .tag_name 2>/dev/null || true)
+          LATEST_VERSION=${LATEST_TAG#v}
+
+          if [ -n "$LATEST_VERSION" ] && [ "$VERSION" != "$LATEST_VERSION" ]; then
+            NEWEST=$(printf '%s\n%s\n' "$LATEST_VERSION" "$VERSION" | sort -V | tail -1)
+            if [ "$NEWEST" != "$VERSION" ]; then
+              echo "should_release=false" >> "$GITHUB_OUTPUT"
+              echo "source_sha=$SOURCE_SHA" >> "$GITHUB_OUTPUT"
+              echo "Cargo version $VERSION is older than latest release $LATEST_TAG — nothing to do."
+              exit 0
+            fi
+          fi
+
+          TAG="v$VERSION"
+          required="m1-eval-x86_64-unknown-linux-gnu m1-eval-aarch64-apple-darwin m1-eval-x86_64-pc-windows-msvc.exe SHA256SUMS"
+          if gh release view "$TAG" --repo "$GITHUB_REPOSITORY" >/dev/null 2>&1; then
+            # An incomplete release must be repaired from the immutable tag,
+            # not from whichever later main commit happened to trigger this run.
+            SOURCE_SHA=$(gh api "repos/$GITHUB_REPOSITORY/commits/$TAG" --jq .sha)
+            assets=$(gh release view "$TAG" --repo "$GITHUB_REPOSITORY" \
+              --json assets --jq '.assets[].name')
+            missing=
+            for asset in $required; do
+              grep -qxF "$asset" <<<"$assets" || missing="$missing $asset"
+            done
+            if [ -n "$missing" ]; then
+              echo "should_release=true" >> "$GITHUB_OUTPUT"
+              echo "Release $TAG is incomplete; missing:$missing — rebuilding and uploading."
+            else
+              echo "should_release=false" >> "$GITHUB_OUTPUT"
+              echo "Release $TAG already has every required asset — nothing to do."
+            fi
+          elif [ -n "$LATEST_VERSION" ] && [ "$VERSION" = "$LATEST_VERSION" ]; then
+            echo "The latest release reports $LATEST_TAG, but $TAG cannot be loaded." >&2
+            exit 1
+          else
+            echo "should_release=true" >> "$GITHUB_OUTPUT"
+            echo "Will release $TAG (latest: ${LATEST_TAG:-none})."
+          fi
+          echo "source_sha=$SOURCE_SHA" >> "$GITHUB_OUTPUT"
+
+  test:
+    name: Test release
+    needs: check
+    if: needs.check.outputs.should_release == 'true'
+    runs-on: ubuntu-latest
+    permissions:
+      contents: read
+    steps:
+      - uses: actions/checkout@v7
+        with:
+          ref: ${{ needs.check.outputs.source_sha }}
+      - uses: dtolnay/rust-toolchain@stable
+      - uses: Swatinem/rust-cache@v2
+      - name: Test default feature set
+        run: cargo test --locked --verbose
+      - name: Test optional ld support
+        run: cargo test --locked --verbose --features ld
+
+  build:
+    name: Build ${{ matrix.target }}
+    needs: [check, test]
+    if: needs.check.outputs.should_release == 'true'
+    permissions:
+      contents: read
+      id-token: write
+      attestations: write
+    strategy:
+      fail-fast: false
+      matrix:
+        include:
+          - os: ubuntu-latest
+            target: x86_64-unknown-linux-gnu
+            ext: ""
+          - os: macos-14
+            target: aarch64-apple-darwin
+            ext: ""
+          - os: windows-latest
+            target: x86_64-pc-windows-msvc
+            ext: ".exe"
+          # Intel macOS is intentionally omitted because GitHub no longer
+          # reliably allocates Intel runners. Intel users can build from source.
+    runs-on: ${{ matrix.os }}
+    steps:
+      - uses: actions/checkout@v7
+        with:
+          ref: ${{ needs.check.outputs.source_sha }}
+      - uses: dtolnay/rust-toolchain@stable
+        with:
+          targets: ${{ matrix.target }}
+      - uses: Swatinem/rust-cache@v2
+      - name: Build
+        run: cargo build --locked --release --target ${{ matrix.target }} --bin m1-eval
+      - name: Stage binary
+        shell: bash
+        run: |
+          mkdir -p out
+          cp "target/${{ matrix.target }}/release/m1-eval${{ matrix.ext }}" \
+             "out/m1-eval-${{ matrix.target }}${{ matrix.ext }}"
+      - name: Ad-hoc re-sign the macOS binary
+        if: runner.os == 'macOS'
+        shell: bash
+        run: |
+          # Refresh the linker's ad-hoc signature over the final bytes so macOS
+          # does not reject downloaded binaries with "Code Signature Invalid".
+          codesign --force --sign - "out/m1-eval-${{ matrix.target }}${{ matrix.ext }}"
+          codesign --verify --verbose "out/m1-eval-${{ matrix.target }}${{ matrix.ext }}"
+      - name: Attest build provenance
+        uses: actions/attest-build-provenance@v4
+        with:
+          subject-path: out/*
+      - uses: actions/upload-artifact@v7
+        with:
+          name: bin-${{ matrix.target }}
+          path: out/*
+
+  release:
+    name: Publish v${{ needs.check.outputs.version }}
+    needs: [check, build]
+    if: needs.check.outputs.should_release == 'true'
+    runs-on: ubuntu-latest
+    permissions:
+      contents: write
+    steps:
+      - uses: actions/download-artifact@v8
+        with:
+          path: out
+          merge-multiple: true
+      - name: Publish release
+        env:
+          GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+          TAG: v${{ needs.check.outputs.version }}
+          SOURCE_SHA: ${{ needs.check.outputs.source_sha }}
+        shell: bash
+        run: |
+          (cd out && sha256sum -- * > SHA256SUMS)
+
+          gh api "repos/$GITHUB_REPOSITORY/releases/generate-notes" \
+            -f tag_name="$TAG" -f target_commitish="$SOURCE_SHA" \
+            --jq .body > body.md || echo "_Generated notes unavailable._" > body.md
+          cat >> body.md <<'NOTES'
+
+          ## Install
+
+          Prebuilt binaries of the **m1-eval** deterministic evaluator for MoTeC M1 projects:
+
+          | Platform | Asset |
+          | --- | --- |
+          | Linux x86_64 | [`m1-eval-x86_64-unknown-linux-gnu`](https://github.com/{{REPO}}/releases/download/{{TAG}}/m1-eval-x86_64-unknown-linux-gnu) |
+          | macOS Apple Silicon | [`m1-eval-aarch64-apple-darwin`](https://github.com/{{REPO}}/releases/download/{{TAG}}/m1-eval-aarch64-apple-darwin) |
+          | Windows x86_64 | [`m1-eval-x86_64-pc-windows-msvc.exe`](https://github.com/{{REPO}}/releases/download/{{TAG}}/m1-eval-x86_64-pc-windows-msvc.exe) |
+
+          Download the binary for your platform, rename it to `m1-eval` (`m1-eval.exe` on Windows), mark it executable (`chmod +x m1-eval`), and move it onto your `PATH`. On macOS, clear the download quarantine first: `xattr -d com.apple.quarantine m1-eval`.
+
+          These binaries use the default CSV log support. To include optional binary `.ld` log import, build from source:
+
+          ```sh
+          cargo install --locked --git https://github.com/{{REPO}} --tag {{TAG}} --features ld
+          ```
+
+          ## Verify the download
+
+          `SHA256SUMS` covers every binary, and each binary carries GitHub build provenance:
+
+          ```sh
+          sha256sum --check --ignore-missing SHA256SUMS
+          gh attestation verify m1-eval-x86_64-unknown-linux-gnu --repo {{REPO}}
+          ```
+          NOTES
+          sed -i "s|{{REPO}}|$GITHUB_REPOSITORY|g; s|{{TAG}}|$TAG|g" body.md
+
+          # Preserve edited notes when repairing a partial release; only assets
+          # are replaced. Otherwise gh creates the v-prefixed tag at GITHUB_SHA.
+          if gh release view "$TAG" --repo "$GITHUB_REPOSITORY" >/dev/null 2>&1; then
+            gh release upload "$TAG" out/* --clobber --repo "$GITHUB_REPOSITORY"
+          else
+            gh release create "$TAG" out/* \
+              --repo "$GITHUB_REPOSITORY" \
+              --target "$SOURCE_SHA" \
+              --title "m1-eval $TAG" \
+              --notes-file body.md
+          fi
