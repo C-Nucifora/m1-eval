@@ -6,6 +6,8 @@ Supported:
   construct assignment_statement
 Assumed:
   builtin Integral.Normal
+Adapter-backed:
+  (none)
 Stubbed:
   (none)
 Unsupported:

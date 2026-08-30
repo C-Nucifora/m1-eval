@@ -20,6 +20,12 @@ pub use triggers::{TriggerMap, TriggerStatus};
 pub mod env;
 pub use env::{CallSite, Env, OpState, StateStore};
 
+pub mod hardware;
+pub use hardware::{
+    AdapterReply, EvalPhase, EvalTime, HardwareAdapter, HardwareCall, HardwareProvenance,
+    HardwareValueSource, ResolvedReceiver,
+};
+
 pub mod ident;
 pub use ident::{Target, classify};
 
@@ -35,7 +41,7 @@ pub mod stmt;
 pub use stmt::{exec, exec_script};
 
 pub mod scenario;
-pub use scenario::{InputKind, InputSeries, RunMode, Scenario};
+pub use scenario::{InputKind, InputSeries, IoSeries, RunMode, Scenario};
 
 pub mod log;
 pub use log::{Log, LogMeta};
@@ -50,7 +56,9 @@ pub mod summary;
 pub use summary::{IoSets, io_sets};
 
 pub mod runner;
-pub use runner::{CounterfactualCfg, run_counterfactual};
+pub use runner::{
+    CounterfactualCfg, run_counterfactual, run_counterfactual_with_adapter, run_with_adapter,
+};
 
 pub mod coverage;
 pub use coverage::{CoverageItem, CoverageReport, ItemKind, UnresolvedTrigger};

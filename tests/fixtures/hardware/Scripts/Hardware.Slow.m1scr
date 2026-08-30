@@ -1,0 +1,2 @@
+// Synthetic hardware-boundary fixture. No proprietary content.
+SlowElapsed = System.ElapsedTime();

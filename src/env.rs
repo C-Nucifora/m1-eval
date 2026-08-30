@@ -32,7 +32,7 @@ use std::collections::HashMap;
 /// A stable identity for one stateful-operator occurrence in the source: the
 /// script basename and the byte offset of its call node. Stable across ticks for
 /// a fixed parse, so a `Filter`/`Integral`/`Delay` keeps its state between ticks.
-#[derive(Debug, Clone, PartialEq, Eq, Hash)]
+#[derive(Debug, Clone, PartialEq, Eq, PartialOrd, Ord, Hash)]
 pub struct CallSite(pub String, pub usize);
 
 impl CallSite {
@@ -118,6 +118,9 @@ pub enum OpState {
     ChangeEdge { prev: bool, held: f64 },
     /// A countdown `Timer` object: the remaining time and whether it is running.
     Timer { remaining: f64, running: bool },
+    /// `System.ElapsedTime`: evaluator time when this exact call site last ran.
+    /// Each execution returns the interval from this timestamp, then replaces it.
+    SystemElapsed { previous_execution_s: f64 },
 }
 
 /// The per-call-site state map for stateful builtins. A new site defaults to
@@ -163,10 +166,9 @@ pub struct Env {
     /// `static local` values, keyed by owning-function path + variable name.
     /// Persist across function entry/exit for the whole run.
     pub statics: HashMap<String, Value>,
-    /// Scenario-fed values for Tier-3 IO calls, keyed by the call spelling
-    /// `"Object.Method"` (e.g. `"CanComms.GetFloat"`). When a key is present the
-    /// IO stub returns it instead of a documented default — this is how a
-    /// scenario externally drives a hardware-backed builtin. Empty by default.
+    /// Wildcard scenario values for hardware calls, keyed by a canonical or
+    /// source-spelled `"Object.Method"` name. A matching value precedes the
+    /// adapter and every built-in fallback. Empty by default.
     pub io_overrides: HashMap<String, Value>,
     /// The current function frame's return-value slot — the `Out` object an M1
     /// user function assigns to (`Out = <expr>;`). A single slot per *active*
@@ -229,14 +231,26 @@ impl Env {
         self.statics.insert(static_key(fn_symbol, var), value);
     }
 
-    /// A scenario-fed override for a Tier-3 IO call `"Object.Method"`, if set.
+    /// A wildcard scenario override for a hardware call name, if set.
     pub fn io_override(&self, call: &str) -> Option<&Value> {
         self.io_overrides.get(call)
     }
 
-    /// Seed a scenario value for a Tier-3 IO call `"Object.Method"`.
+    /// A scenario override for one exact hardware call occurrence.
+    pub fn io_override_at(&self, call: &str, site: &CallSite) -> Option<&Value> {
+        self.io_overrides.get(&site_override_key(call, site))
+    }
+
+    /// Seed a wildcard scenario value for a hardware call name.
     pub fn set_io_override(&mut self, call: impl Into<String>, value: Value) {
         self.io_overrides.insert(call.into(), value);
+    }
+
+    /// Seed a scenario value for one exact hardware call occurrence.
+    pub fn set_io_override_at(&mut self, call: impl Into<String>, site: CallSite, value: Value) {
+        let call = call.into();
+        self.io_overrides
+            .insert(site_override_key(&call, &site), value);
     }
 
     /// Write the current frame's `Out` return slot — the value an `Out = <expr>;`
@@ -269,6 +283,17 @@ impl Env {
     pub fn leave_function(&mut self) {
         self.locals.clear();
     }
+}
+
+/// Private key namespace for exact-site values inside the established wildcard
+/// map. M1 identifiers cannot contain NUL, so ordinary call names cannot collide
+/// with these entries.
+fn site_override_key(call: &str, site: &CallSite) -> String {
+    format!(
+        "\0m1-eval-site\0{call}\0{}\0{}",
+        site.script(),
+        site.offset()
+    )
 }
 
 #[cfg(test)]

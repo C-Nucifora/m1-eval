@@ -2,7 +2,8 @@
 //! The stateful (time-domain) builtins — the hard core of the evaluator.
 //!
 //! Each operator is a small state machine keyed by its [`CallSite`] and advanced
-//! once per tick by `ctx.dt`. State lives in [`crate::env::StateStore`] as an
+//! once per execution by `ctx.dt`. State lives in
+//! [`crate::env::StateStore`] as an
 //! [`OpState`] variant; a fresh site starts [`OpState::Uninit`] and the operator
 //! seeds itself on its first tick so the discretisation has a defined prior
 //! value. The update laws below are paraphrased from our understanding of the M1

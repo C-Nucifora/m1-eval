@@ -1,0 +1,3 @@
+// Synthetic hardware-boundary fixture. No proprietary content.
+StartupTick = System.Ticks();
+StartupElapsed = System.ElapsedTime();

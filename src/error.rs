@@ -15,6 +15,9 @@ pub enum EvalError {
     TypeError { detail: String },
     /// An input the scenario was required to provide but did not.
     MissingInput { channel: String },
+    /// Required hardware metadata had no exact/wildcard scenario value and the
+    /// attached adapter declined the call.
+    MissingHardwareMetadata { call: String },
     /// Wrong argument count/kind for a builtin call.
     BadCall { detail: String },
     /// An error wrapped with *where* it happened: the script whose execution
@@ -70,6 +73,10 @@ impl std::fmt::Display for EvalError {
             }
             EvalError::TypeError { detail } => write!(f, "type error: {detail}"),
             EvalError::MissingInput { channel } => write!(f, "missing scenario input: {channel}"),
+            EvalError::MissingHardwareMetadata { call } => write!(
+                f,
+                "missing required hardware metadata for {call}; add a scenario [[io]] value for this call or supply it from a HardwareAdapter"
+            ),
             EvalError::BadCall { detail } => write!(f, "bad call: {detail}"),
             EvalError::InScript { script, t, source } => match t {
                 Some(t) => write!(f, "in {script} at t = {t:.3} s: {source}"),

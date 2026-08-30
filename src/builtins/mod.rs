@@ -13,11 +13,9 @@
 //! named method is a fail-loud [`EvalError::BadCall`]; a method the registry does
 //! not list on the object is an [`EvalError::UnsupportedBuiltin`].
 //!
-//! The stateful operators (`Filter`/`Integral`/`Delay`/… and the stateful
-//! `Calculate.{Stable,Hysteresis,Between,Beyond}`) and the Tier-3 IO objects
-//! arrive in later milestones; until then they match no implemented branch here
-//! and fall through to the fail-loud default. That default is the whole point:
-//! an unimplemented builtin must surface as an error, never a guessed number.
+//! Stateful operators and hardware-backed calls also route here. Hardware calls
+//! share one typed boundary and deterministic fallback policy; unsupported
+//! receiver/method pairs still fail loud rather than inventing a value.
 
 pub mod calculate;
 pub mod convert;
@@ -30,7 +28,8 @@ pub mod userfn;
 
 use crate::env::CallSite;
 use crate::error::EvalError;
-use crate::expr::EvalCtx;
+use crate::expr::{EvalCtx, EvalRuntime};
+use crate::hardware::ResolvedReceiver;
 use crate::ident::{Target, classify};
 use crate::value::{M1Scalar, Value};
 use m1_typecheck::Project;
@@ -57,6 +56,19 @@ pub fn dispatch(
     site: CallSite,
     ctx: &mut EvalCtx,
 ) -> Result<Value, EvalError> {
+    let mut runtime = EvalRuntime::from_public(ctx.dt);
+    dispatch_with_runtime(object, method, args, site, ctx, &mut runtime)
+}
+
+/// Internal dispatch path carrying the runner's evaluator timeline and adapter.
+pub(crate) fn dispatch_with_runtime(
+    object: &str,
+    method: &str,
+    args: &[Value],
+    site: CallSite,
+    ctx: &mut EvalCtx,
+    runtime: &mut EvalRuntime<'_>,
+) -> Result<Value, EvalError> {
     let capability = {
         let scope = CapabilityScope {
             project: Some(ctx.project),
@@ -69,10 +81,12 @@ pub fn dispatch(
     };
 
     match capability.route {
-        CallRoute::UserFunction(canon) => match userfn::call(&canon, args, ctx)? {
-            Some(value) => Ok(value),
-            None => Err(unsupported(object, method)),
-        },
+        CallRoute::UserFunction(canon) => {
+            match userfn::call_with_runtime(&canon, args, ctx, runtime)? {
+                Some(value) => Ok(value),
+                None => Err(unsupported(object, method)),
+            }
+        }
         CallRoute::TableLookup => match try_table_lookup(object, args, ctx)? {
             Some(value) => Ok(value),
             None => Err(unsupported(object, method)),
@@ -102,7 +116,13 @@ pub fn dispatch(
             }
         }
         CallRoute::IoLibrary(library_object) => {
-            io_stub::call(&library_object, object, method, args, ctx)
+            if !intrinsics::get()
+                .library_overloads(&library_object, method)
+                .is_empty()
+            {
+                validate_arity(&library_object, object, method, args.len())?;
+            }
+            io_stub::call_with_runtime(&library_object, object, method, args, site, ctx, runtime)
         }
         CallRoute::MathAssumption(library_object) => {
             validate_arity(&library_object, object, method, args.len())?;
@@ -157,7 +177,9 @@ pub fn dispatch(
                 None => Err(unsupported(object, method)),
             }
         }
-        CallRoute::ProjectIo => io_stub::project_object_call(object, method, args, ctx),
+        CallRoute::ProjectIo(receiver) => io_stub::project_object_call_with_runtime(
+            receiver, object, method, args, site, ctx, runtime,
+        ),
         CallRoute::Unsupported => Err(unsupported(object, method)),
     }
 }
@@ -165,11 +187,23 @@ pub fn dispatch(
 /// Dispatch a bare user-function call such as `Update(...)`. Bare callees cannot
 /// name a library builtin, so the shared capability model either resolves a
 /// script-backed function or rejects the call.
+#[cfg(test)]
 pub(crate) fn dispatch_bare(
     callee: &str,
     args: &[Value],
     site: CallSite,
     ctx: &mut EvalCtx,
+) -> Result<Value, EvalError> {
+    let mut runtime = EvalRuntime::from_public(ctx.dt);
+    dispatch_bare_with_runtime(callee, args, site, ctx, &mut runtime)
+}
+
+pub(crate) fn dispatch_bare_with_runtime(
+    callee: &str,
+    args: &[Value],
+    site: CallSite,
+    ctx: &mut EvalCtx,
+    runtime: &mut EvalRuntime<'_>,
 ) -> Result<Value, EvalError> {
     let capability = {
         let scope = CapabilityScope {
@@ -182,7 +216,7 @@ pub(crate) fn dispatch_bare(
         classify_bare_call(callee, &scope)
     };
     if let CallRoute::UserFunction(canon) = capability.route
-        && let Some(value) = userfn::call(&canon, args, ctx)?
+        && let Some(value) = userfn::call_with_runtime(&canon, args, ctx, runtime)?
     {
         return Ok(value);
     }
@@ -465,8 +499,10 @@ pub enum BuiltinSupport {
     /// Runs through an explicit offline model, such as a time-domain update law.
     /// The coverage report renders this operational category as `Assumed`.
     Modeled,
-    /// A Tier-3 IO object handled as a documented/scenario-fed stub.
+    /// A hardware call with a documented generic offline fallback.
     Stubbed,
+    /// Hardware metadata which must come from a scenario or typed adapter.
+    AdapterBacked,
     /// Not implemented — fails loud at runtime.
     Unsupported,
 }
@@ -487,7 +523,7 @@ enum CallRoute {
     ObjectGetUnscheduled,
     ChannelSet,
     Timer,
-    ProjectIo,
+    ProjectIo(ResolvedReceiver),
     Unsupported,
 }
 
@@ -586,9 +622,22 @@ const MODELED_STATEFUL_METHODS: &[(&str, &str)] = &[
     ("Change", "Either"),
 ];
 
-/// The Tier-3 IO library objects: their methods are handled as documented/
-/// scenario-fed stubs (flagged externally driven), not evaluated as hardware.
+/// Hardware library objects routed through scenario values, an optional adapter,
+/// deterministic `System` behavior, and documented typed fallbacks.
 const STUB_OBJECTS: &[&str] = &["CanComms", "Serial", "System", "Logging"];
+
+/// `System` calls computed from the evaluator's deterministic base timeline.
+const MODELED_SYSTEM_METHODS: &[&str] = &[
+    "ElapsedTime",
+    "HiResTickPeriod",
+    "HiResTicks",
+    "HiResTicksSince",
+    "TickPeriod",
+    "Ticks",
+    "TicksBetween",
+    "TicksRemaining",
+    "TicksSince",
+];
 
 /// Calibration-only `Math` methods that real ECU scripts nevertheless use. They
 /// have deterministic standard-library implementations here, but remain explicit
@@ -649,7 +698,7 @@ pub(crate) fn classify_member_call(
     match classify(object, scope.group, scope.fn_symbol, project, locals) {
         Target::Builtin { object: builtin } => classify_library(&builtin, method),
         Target::Symbol(canon) => classify_project_method(&canon, method, project),
-        Target::Unresolved => classify_unresolved_project_method(method),
+        Target::Unresolved => classify_unresolved_project_method(object, method),
         Target::Local(_) => unsupported_capability(),
     }
 }
@@ -670,7 +719,7 @@ fn classify_without_project(object: &str, method: &str) -> CallCapability {
     if object == "Library" || object.starts_with("Library.") {
         return unsupported_capability();
     }
-    classify_unresolved_project_method(method)
+    classify_unresolved_project_method(object, method)
 }
 
 /// Normalize a source receiver that directly names a library object. The
@@ -704,13 +753,32 @@ fn classify_library(object: &str, method: &str) -> CallCapability {
             CallRoute::MathAssumption(object.to_string()),
         );
     }
-    if STUB_OBJECTS.contains(&object)
-        && !intrinsics::get()
+    if STUB_OBJECTS.contains(&object) {
+        let known = !intrinsics::get()
             .library_overloads(object, method)
-            .is_empty()
-    {
+            .is_empty();
+        if object == "System" && known && MODELED_SYSTEM_METHODS.contains(&method) {
+            return capability(
+                BuiltinSupport::Modeled,
+                CallRoute::IoLibrary(object.to_string()),
+            );
+        }
+        if known && io_stub::required_metadata(object, method) {
+            return capability(
+                BuiltinSupport::AdapterBacked,
+                CallRoute::IoLibrary(object.to_string()),
+            );
+        }
+        if known {
+            return capability(
+                BuiltinSupport::Stubbed,
+                CallRoute::IoLibrary(object.to_string()),
+            );
+        }
+        // Give an attached adapter first refusal on a hardware method absent
+        // from the catalogue. Without an adapter, the runtime still fails loud.
         return capability(
-            BuiltinSupport::Stubbed,
+            BuiltinSupport::Unsupported,
             CallRoute::IoLibrary(object.to_string()),
         );
     }
@@ -786,16 +854,35 @@ fn classify_project_method(canon: &str, method: &str, project: &Project) -> Call
         SymbolKind::Object | SymbolKind::Group | SymbolKind::Reference | SymbolKind::Other
     ) && io_stub::PROJECT_OBJECT_STUB_METHODS.contains(&method)
     {
-        return capability(BuiltinSupport::Stubbed, CallRoute::ProjectIo);
+        return capability(
+            BuiltinSupport::Stubbed,
+            CallRoute::ProjectIo(ResolvedReceiver::Project {
+                path: canon.to_string(),
+            }),
+        );
+    }
+    if matches!(
+        symbol.kind,
+        SymbolKind::Object | SymbolKind::Group | SymbolKind::Reference | SymbolKind::Other
+    ) {
+        return capability(
+            BuiltinSupport::Unsupported,
+            CallRoute::ProjectIo(ResolvedReceiver::Project {
+                path: canon.to_string(),
+            }),
+        );
     }
     unsupported_capability()
 }
 
-fn classify_unresolved_project_method(method: &str) -> CallCapability {
+fn classify_unresolved_project_method(object: &str, method: &str) -> CallCapability {
+    let route = CallRoute::ProjectIo(ResolvedReceiver::Unresolved {
+        spelling: object.to_string(),
+    });
     if io_stub::PROJECT_OBJECT_STUB_METHODS.contains(&method) {
-        capability(BuiltinSupport::Stubbed, CallRoute::ProjectIo)
+        capability(BuiltinSupport::Stubbed, route)
     } else {
-        unsupported_capability()
+        capability(BuiltinSupport::Unsupported, route)
     }
 }
 
@@ -1697,6 +1784,16 @@ mod tests {
         }
 
         fn call(&mut self, object: &str, method: &str, args: &[Value]) -> Result<Value, EvalError> {
+            self.call_with_adapter(object, method, args, None)
+        }
+
+        fn call_with_adapter(
+            &mut self,
+            object: &str,
+            method: &str,
+            args: &[Value],
+            hardware: Option<&mut dyn crate::hardware::HardwareAdapter>,
+        ) -> Result<Value, EvalError> {
             let site = CallSite::new("Demo.Update.m1scr", 0);
             let mut ctx = EvalCtx {
                 project: &self.project,
@@ -1713,8 +1810,46 @@ mod tests {
                 depth: 0,
                 trace: Some(&mut self.trace),
             };
-            dispatch(object, method, args, site, &mut ctx)
+            let mut runtime = EvalRuntime {
+                time: crate::hardware::EvalTime::at_start(0.01),
+                hardware,
+            };
+            dispatch_with_runtime(object, method, args, site, &mut ctx, &mut runtime)
         }
+    }
+
+    #[derive(Default)]
+    struct ProjectRecordingAdapter {
+        calls: Vec<crate::hardware::HardwareCall>,
+    }
+
+    impl crate::hardware::HardwareAdapter for ProjectRecordingAdapter {
+        fn call(
+            &mut self,
+            call: &crate::hardware::HardwareCall,
+        ) -> Result<crate::hardware::AdapterReply, EvalError> {
+            self.calls.push(call.clone());
+            Ok(crate::hardware::AdapterReply::Value(Value::Bool(true)))
+        }
+    }
+
+    #[test]
+    fn project_hardware_adapter_receives_the_canonical_receiver_path() {
+        let mut h = ProjectObjHarness::new();
+        let mut adapter = ProjectRecordingAdapter::default();
+        assert_eq!(
+            h.call_with_adapter("DashVals.Aux Switch", "Receive", &[], Some(&mut adapter),)
+                .unwrap(),
+            Value::Bool(true)
+        );
+        assert_eq!(adapter.calls.len(), 1);
+        assert_eq!(
+            adapter.calls[0].receiver,
+            crate::hardware::ResolvedReceiver::Project {
+                path: "Root.Demo.DashVals.Aux Switch".to_string()
+            }
+        );
+        assert_eq!(adapter.calls[0].source_receiver, "DashVals.Aux Switch");
     }
 
     // ---- Task 6: Channel .Set(value) imperative setter ----
@@ -2412,12 +2547,17 @@ mod tests {
             let library = intrinsics::get()
                 .library_object(object)
                 .expect("stub object is in the intrinsic catalog");
-            cases.extend(
-                library
-                    .functions
-                    .iter()
-                    .map(|overload| (object, overload.name.as_str(), BuiltinSupport::Stubbed)),
-            );
+            cases.extend(library.functions.iter().map(|overload| {
+                let method = overload.name.as_str();
+                let support = if object == "System" && MODELED_SYSTEM_METHODS.contains(&method) {
+                    BuiltinSupport::Modeled
+                } else if io_stub::required_metadata(object, method) {
+                    BuiltinSupport::AdapterBacked
+                } else {
+                    BuiltinSupport::Stubbed
+                };
+                (object, method, support)
+            }));
         }
         cases.sort_by_key(|(object, method, _)| (*object, *method));
         cases.dedup_by_key(|(object, method, _)| (*object, *method));
@@ -2445,6 +2585,7 @@ mod tests {
             let bucket = match expected {
                 BuiltinSupport::Direct => &report.supported,
                 BuiltinSupport::Modeled => &report.assumed,
+                BuiltinSupport::AdapterBacked => &report.adapter_backed,
                 BuiltinSupport::Stubbed => &report.stubbed,
                 _ => unreachable!("catalog test covers executable methods"),
             };
@@ -2467,6 +2608,8 @@ mod tests {
                 .collect();
             let mut harness = Harness::new();
             match harness.call(object, method, &args) {
+                Err(EvalError::MissingHardwareMetadata { .. })
+                    if expected == BuiltinSupport::AdapterBacked => {}
                 Err(EvalError::UnsupportedBuiltin { .. }) => {
                     panic!("coverage says {expected:?}, but dispatch rejects {name}")
                 }
@@ -2495,12 +2638,10 @@ mod tests {
     }
 
     #[test]
-    fn io_library_methods_are_classified_stubbed() {
-        // Every method on a Tier-3 IO *library* object (CanComms/Serial/System/
-        // Logging) the generic typed-default stub now handles must classify as
-        // Stubbed, so coverage stays consistent with what the IO stub returns at
-        // runtime — including the `CanComms.*` reads/setup the old design left
-        // unstubbed (the EV-M1 whole-project blocker this fix closed).
+    fn io_library_methods_keep_modeled_metadata_and_stub_categories_distinct() {
+        // Every method on a hardware library object (CanComms/Serial/System/
+        // Logging) handled by the generic typed fallback must classify as
+        // Stubbed, so coverage stays consistent with runtime dispatch.
         let cases = [
             ("CanComms", "RxOpenStandard"),     // Handle -> unit stub
             ("CanComms", "GetFloat"),           // FloatingPoint -> 0.0
@@ -2508,8 +2649,6 @@ mod tests {
             ("CanComms", "RxMessage"),          // Boolean -> false
             ("CanComms", "SetFloat"),           // Void -> unit
             ("Serial", "GetFloat"),
-            ("System", "ElapsedTime"),
-            ("System", "TickPeriod"),
             ("Logging", "Running"),
         ];
         for (object, method) in cases {
@@ -2517,6 +2656,20 @@ mod tests {
                 classify_builtin(object, method),
                 BuiltinSupport::Stubbed,
                 "{object}.{method} should be a stub"
+            );
+        }
+        for method in ["ElapsedTime", "TickPeriod", "Ticks", "TicksSince"] {
+            assert_eq!(
+                classify_builtin("System", method),
+                BuiltinSupport::Modeled,
+                "System.{method} should use evaluator time"
+            );
+        }
+        for method in ["FlashSize", "FlashFree"] {
+            assert_eq!(
+                classify_builtin("System", method),
+                BuiltinSupport::AdapterBacked,
+                "System.{method} must not use a zero stub"
             );
         }
     }

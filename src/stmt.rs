@@ -32,7 +32,7 @@
 //! contain spaces; we only ever split on `.`.
 
 use crate::error::EvalError;
-use crate::expr::{self, EvalCtx, eval};
+use crate::expr::{self, EvalCtx, EvalRuntime, eval_with_runtime};
 use crate::ident::{Target, classify};
 use crate::value::Value;
 use m1_core::{Field, Kind, Node};
@@ -41,14 +41,23 @@ use m1_typecheck::types::declared_local_type;
 
 /// Execute one statement node, applying its effect to `ctx`.
 pub fn exec(node: &Node, ctx: &mut EvalCtx) -> Result<(), EvalError> {
+    let mut runtime = EvalRuntime::from_public(ctx.dt);
+    exec_with_runtime(node, ctx, &mut runtime)
+}
+
+pub(crate) fn exec_with_runtime(
+    node: &Node,
+    ctx: &mut EvalCtx,
+    runtime: &mut EvalRuntime<'_>,
+) -> Result<(), EvalError> {
     match node.kind() {
-        Kind::AssignmentStatement => exec_assignment(node, ctx),
-        Kind::ExpressionStatement => exec_expression_statement(node, ctx),
-        Kind::LocalDeclaration => exec_local_declaration(node, ctx),
-        Kind::IfStatement => exec_if(node, ctx),
-        Kind::WhenStatement => exec_when(node, ctx),
-        Kind::ExpandStatement => exec_expand(node, ctx),
-        Kind::Block => exec_block(node, ctx),
+        Kind::AssignmentStatement => exec_assignment(node, ctx, runtime),
+        Kind::ExpressionStatement => exec_expression_statement(node, ctx, runtime),
+        Kind::LocalDeclaration => exec_local_declaration(node, ctx, runtime),
+        Kind::IfStatement => exec_if(node, ctx, runtime),
+        Kind::WhenStatement => exec_when(node, ctx, runtime),
+        Kind::ExpandStatement => exec_expand(node, ctx, runtime),
+        Kind::Block => exec_block(node, ctx, runtime),
         // A bare `;` is a no-op.
         Kind::EmptyStatement => Ok(()),
         // Comments and the like are not statements; ignore non-statement trivia
@@ -65,9 +74,18 @@ pub fn exec(node: &Node, ctx: &mut EvalCtx) -> Result<(), EvalError> {
 /// Non-statement trivia (comments) between statements is skipped; every real
 /// statement is executed. A failure in any statement aborts the script fail-loud.
 pub fn exec_script(root: &Node, ctx: &mut EvalCtx) -> Result<(), EvalError> {
+    let mut runtime = EvalRuntime::from_public(ctx.dt);
+    exec_script_with_runtime(root, ctx, &mut runtime)
+}
+
+pub(crate) fn exec_script_with_runtime(
+    root: &Node,
+    ctx: &mut EvalCtx,
+    runtime: &mut EvalRuntime<'_>,
+) -> Result<(), EvalError> {
     for child in root.children() {
         if is_statement(child.kind()) {
-            exec(&child, ctx)?;
+            exec_with_runtime(&child, ctx, runtime)?;
         }
     }
     Ok(())
@@ -95,7 +113,11 @@ fn is_statement(kind: Kind) -> bool {
 /// a `static local`, or a project channel/parameter path); the `value` field is
 /// the right-hand-side expression. A compound operator (`+=`, …) reads the
 /// current value, applies the operator, and writes the result back.
-fn exec_assignment(node: &Node, ctx: &mut EvalCtx) -> Result<(), EvalError> {
+fn exec_assignment(
+    node: &Node,
+    ctx: &mut EvalCtx,
+    runtime: &mut EvalRuntime<'_>,
+) -> Result<(), EvalError> {
     let target = node
         .child_by_field(Field::Target)
         .ok_or_else(|| shape_err(node, "assignment target"))?;
@@ -110,7 +132,7 @@ fn exec_assignment(node: &Node, ctx: &mut EvalCtx) -> Result<(), EvalError> {
     // forms): a local slot, a static-local slot, or a canonical channel path.
     let dest = resolve_target(&target, ctx)?;
 
-    let rhs = eval(&value_node, ctx)?;
+    let rhs = eval_with_runtime(&value_node, ctx, runtime)?;
 
     // Plain `=` writes the rhs directly. A compound `op=` reads the current value
     // first, applies the corresponding binary operator, then writes the result.
@@ -128,14 +150,18 @@ fn exec_assignment(node: &Node, ctx: &mut EvalCtx) -> Result<(), EvalError> {
 /// Execute an expression statement: evaluate its inner expression purely for its
 /// side effects (e.g. `Output.SetState(...)`, a Tier-3 IO call). The produced
 /// value is discarded; any evaluation error surfaces fail-loud.
-fn exec_expression_statement(node: &Node, ctx: &mut EvalCtx) -> Result<(), EvalError> {
+fn exec_expression_statement(
+    node: &Node,
+    ctx: &mut EvalCtx,
+    runtime: &mut EvalRuntime<'_>,
+) -> Result<(), EvalError> {
     // The single named child is the expression.
     let inner = node
         .named_children()
         .into_iter()
         .next()
         .ok_or_else(|| shape_err(node, "expression statement"))?;
-    eval(&inner, ctx)?;
+    eval_with_runtime(&inner, ctx, runtime)?;
     Ok(())
 }
 
@@ -382,10 +408,14 @@ fn apply_compound(op: Kind, current: &Value, rhs: &Value) -> Result<Value, EvalE
 
 /// Execute a block: each child statement in source order. Braces and trivia are
 /// skipped via [`is_statement`].
-fn exec_block(node: &Node, ctx: &mut EvalCtx) -> Result<(), EvalError> {
+fn exec_block(
+    node: &Node,
+    ctx: &mut EvalCtx,
+    runtime: &mut EvalRuntime<'_>,
+) -> Result<(), EvalError> {
     for child in node.children() {
         if is_statement(child.kind()) {
-            exec(&child, ctx)?;
+            exec_with_runtime(&child, ctx, runtime)?;
         }
     }
     Ok(())
@@ -395,7 +425,7 @@ fn exec_block(node: &Node, ctx: &mut EvalCtx) -> Result<(), EvalError> {
 /// true the `consequence` block runs, otherwise the `ElseClause` (a child node)
 /// runs — its content is either a `Block` (plain `else`) or a nested
 /// `IfStatement` (`else if`).
-fn exec_if(node: &Node, ctx: &mut EvalCtx) -> Result<(), EvalError> {
+fn exec_if(node: &Node, ctx: &mut EvalCtx, runtime: &mut EvalRuntime<'_>) -> Result<(), EvalError> {
     let cond = node
         .child_by_field(Field::Condition)
         .ok_or_else(|| shape_err(node, "if condition"))?;
@@ -403,8 +433,8 @@ fn exec_if(node: &Node, ctx: &mut EvalCtx) -> Result<(), EvalError> {
         .child_by_field(Field::Consequence)
         .ok_or_else(|| shape_err(node, "if consequence"))?;
 
-    if eval(&cond, ctx)?.as_bool()? {
-        return exec(&consequence, ctx);
+    if eval_with_runtime(&cond, ctx, runtime)?.as_bool()? {
+        return exec_with_runtime(&consequence, ctx, runtime);
     }
 
     // No `else if` matched the boolean: run the else clause if present.
@@ -417,8 +447,8 @@ fn exec_if(node: &Node, ctx: &mut EvalCtx) -> Result<(), EvalError> {
         // IfStatement (`else if … { … }`). Execute whichever it carries.
         for child in else_clause.children() {
             match child.kind() {
-                Kind::Block => return exec_block(&child, ctx),
-                Kind::IfStatement => return exec_if(&child, ctx),
+                Kind::Block => return exec_block(&child, ctx, runtime),
+                Kind::IfStatement => return exec_if(&child, ctx, runtime),
                 _ => {}
             }
         }
@@ -431,11 +461,15 @@ fn exec_if(node: &Node, ctx: &mut EvalCtx) -> Result<(), EvalError> {
 /// the subject's value runs its body. A non-matching `when` runs no clause (no
 /// fall-through). Patterns are enum members (`State.On`, `On`) compared against
 /// the subject enum value, or a pattern list (`is (A or B)`).
-fn exec_when(node: &Node, ctx: &mut EvalCtx) -> Result<(), EvalError> {
+fn exec_when(
+    node: &Node,
+    ctx: &mut EvalCtx,
+    runtime: &mut EvalRuntime<'_>,
+) -> Result<(), EvalError> {
     let subject_node = node
         .child_by_field(Field::Subject)
         .ok_or_else(|| shape_err(node, "when subject"))?;
-    let subject = eval(&subject_node, ctx)?;
+    let subject = eval_with_runtime(&subject_node, ctx, runtime)?;
 
     for clause in node.children() {
         if clause.kind() != Kind::IsClause {
@@ -444,9 +478,9 @@ fn exec_when(node: &Node, ctx: &mut EvalCtx) -> Result<(), EvalError> {
         let state = clause
             .child_by_field(Field::State)
             .ok_or_else(|| shape_err(&clause, "is-clause state"))?;
-        if pattern_matches(&state, &subject, ctx)? {
+        if pattern_matches(&state, &subject, ctx, runtime)? {
             if let Some(body) = clause.child_by_field(Field::Body) {
-                return exec(&body, ctx);
+                return exec_with_runtime(&body, ctx, runtime);
             }
             return Ok(());
         }
@@ -457,16 +491,21 @@ fn exec_when(node: &Node, ctx: &mut EvalCtx) -> Result<(), EvalError> {
 /// Whether an `is`-clause pattern matches the subject value. A single pattern is
 /// an enum member (its last `.`-segment is the member name); a pattern list
 /// (`is (A or B)`) matches if any of its member patterns match.
-fn pattern_matches(pattern: &Node, subject: &Value, ctx: &mut EvalCtx) -> Result<bool, EvalError> {
+fn pattern_matches(
+    pattern: &Node,
+    subject: &Value,
+    ctx: &mut EvalCtx,
+    runtime: &mut EvalRuntime<'_>,
+) -> Result<bool, EvalError> {
     if pattern.kind() == Kind::IsPatternList {
         for p in pattern.named_children() {
-            if pattern_matches(&p, subject, ctx)? {
+            if pattern_matches(&p, subject, ctx, runtime)? {
                 return Ok(true);
             }
         }
         return Ok(false);
     }
-    single_pattern_matches(pattern, subject, ctx)
+    single_pattern_matches(pattern, subject, ctx, runtime)
 }
 
 /// Match one (non-list) pattern against the subject. Enum subjects compare by
@@ -477,6 +516,7 @@ fn single_pattern_matches(
     pattern: &Node,
     subject: &Value,
     ctx: &mut EvalCtx,
+    runtime: &mut EvalRuntime<'_>,
 ) -> Result<bool, EvalError> {
     // The member-name spelling of the pattern: the last `.`-segment of its text.
     let pattern_text = pattern.text();
@@ -500,7 +540,7 @@ fn single_pattern_matches(
         // expression. This keeps `when` usable for non-enum subjects without
         // guessing.
         _ => {
-            let pat_value = eval(pattern, ctx)?;
+            let pat_value = eval_with_runtime(pattern, ctx, runtime)?;
             values_equal_loose(subject, &pat_value)
         }
     }
@@ -529,7 +569,11 @@ fn values_equal_loose(a: &Value, b: &Value) -> Result<bool, EvalError> {
 /// iteration the body is re-evaluated with `$(VAR)` interpolations substituted by
 /// the current value. We substitute textually then re-parse the body so the
 /// expanded identifiers resolve like ordinary source.
-fn exec_expand(node: &Node, ctx: &mut EvalCtx) -> Result<(), EvalError> {
+fn exec_expand(
+    node: &Node,
+    ctx: &mut EvalCtx,
+    runtime: &mut EvalRuntime<'_>,
+) -> Result<(), EvalError> {
     let var = node
         .child_by_field(Field::Variable)
         .ok_or_else(|| shape_err(node, "expand variable"))?;
@@ -546,8 +590,8 @@ fn exec_expand(node: &Node, ctx: &mut EvalCtx) -> Result<(), EvalError> {
         .ok_or_else(|| shape_err(node, "expand body"))?;
 
     let var_name = var.text().trim().to_string();
-    let start = expand_bound(&eval(&start_node, ctx)?)?;
-    let end = expand_bound(&eval(&end_node, ctx)?)?;
+    let start = expand_bound(&eval_with_runtime(&start_node, ctx, runtime)?)?;
+    let end = expand_bound(&eval_with_runtime(&end_node, ctx, runtime)?)?;
 
     // The body source, with `$(VAR)` placeholders, taken verbatim from the CST.
     let body_src = body.text().to_string();
@@ -575,7 +619,7 @@ fn exec_expand(node: &Node, ctx: &mut EvalCtx) -> Result<(), EvalError> {
         // SourceFile wrapping one), whose statements we run.
         let cst = m1_core::parse(&substituted);
         let root = cst.root();
-        exec_expanded_root(&root, ctx)?;
+        exec_expanded_root(&root, ctx, runtime)?;
     }
 
     // Restore the prior local binding (or clear the loop var if there was none).
@@ -592,11 +636,15 @@ fn exec_expand(node: &Node, ctx: &mut EvalCtx) -> Result<(), EvalError> {
 /// brace-delimited block; its root is a `SourceFile` containing a `Block` (or the
 /// statements directly). Run every statement found at the top level or inside a
 /// single wrapping block.
-fn exec_expanded_root(root: &Node, ctx: &mut EvalCtx) -> Result<(), EvalError> {
+fn exec_expanded_root(
+    root: &Node,
+    ctx: &mut EvalCtx,
+    runtime: &mut EvalRuntime<'_>,
+) -> Result<(), EvalError> {
     for child in root.children() {
         match child.kind() {
-            Kind::Block => exec_block(&child, ctx)?,
-            k if is_statement(k) => exec(&child, ctx)?,
+            Kind::Block => exec_block(&child, ctx, runtime)?,
+            k if is_statement(k) => exec_with_runtime(&child, ctx, runtime)?,
             _ => {}
         }
     }
@@ -631,7 +679,11 @@ fn expand_bound(value: &Value) -> Result<i32, EvalError> {
 /// `Static` child) makes it persist across function entry/exit, keyed by the
 /// owning function symbol — and it is only initialised once (its persisted value
 /// survives re-execution). A plain `local` is (re)initialised each time.
-fn exec_local_declaration(node: &Node, ctx: &mut EvalCtx) -> Result<(), EvalError> {
+fn exec_local_declaration(
+    node: &Node,
+    ctx: &mut EvalCtx,
+    runtime: &mut EvalRuntime<'_>,
+) -> Result<(), EvalError> {
     let name_node = node
         .child_by_field(Field::Name)
         .ok_or_else(|| shape_err(node, "local declaration name"))?;
@@ -660,7 +712,7 @@ fn exec_local_declaration(node: &Node, ctx: &mut EvalCtx) -> Result<(), EvalErro
             })?;
         if ctx.env.get_static(fn_symbol, &var).is_none() {
             let init = match node.child_by_field(Field::Value) {
-                Some(v) => coerce_to(eval(&v, ctx)?, declared, ctx, &var)?,
+                Some(v) => coerce_to(eval_with_runtime(&v, ctx, runtime)?, declared, ctx, &var)?,
                 None => default_for(declared),
             };
             let fn_symbol = ctx.fn_symbol.unwrap().to_string();
@@ -671,7 +723,7 @@ fn exec_local_declaration(node: &Node, ctx: &mut EvalCtx) -> Result<(), EvalErro
 
     // A plain local is (re)initialised on every execution.
     let value = match node.child_by_field(Field::Value) {
-        Some(v) => coerce_to(eval(&v, ctx)?, declared, ctx, &var)?,
+        Some(v) => coerce_to(eval_with_runtime(&v, ctx, runtime)?, declared, ctx, &var)?,
         None => default_for(declared),
     };
     ctx.env.set_local(var, value);

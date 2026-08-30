@@ -34,7 +34,7 @@ do not compare computed channel values with captured M1 results.
 | `.m1cfg` parameters and 1/2/3-D table lookup | **Assumed** | Parsing, interpolation, and edge clamping use synthetic fixtures. Use the matching calibration file for actual values. Without it, parameters use typed external defaults. Table `.Lookup()` and `.Get()` fail in strict modes; whole-project mode may opt in to an external `0.0` fallback. |
 | `Calculate.*`, `Limit.*`, `Convert.*`, enum conversions, core value-object methods, and table methods | **Assumed** | Implemented methods have hand-derived tests. `AsString`, `Validate`, `Constrain`, `GetUnscheduled`, and `Set` resolve against eligible receiver classes; channel `Set` applies its project validation range before writing. `--coverage` remains authoritative for the methods a project uses. |
 | Filters, integrals, derivatives, debounce, delay, change detection, timers, and `static local` state | **Assumed** | Update laws and startup behavior are explicit implementation assumptions with hand-derived tests, not M1 value comparisons. |
-| `CanComms.*`, `Serial.*`, `System.*`, `Logging.*`, DBC objects, and other hardware-backed calls | **Stubbed** | Scenario `[[io]]` values take precedence. Otherwise calls use documented or generic typed stubs; writes are offline no-ops. |
+| `CanComms.*`, `Serial.*`, `System.*`, `Logging.*`, DBC objects, and other hardware-backed calls | **Assumed / Stubbed** | Each call crosses a typed adapter boundary with its resolved receiver, source call site, arguments, and evaluator time. Exact-site scenario values take precedence over wildcard values and an attached adapter. `System.ElapsedTime` reports the interval since that call site last ran. Its first tick-zero call returns zero, while a site first reached later uses its function step. Tick calls use the deterministic base timeline. `System.FlashSize` and `System.FlashFree` require scenario or adapter data; they never become a dangerous zero. Remaining unhandled calls use documented typed stubs or fail loud. |
 | Scenario parsing, tick grids, trace output, and `--coverage` | **Assumed** | These are deterministic m1-eval contracts tested with synthetic data. A `Supported` coverage entry means implemented, not M1-verified. |
 | Single-function and upstream dependency-cone runners | **Assumed** | Selection, ordering, and zero-order hold are tested on synthetic projects. |
 | Whole-project multi-rate scheduling | **Assumed** | Trigger rates come from `Project.m1prj`; same-rate dependency order, fastest-first rate groups, startup order, and cross-rate stale reads are the evaluator's model. |
@@ -58,9 +58,11 @@ dependency-cone runners.
   `Filter.{Maximum,Minimum}`, `Integral.Normal`, `Derivative.*`, `Debounce.*`,
   `Delay.*`, `Change.*`, timers, and `static local` persistence. Each is a small
   state machine keyed by call-site and advanced by an explicit `dt`.
-- **Tier-3 IO** — `CanComms.*`, `Serial.*`, `System.*`, `Logging.*` are
-  **stubbed or scenario-fed**: they return a scenario-provided value or a
-  documented stub, and the channel is flagged "externally driven" in the trace.
+- **Tier-3 IO.** Hardware calls use a typed `HardwareAdapter` boundary. The
+  adapter receives `ResolvedReceiver`, `CallSite`, arguments, and `EvalTime`.
+  Routing is exact-site scenario value, wildcard scenario value, adapter,
+  deterministic `System` model, generic typed stub, then fail loud. Trace
+  provenance records which route supplied each call site.
 - **Two runners** — *single-function* (run one chosen function each tick over a
   time series) and *dependency-cone* (run a target channel plus its upstream
   cone, topologically ordered).
@@ -138,9 +140,10 @@ The multi-rate model:
   sees the slower function's *previous* value (stale between writer ticks).
   This ordering is an explicit evaluator assumption. Rate groups run
   fastest-first within a base tick.
-- **Externally-driven IO still stubbed, still fail-loud.** CAN/sensor reads
-  fall back to their documented stubs (flagged externally driven in the trace);
-  any genuinely unsupported construct still aborts the run rather than guessing.
+- **Hardware calls keep base-grid time.** The adapter sees both the current
+  function step and the base tick, elapsed seconds, and base period. CAN and
+  sensor reads can fall back to documented stubs. Required flash metadata does
+  not. Unknown calls still abort unless the adapter handles them.
 
 ### Determinism & fail-loud
 
@@ -148,7 +151,7 @@ The multi-rate model:
   RNG: the same scenario always produces the same `Trace`.
 - **Strict channel inputs.** An unimplemented builtin, an unsupported construct,
   an unresolved symbol, or an unseeded ordinary channel aborts the run by
-  default. Hardware-backed calls follow the **Stubbed** contract above, and an
+  default. Hardware-backed calls follow the routing contract above, and an
   unseeded parameter uses its type-correct calibration default. Whole-project
   mode may also opt in to
   **`allow_default_inputs`** (scenario field or `--allow-default-inputs`):
@@ -162,12 +165,12 @@ The multi-rate model:
 
 Before running, `m1-eval --coverage` reports, per project, which builtins and
 constructs each script uses and whether the engine dispatches them through a
-**direct implementation**, an explicit offline **model**, a hardware **stub**
-(Tier-3 IO, externally driven), or no implementation (would fail loud at
-runtime). The rendered labels are `Supported`, `Assumed`, `Stubbed`, and
-`Unsupported`, respectively. These are execution-route labels, separate from the
-evidence maturity contract above: both `Supported` and `Assumed` coverage entries
-remain **Assumed** maturity until captured M1 output verifies them.
+**direct implementation**, an explicit offline **model**, required
+**adapter-backed** metadata, a hardware **stub**, or no implementation. The
+rendered labels are `Supported`, `Assumed`, `Adapter-backed`, `Stubbed`, and
+`Unsupported`. These are execution-route labels, separate from the evidence
+maturity contract above. Both `Supported` and `Assumed` coverage entries remain
+**Assumed** maturity until captured M1 output verifies them.
 
 The report also prints a **`Schedule:`** section: every script-backed function
 with its execution rate (`@ 500 Hz`, `@ 50 Hz`, …), `startup, runs once`, or
@@ -200,10 +203,12 @@ unseeded parameter uses a type-correct externally-driven default. Table
 The evaluator does not load `.m1dbc` files.
 
 Seed an ordinary hardware channel with scenario `[[inputs]]`. Seed a
-hardware-backed builtin call with `[[io]]`, using its exact `Object.Method` name.
-Without those seeds, function and cone runs fail on an ordinary missing channel,
-while Tier-3 calls use the **Stubbed** contract. Run `--coverage` first to see the
-implemented, assumed, stubbed, and unsupported calls in a project.
+hardware-backed call with `[[io]]`, using its `Object.Method` name. Add `script`
+and `offset` to target one call occurrence; omit both for a wildcard. Exact-site
+values win over wildcards. Library consumers can instead call
+`Engine::run_with_adapter`. `System.FlashSize` and `System.FlashFree` require one
+of those sources. Run `--coverage` first to see the implemented, assumed,
+adapter-backed, stubbed, and unsupported calls in a project.
 
 Whole-project mode is strict about ordinary missing channels unless
 `allow_default_inputs = true` or `--allow-default-inputs` is set. The CLI then

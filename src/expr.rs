@@ -27,6 +27,7 @@
 use crate::calib::Calibration;
 use crate::env::{CallSite, Env, StateStore};
 use crate::error::EvalError;
+use crate::hardware::{EvalTime, HardwareAdapter};
 use crate::ident::{Target, classify};
 use crate::value::{FixedPoint7dps, M1Scalar, M1ScalarKind, Value};
 use m1_core::{Field, Kind, Node};
@@ -58,7 +59,7 @@ pub struct EvalCtx<'a> {
     pub fn_symbol: Option<&'a str>,
     /// The current script's file name, for [`CallSite`] identity.
     pub script_name: &'a str,
-    /// The tick step in seconds (stateful operators advance by this).
+    /// The tick step in seconds. Stateful operators advance by this interval.
     pub dt: f64,
     /// Every parsed script in the project, so an inline user-function call
     /// ([`crate::builtins::userfn`]) can find the backing `ParsedScript` of the
@@ -78,26 +79,57 @@ pub struct EvalCtx<'a> {
     /// runtime call cycle fails loud past a fixed bound rather than overflowing
     /// the stack (the upstream static check is T097; this is the runtime guard).
     pub depth: u32,
-    /// Optional per-expression / external-channel sink. When present, the call
-    /// evaluator records each builtin call's result value at its [`CallSite`],
-    /// and Tier-3 IO stubs flag the channels they externally drive. `None` in
-    /// unit tests that only want the returned value.
+    /// Optional per-expression, external-value, and hardware-provenance sink.
+    /// When present, the call evaluator records each builtin result at its
+    /// [`CallSite`] and hardware dispatch records the route that supplied it.
+    /// `None` in unit tests that only want the returned value.
     pub trace: Option<&'a mut crate::trace::Trace>,
+}
+
+/// Evaluator-only data that is intentionally separate from the public
+/// [`EvalCtx`]. Keeping the timeline and adapter here preserves the original
+/// one-lifetime `EvalCtx` type and its public struct-literal shape.
+pub(crate) struct EvalRuntime<'h> {
+    pub(crate) time: EvalTime,
+    pub(crate) hardware: Option<&'h mut dyn HardwareAdapter>,
+}
+
+impl EvalRuntime<'static> {
+    /// Runtime defaults for callers of the long-standing public evaluator API.
+    /// Such callers supply only `dt`, so the evaluation starts at tick zero and
+    /// has no external hardware adapter.
+    pub(crate) fn from_public(dt: f64) -> Self {
+        EvalRuntime {
+            time: EvalTime::at_start(dt),
+            hardware: None,
+        }
+    }
 }
 
 /// Evaluate an expression node to a [`Value`].
 pub fn eval(node: &Node, ctx: &mut EvalCtx) -> Result<Value, EvalError> {
+    let mut runtime = EvalRuntime::from_public(ctx.dt);
+    eval_with_runtime(node, ctx, &mut runtime)
+}
+
+/// Evaluate an expression with the runner's deterministic time and optional
+/// hardware adapter.
+pub(crate) fn eval_with_runtime(
+    node: &Node,
+    ctx: &mut EvalCtx,
+    runtime: &mut EvalRuntime<'_>,
+) -> Result<Value, EvalError> {
     match node.kind() {
         Kind::Number => eval_number(node),
         Kind::Boolean | Kind::True | Kind::False => eval_boolean(node),
         Kind::String => Ok(Value::Str(strip_quotes(node.text()).to_string())),
         Kind::Identifier => eval_path(node.text(), node, ctx),
         Kind::MemberExpression => eval_member(node, ctx),
-        Kind::ParenthesizedExpression => eval_paren(node, ctx),
-        Kind::UnaryExpression => eval_unary(node, ctx),
-        Kind::BinaryExpression => eval_binary(node, ctx),
-        Kind::TernaryExpression => eval_ternary(node, ctx),
-        Kind::CallExpression => eval_call(node, ctx),
+        Kind::ParenthesizedExpression => eval_paren(node, ctx, runtime),
+        Kind::UnaryExpression => eval_unary(node, ctx, runtime),
+        Kind::BinaryExpression => eval_binary(node, ctx, runtime),
+        Kind::TernaryExpression => eval_ternary(node, ctx, runtime),
+        Kind::CallExpression => eval_call(node, ctx, runtime),
         other => Err(EvalError::UnsupportedConstruct {
             kind: format!("{other:?}"),
             at: node.byte_range().start,
@@ -166,7 +198,11 @@ fn strip_quotes(text: &str) -> &str {
 }
 
 /// Evaluate a parenthesized expression: just its single inner expression.
-fn eval_paren(node: &Node, ctx: &mut EvalCtx) -> Result<Value, EvalError> {
+fn eval_paren(
+    node: &Node,
+    ctx: &mut EvalCtx,
+    runtime: &mut EvalRuntime<'_>,
+) -> Result<Value, EvalError> {
     // The grammar gives the parenthesised expression no field; the single named
     // child is the wrapped expression.
     let inner = node.named_children().into_iter().next().ok_or_else(|| {
@@ -175,7 +211,7 @@ fn eval_paren(node: &Node, ctx: &mut EvalCtx) -> Result<Value, EvalError> {
             at: node.byte_range().start,
         }
     })?;
-    eval(&inner, ctx)
+    eval_with_runtime(&inner, ctx, runtime)
 }
 
 /// Evaluate a member expression (`A.B`, `This.X`, `In.Param`, `Parent.Y`) by
@@ -826,7 +862,11 @@ fn calib_param(canon: &str, calib: &Calibration) -> Option<Value> {
 }
 
 /// Evaluate a unary expression (`- ! ~ not`).
-fn eval_unary(node: &Node, ctx: &mut EvalCtx) -> Result<Value, EvalError> {
+fn eval_unary(
+    node: &Node,
+    ctx: &mut EvalCtx,
+    runtime: &mut EvalRuntime<'_>,
+) -> Result<Value, EvalError> {
     let op = node
         .child_by_field(Field::Operator)
         .ok_or_else(|| op_shape_err(node, "unary"))?;
@@ -846,7 +886,7 @@ fn eval_unary(node: &Node, ctx: &mut EvalCtx) -> Result<Value, EvalError> {
     {
         return Ok(Value::m1_integer(i32::MIN));
     }
-    let v = eval(&operand, ctx)?;
+    let v = eval_with_runtime(&operand, ctx, runtime)?;
     match op.kind() {
         Kind::Minus => match v {
             Value::M1(M1Scalar::Integer(x)) => Ok(Value::m1_integer(x.wrapping_neg())),
@@ -878,7 +918,11 @@ fn eval_unary(node: &Node, ctx: &mut EvalCtx) -> Result<Value, EvalError> {
 
 /// Evaluate a binary expression. Short-circuits `and`/`or`; otherwise evaluates
 /// both operands then applies the operator.
-fn eval_binary(node: &Node, ctx: &mut EvalCtx) -> Result<Value, EvalError> {
+fn eval_binary(
+    node: &Node,
+    ctx: &mut EvalCtx,
+    runtime: &mut EvalRuntime<'_>,
+) -> Result<Value, EvalError> {
     let op = node
         .child_by_field(Field::Operator)
         .ok_or_else(|| op_shape_err(node, "binary"))?;
@@ -895,24 +939,28 @@ fn eval_binary(node: &Node, ctx: &mut EvalCtx) -> Result<Value, EvalError> {
     // left does not already decide the result. Operands must be boolean.
     match kind {
         Kind::And | Kind::AmpAmp => {
-            let l = eval(&left, ctx)?.as_bool()?;
+            let l = eval_with_runtime(&left, ctx, runtime)?.as_bool()?;
             if !l {
                 return Ok(Value::Bool(false));
             }
-            return Ok(Value::Bool(eval(&right, ctx)?.as_bool()?));
+            return Ok(Value::Bool(
+                eval_with_runtime(&right, ctx, runtime)?.as_bool()?,
+            ));
         }
         Kind::Or | Kind::PipePipe => {
-            let l = eval(&left, ctx)?.as_bool()?;
+            let l = eval_with_runtime(&left, ctx, runtime)?.as_bool()?;
             if l {
                 return Ok(Value::Bool(true));
             }
-            return Ok(Value::Bool(eval(&right, ctx)?.as_bool()?));
+            return Ok(Value::Bool(
+                eval_with_runtime(&right, ctx, runtime)?.as_bool()?,
+            ));
         }
         _ => {}
     }
 
-    let l = eval(&left, ctx)?;
-    let r = eval(&right, ctx)?;
+    let l = eval_with_runtime(&left, ctx, runtime)?;
+    let r = eval_with_runtime(&right, ctx, runtime)?;
 
     // The remaining operators (arithmetic, comparison, equality, bitwise/shift)
     // operate on the two evaluated values; share that core with the compound
@@ -1181,7 +1229,11 @@ fn as_u32_bits(v: &Value) -> Result<u32, EvalError> {
 /// Evaluate a ternary `condition ? consequence : alternative`. The condition
 /// must be boolean (no truthiness on numbers); the chosen branch is evaluated,
 /// the other is not.
-fn eval_ternary(node: &Node, ctx: &mut EvalCtx) -> Result<Value, EvalError> {
+fn eval_ternary(
+    node: &Node,
+    ctx: &mut EvalCtx,
+    runtime: &mut EvalRuntime<'_>,
+) -> Result<Value, EvalError> {
     let cond = node
         .child_by_field(Field::Condition)
         .ok_or_else(|| op_shape_err(node, "ternary condition"))?;
@@ -1192,10 +1244,10 @@ fn eval_ternary(node: &Node, ctx: &mut EvalCtx) -> Result<Value, EvalError> {
         .child_by_field(Field::Alternative)
         .ok_or_else(|| op_shape_err(node, "ternary alternative"))?;
 
-    if eval(&cond, ctx)?.as_bool()? {
-        eval(&conseq, ctx)
+    if eval_with_runtime(&cond, ctx, runtime)?.as_bool()? {
+        eval_with_runtime(&conseq, ctx, runtime)
     } else {
-        eval(&alt, ctx)
+        eval_with_runtime(&alt, ctx, runtime)
     }
 }
 
@@ -1204,7 +1256,11 @@ fn eval_ternary(node: &Node, ctx: &mut EvalCtx) -> Result<Value, EvalError> {
 /// and dispatched through [`crate::builtins::dispatch`] with the call's stable
 /// [`CallSite`]. A call to a user function/method is out of the Phase-1 cone
 /// scope and fails loud as an unsupported construct.
-fn eval_call(node: &Node, ctx: &mut EvalCtx) -> Result<Value, EvalError> {
+fn eval_call(
+    node: &Node,
+    ctx: &mut EvalCtx,
+    runtime: &mut EvalRuntime<'_>,
+) -> Result<Value, EvalError> {
     let callee = node
         .child_by_field(Field::Function)
         .ok_or_else(|| op_shape_err(node, "call function"))?;
@@ -1217,7 +1273,7 @@ fn eval_call(node: &Node, ctx: &mut EvalCtx) -> Result<Value, EvalError> {
     let mut args = Vec::new();
     if let Some(arglist) = node.child_by_field(Field::Arguments) {
         for arg in arglist.named_children() {
-            args.push(eval(&arg, ctx)?);
+            args.push(eval_with_runtime(&arg, ctx, runtime)?);
         }
     }
 
@@ -1239,7 +1295,14 @@ fn eval_call(node: &Node, ctx: &mut EvalCtx) -> Result<Value, EvalError> {
                 Kind::MemberExpression => flatten_member(&object_node)?,
                 _ => object_node.text().to_string(),
             };
-            crate::builtins::dispatch(&object, method, &args, site.clone(), ctx)?
+            crate::builtins::dispatch_with_runtime(
+                &object,
+                method,
+                &args,
+                site.clone(),
+                ctx,
+                runtime,
+            )?
         }
         // A bare-identifier callee `Update(...)` is an inline user-function call
         // (the callee names a project `Function`/`Method` symbol directly). Route
@@ -1247,7 +1310,7 @@ fn eval_call(node: &Node, ctx: &mut EvalCtx) -> Result<Value, EvalError> {
         // rather than guessing (it is neither a library object nor a value).
         Kind::Identifier => {
             let name = callee.text();
-            crate::builtins::dispatch_bare(name, &args, site.clone(), ctx)?
+            crate::builtins::dispatch_bare_with_runtime(name, &args, site.clone(), ctx, runtime)?
         }
         _ => {
             return Err(EvalError::UnsupportedConstruct {
