@@ -19,7 +19,8 @@ steps in command-line order and stops at the first error or output mismatch.
 ```sh
 m1-eval \
   --conformance tests/fixtures/conformance/synthetic-mini.toml \
-  --conformance tests/fixtures/conformance/synthetic-initial-state.toml
+  --conformance tests/fixtures/conformance/synthetic-initial-state.toml \
+  --conformance tests/fixtures/conformance/synthetic-tables.toml
 ```
 
 Each fixture carries its own project and optional calibration path, so
@@ -208,6 +209,12 @@ signed, unsigned, binary32, fixed-point, enum, and string values through the
 full parser, evaluator, and comparator. The initial-state fixture starts two
 scheduled counters at non-zero values and runs the same fixture twice in one
 test. It catches state leakage and accidental per-tick reseeding.
+
+The table fixture checks one-, two-, and three-dimensional X-fastest layout,
+exact breakpoints, interior interpolation, lower and upper boundaries, a
+single-site axis, and project-enabled extrapolation. Its values are
+hand-derived. See [`table-conformance.md`](table-conformance.md) for the runtime
+contract and the separate M1 Sim capture gate.
 
 These files use `kind = "synthetic"` and cannot satisfy
 `--require-m1-sim-capture`.

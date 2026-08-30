@@ -132,6 +132,8 @@ meaningful mismatch.
 
 See [`conformance.md`](conformance.md) for the schema, comparison rules, M1 Sim
 capture procedure, synthetic examples, and the optional private-capture gate.
+Table captures also follow the stricter vector and corpus checks in
+[`table-conformance.md`](table-conformance.md).
 
 ## Output
 

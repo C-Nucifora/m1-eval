@@ -1,0 +1,44 @@
+<?xml version="1.0"?>
+<!-- Synthetic table-conformance project. No proprietary MoTeC content. -->
+<MoTeCM1BuildSession>
+ <Project Name="TableConformance" TargetHardware="ecu120">
+  <DataTypes>
+   <Type Storage="enum" Name="Table Mode" Default="Idle">
+    <Enum Name="Idle" ContainerOrder="0"/>
+    <Enum Name="Active" ContainerOrder="2"/>
+    <Enum Name="Fault" ContainerOrder="7"/>
+   </Type>
+   <Type Storage="enum" Name="Other Table Mode" Default="Idle">
+    <Enum Name="Idle" ContainerOrder="0"/>
+    <Enum Name="Active" ContainerOrder="2"/>
+    <Enum Name="Fault" ContainerOrder="7"/>
+   </Type>
+  </DataTypes>
+  <ComponentStream><List>
+   <Component Classname="BuiltIn.GroupCompound" Name="Root.Tables"/>
+   <Component Classname="BuiltIn.Channel" Name="Root.Tables.Curve X"><Props Type="f32"/></Component>
+   <Component Classname="BuiltIn.Channel" Name="Root.Tables.Grid X"><Props Type="f32"/></Component>
+   <Component Classname="BuiltIn.Channel" Name="Root.Tables.Grid Y"><Props Type="f32"/></Component>
+   <Component Classname="BuiltIn.Channel" Name="Root.Tables.Cube X"><Props Type="f32"/></Component>
+   <Component Classname="BuiltIn.Channel" Name="Root.Tables.Cube Y"><Props Type="f32"/></Component>
+   <Component Classname="BuiltIn.Channel" Name="Root.Tables.Cube Z"><Props Type="f32"/></Component>
+   <Component Classname="BuiltIn.Channel" Name="Root.Tables.Single X"><Props Type="f32"/></Component>
+   <Component Classname="BuiltIn.Channel" Name="Root.Tables.Extend X"><Props Type="f32"/></Component>
+   <Component Classname="BuiltIn.Channel" Name="Root.Tables.Extend Y"><Props Type="f32"/></Component>
+   <Component Classname="BuiltIn.Channel" Name="Root.Tables.Mode In"><Props Type="::This.Table Mode"/></Component>
+   <Component Classname="BuiltIn.Channel" Name="Root.Tables.Curve Out"><Props Type="f32"/></Component>
+   <Component Classname="BuiltIn.Channel" Name="Root.Tables.Grid Out"><Props Type="f32"/></Component>
+   <Component Classname="BuiltIn.Channel" Name="Root.Tables.Cube Out"><Props Type="f32"/></Component>
+   <Component Classname="BuiltIn.Channel" Name="Root.Tables.Single Out"><Props Type="f32"/></Component>
+   <Component Classname="BuiltIn.Channel" Name="Root.Tables.Extend Out"><Props Type="f32"/></Component>
+   <Component Classname="BuiltIn.Channel" Name="Root.Tables.Enum Out"><Props Type="f32"/></Component>
+   <Component Classname="BuiltIn.Table" Name="Root.Tables.Curve"><Props Type="f32" NumAxes="1"/><Axis><X/></Axis></Component>
+   <Component Classname="BuiltIn.Table" Name="Root.Tables.Grid"><Props Type="f32" NumAxes="2"/><Axis><X/><Y/></Axis></Component>
+   <Component Classname="BuiltIn.Table3D" Name="Root.Tables.Cube"><Props Type="f32" NumAxes="3"/><Axis><X/><Y/><Z/></Axis></Component>
+   <Component Classname="BuiltIn.Table" Name="Root.Tables.Single"><Props Type="f32" NumAxes="1"/><Axis><X/></Axis></Component>
+   <Component Classname="BuiltIn.CalibrationTable" Name="Root.Tables.Extend"><Props Type="f32" NumAxes="2"><Axis><X Extrapolate="Both"/><Y Extrapolate="Both"/></Axis></Props></Component>
+   <Component Classname="BuiltIn.Table" Name="Root.Tables.Enum Map"><Props Type="f32" NumAxes="1"/><Axis><X Source="Parent.Mode In"/></Axis></Component>
+   <Component Classname="BuiltIn.FuncUser" Filename="Tables.Update.m1scr" Name="Root.Tables.Update"/>
+  </List></ComponentStream>
+ </Project>
+</MoTeCM1BuildSession>

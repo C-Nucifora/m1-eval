@@ -305,19 +305,14 @@ fn try_table_lookup(
         }
     };
 
-    // Each lookup coordinate must be numeric; collect them then interpolate.
-    let inputs = args
-        .iter()
-        .map(Value::m1_scalar)
-        .collect::<Result<Vec<_>, _>>()?;
-    // `table::lookup` validates arity (inputs vs axes) and clamps out-of-range
-    // coordinates, returning a BadCall on a mismatch.
-    let value = crate::table::lookup(table, &inputs)?;
+    // `table::lookup` validates arity and the coordinate family for every
+    // axis. Numeric axes interpolate; enum axes select an exact member site.
+    let value = crate::table::lookup_values(table, args, ctx.project)?;
     Ok(Some(Value::M1(value)))
 }
 
 /// Attempt a table `.Get(site)` — a raw read of one body cell by flat site
-/// index (row-major, matching [`crate::calib::CalTable`]'s documented layout),
+/// index (X-fastest, matching [`crate::calib::CalTable`]'s documented layout),
 /// with no interpolation. Returns `Ok(Some(value))` when `object` resolves to a
 /// project table with calibration cells; `Ok(None)` when `object` is not a
 /// table (so the caller continues to library-object dispatch). The site must be
@@ -1345,8 +1340,8 @@ mod tests {
     #[test]
     fn table_lookup_interpolates_over_calibration() {
         let mut h = Harness::new();
-        // The mini fixture's Demo.Map is 2-D: x in {0,100}, y in {0,1}, body
-        // (10,20,30,40). Corner and midpoint values come straight from table.rs.
+        // The mini fixture's Demo.Map is 2-D: x in {0,100}, y in {0,1}.
+        // Its M1 body order is (10,30,20,40), with X changing fastest.
         assert_eq!(
             h.call(
                 "Map",
@@ -1439,15 +1434,15 @@ mod tests {
     #[test]
     fn table_get_reads_flat_site() {
         let mut h = Harness::new();
-        // `.Get(i)` is a raw read of body cell i (row-major, no interpolation).
-        // Demo.Map's body is (10,20,30,40).
+        // `.Get(i)` is a raw read of body cell i (X-fastest, no interpolation).
+        // Demo.Map's flat body is (10,30,20,40).
         assert_eq!(
             h.call("Map", "Get", &[Value::m1_integer(0)]).unwrap(),
             Value::m1_float(10.0)
         );
         assert_eq!(
             h.call("Map", "Get", &[Value::m1_integer(2)]).unwrap(),
-            Value::m1_float(30.0)
+            Value::m1_float(20.0)
         );
         assert_eq!(
             h.call("Map", "Get", &[Value::m1_unsigned(3)]).unwrap(),
