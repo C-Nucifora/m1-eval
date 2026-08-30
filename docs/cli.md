@@ -19,7 +19,7 @@ m1-eval [--project P] [--config C]
 | Flag | Meaning |
 | --- | --- |
 | `--project <PATH>` | The `Project.m1prj`. Defaults to the nearest one upward from the cwd, or `$M1_PROJECT`. |
-| `--config <PATH>` | The calibration file (`.m1cfg`) supplying parameter values and table cells. Required for any run that reads a parameter or does a table `.Lookup()`. |
+| `--config <PATH>` | The calibration file (`.m1cfg`) supplying parameter values and table cells. Required for table lookup and for actual tunable values; without it, parameters use externally-driven type defaults. |
 | `--scenario <PATH>` | The scenario file (TOML or JSON; parser chosen by extension) describing how to drive the run. |
 | `--function <NAME>` | Override the scenario's mode: run this single function each tick. Mutually exclusive with `--target` and `--whole-project`. |
 | `--target <CHANNEL>` | Override the scenario's mode: run this target channel plus its upstream dependency cone. Mutually exclusive with `--function` and `--whole-project`. |
@@ -38,6 +38,11 @@ A run requires `--scenario` (to evaluate), `--log` (to replay a log), or
 `--function` / `--target` / `--whole-project` override the `mode`/`target`
 declared in the scenario file; at most one may be given (combining two is a usage
 error, exit `2`). `--override` and `--diff` require `--log`.
+
+The `Supported` bucket from `--coverage` means the evaluator has an
+implementation. It does not mean the behavior has been verified against M1.
+See the [README maturity contract](../README.md#maturity-contract) for the
+evidence labels and current status of each evaluator area.
 
 ## Scenario file
 
@@ -94,8 +99,9 @@ used verbatim and never split on whitespace, only on `.` for path segments.
 
 - **JSON** (`--out trace.json`, or no `--out`):
   `{ "time": [...], "channels": { path: [...] }, "external": [...] }`. The
-  `external` list names channels whose values were externally driven (scenario-fed
-  or a Tier-3 stub) rather than computed.
+  `external` list names channels whose values were externally driven rather than
+  computed, including scenario inputs, Tier-3 stubs, parameter defaults, and
+  opt-in defaults for unseeded channels.
 - **CSV** (`--out trace.csv`): a `time` header column followed by one column per
   channel in sorted-name order, one row per tick.
 
@@ -111,8 +117,10 @@ These follow the shared toolchain contract (`m1-tools/docs/cli.md`):
 | `1` | The engine ran and **has something to report**: a project/calibration that would not load, a scenario that would not parse, or a fail-loud evaluation error (an unsupported builtin, a missing calibration value, an unresolved symbol, a missing input). |
 | `2` | A **usage error** — an unrecognised flag, no resolvable project, or neither `--scenario` nor `--coverage` given. |
 
-So `$? != 0` means "do not trust the output." The engine **fails loud**: it never
-emits a guessed or default number in place of something it cannot evaluate.
+So `$? != 0` means "do not trust the output." Unsupported behavior fails loud.
+The documented hardware stubs, parameter defaults, and opt-in unseeded-channel
+defaults are exceptions; the trace marks them externally driven, and the CLI
+reports every `--allow-default-inputs` substitution on stderr.
 
 A fail-loud evaluation error also says **where** it happened — the failing
 script and the tick instant (`in ECU.Update.m1scr at t = 0.125 s: type error:
@@ -149,8 +157,8 @@ overrides the log.
 
 **The no-op invariant.** `--log` with no `--override` (or an identity override
 like `CH=CH`) reproduces the logged series within floating-point tolerance, and
-the diff's changed-channel set is empty. This is the load-bearing correctness
-guarantee of the whole pipeline.
+the diff's changed-channel set is empty. Synthetic regression tests enforce this
+evaluator invariant; it is not a comparison with an M1 execution result.
 
 **Fail-loud.** A malformed log, a non-numeric value cell, an override of a
 channel that no in-project function reads (nothing downstream to recompute), or an
