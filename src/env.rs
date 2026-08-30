@@ -25,7 +25,7 @@
 //! fixed parse). The concrete per-operator state lives in [`OpState`], filled in
 //! by the M6 stateful-builtin milestone; this module provides the keyed slot.
 
-use crate::value::Value;
+use crate::value::{M1Scalar, Value};
 use m1_core::Node;
 use std::collections::HashMap;
 
@@ -106,10 +106,10 @@ pub enum OpState {
     /// This is separate from [`OpState::Timed`] so a script value never hides in
     /// a host-width timing field.
     DebounceFilter { output: bool, level: f32 },
-    /// `Change.{By,Up,Down}`: the previous numeric argument value, plus a timer
-    /// and pending flag for the filtered overloads.
+    /// `Change.{By,Up,Down}`, `Delay.Stable`, and `Calculate.Stable`: the exact
+    /// previous M1 scalar, plus a timer and pending/output flag.
     ChangeBy {
-        prev_x: f32,
+        prev_x: M1Scalar,
         held: f64,
         pending: bool,
     },

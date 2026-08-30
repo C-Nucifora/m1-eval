@@ -34,7 +34,9 @@
 use crate::env::{CallSite, OpState};
 use crate::error::EvalError;
 use crate::expr::EvalCtx;
-use crate::value::Value;
+use crate::value::{M1Scalar, Value};
+use m1_typecheck::types::{ValueType, numeric_join};
+use std::cmp::Ordering;
 
 /// Evaluate one stateful builtin call `object.method(args)`. Returns `Ok(None)`
 /// when `object` is not a stateful family handled here, so the dispatcher can
@@ -62,6 +64,122 @@ pub fn call(
 /// Read a script numeric operand in the binary32 family used by stateful math.
 fn numeric_f32(value: &Value) -> Result<f32, EvalError> {
     Ok(value.m1_scalar()?.as_f32())
+}
+
+fn scalar_type(value: M1Scalar) -> ValueType {
+    match value {
+        M1Scalar::Integer(_) => ValueType::Integer,
+        M1Scalar::UnsignedInteger(_) => ValueType::Unsigned,
+        M1Scalar::FloatingPoint(_) | M1Scalar::FixedPoint7dps(_) => ValueType::Float,
+    }
+}
+
+fn scalar_u32_bits(value: M1Scalar) -> u32 {
+    match value {
+        M1Scalar::Integer(value) => value as u32,
+        M1Scalar::UnsignedInteger(value) => value,
+        _ => unreachable!("numeric_join selected Unsigned for integral scalars"),
+    }
+}
+
+/// Compare two stateful numeric operands under the evaluator's M1 promotion
+/// rules. Two fixed-point values compare their raw scaled integers exactly;
+/// mixed fixed/float or integral/float pairs promote to binary32. Mixed signed
+/// and unsigned integers compare as their unsigned 32-bit patterns.
+fn scalar_cmp(left: M1Scalar, right: M1Scalar) -> Option<Ordering> {
+    if let (M1Scalar::FixedPoint7dps(left), M1Scalar::FixedPoint7dps(right)) = (left, right) {
+        return Some(left.raw().cmp(&right.raw()));
+    }
+
+    match numeric_join(scalar_type(left), scalar_type(right)) {
+        ValueType::Float => left.as_f32().partial_cmp(&right.as_f32()),
+        ValueType::Unsigned => Some(scalar_u32_bits(left).cmp(&scalar_u32_bits(right))),
+        ValueType::Integer => match (left, right) {
+            (M1Scalar::Integer(left), M1Scalar::Integer(right)) => Some(left.cmp(&right)),
+            _ => unreachable!("numeric_join selected Integer for signed scalars"),
+        },
+        _ => unreachable!("M1Scalar always has a numeric ValueType"),
+    }
+}
+
+fn scalar_equal(left: M1Scalar, right: M1Scalar) -> bool {
+    scalar_cmp(left, right) == Some(Ordering::Equal)
+}
+
+#[derive(Clone, Copy)]
+enum ScalarMagnitude {
+    Integral(u32),
+    FixedPoint7dps(u32),
+    FloatingPoint(f32),
+}
+
+fn fixed_magnitude_f32(raw_magnitude: u32) -> f32 {
+    // A fixed-point difference can span the full u32 magnitude even though one
+    // stored endpoint is i32. Widen the exact raw integer only for the scale
+    // conversion, then narrow before the M1 binary32 comparison.
+    (f64::from(raw_magnitude) / crate::value::FixedPoint7dps::SCALE as f64) as f32
+}
+
+/// Calculate `|to - from|` after applying the M1 promotion rule to that pair.
+/// Integral and same-family fixed-point differences use full-width `abs_diff`,
+/// so neither subtraction nor absolute value can overflow at an endpoint.
+fn scalar_magnitude(from: M1Scalar, to: M1Scalar) -> ScalarMagnitude {
+    if let (M1Scalar::FixedPoint7dps(from), M1Scalar::FixedPoint7dps(to)) = (from, to) {
+        return ScalarMagnitude::FixedPoint7dps(from.raw().abs_diff(to.raw()));
+    }
+
+    match numeric_join(scalar_type(from), scalar_type(to)) {
+        ValueType::Float => ScalarMagnitude::FloatingPoint((to.as_f32() - from.as_f32()).abs()),
+        ValueType::Unsigned => {
+            ScalarMagnitude::Integral(scalar_u32_bits(from).abs_diff(scalar_u32_bits(to)))
+        }
+        ValueType::Integer => match (from, to) {
+            (M1Scalar::Integer(from), M1Scalar::Integer(to)) => {
+                ScalarMagnitude::Integral(from.abs_diff(to))
+            }
+            _ => unreachable!("numeric_join selected Integer for signed scalars"),
+        },
+        _ => unreachable!("M1Scalar always has a numeric ValueType"),
+    }
+}
+
+/// Compare a non-negative change magnitude with `|delta|`. Cross-family
+/// comparisons narrow to binary32 at the same point as an M1 numeric join;
+/// same-family integral and fixed-point magnitudes remain exact.
+fn scalar_magnitude_cmp(magnitude: ScalarMagnitude, delta: M1Scalar) -> Option<Ordering> {
+    match magnitude {
+        ScalarMagnitude::Integral(magnitude) => match delta {
+            M1Scalar::Integer(delta) => Some(magnitude.cmp(&delta.unsigned_abs())),
+            M1Scalar::UnsignedInteger(delta) => Some(magnitude.cmp(&delta)),
+            M1Scalar::FloatingPoint(delta) => (magnitude as f32).partial_cmp(&delta.abs()),
+            M1Scalar::FixedPoint7dps(delta) => {
+                (magnitude as f32).partial_cmp(&M1Scalar::FixedPoint7dps(delta).as_f32().abs())
+            }
+        },
+        ScalarMagnitude::FixedPoint7dps(raw_magnitude) => match delta {
+            M1Scalar::FixedPoint7dps(delta) => Some(raw_magnitude.cmp(&delta.raw().unsigned_abs())),
+            _ => {
+                // The exact raw subtraction is complete before this intentional
+                // promotion to the binary32 family used by a mixed comparison.
+                fixed_magnitude_f32(raw_magnitude).partial_cmp(&delta.as_f32().abs())
+            }
+        },
+        ScalarMagnitude::FloatingPoint(magnitude) => magnitude.partial_cmp(&delta.as_f32().abs()),
+    }
+}
+
+/// Return `(to cmp from, |to - from| cmp |delta|)` under M1 pairwise numeric
+/// promotion. Direction depends only on the two sampled values. Their exact
+/// difference is then compared with the delta in its accepted scalar family.
+fn scalar_change_cmp(
+    from: M1Scalar,
+    to: M1Scalar,
+    delta: M1Scalar,
+) -> (Option<Ordering>, Option<Ordering>) {
+    (
+        scalar_cmp(to, from),
+        scalar_magnitude_cmp(scalar_magnitude(from, to), delta),
+    )
 }
 
 /// Read a numeric operand as seconds. Timing state uses the scheduler's host
@@ -505,12 +623,9 @@ fn edge_delay(
 /// no `delta` the argument must be exactly unchanged. Uses the `ChangeBy` slot to
 /// hold the reference value and the held time.
 fn delay_stable(args: &[Value], site: CallSite, ctx: &mut EvalCtx) -> Result<Value, EvalError> {
-    let x = numeric_f32(&args[0])?;
+    let x = args[0].m1_scalar()?;
     let delay = seconds(&args[1])?;
-    let delta = match args.get(2) {
-        Some(v) => numeric_f32(v)?.abs(),
-        None => 0.0,
-    };
+    let delta = args.get(2).map(Value::m1_scalar).transpose()?;
     let dt = ctx.dt;
     let slot = ctx.state.entry(site);
     let prev = match slot {
@@ -525,7 +640,11 @@ fn delay_stable(args: &[Value], site: CallSite, ctx: &mut EvalCtx) -> Result<Val
         // First tick: start timing from the current value, not yet stable.
         None => (x, 0.0, false),
         Some((reference, held, _)) => {
-            if (x - reference).abs() > delta {
+            let moved = match delta {
+                Some(delta) => scalar_change_cmp(reference, x, delta).1 == Some(Ordering::Greater),
+                None => !scalar_equal(reference, x),
+            };
+            if moved {
                 // Moved beyond tolerance: restart timing from the new value.
                 (x, 0.0, false)
             } else {
@@ -691,8 +810,8 @@ fn change_by(
     ctx: &mut EvalCtx,
     dir: ChangeDir,
 ) -> Result<Value, EvalError> {
-    let x = numeric_f32(&args[0])?;
-    let delta = numeric_f32(&args[1])?.abs();
+    let x = args[0].m1_scalar()?;
+    let delta = args[1].m1_scalar()?;
     let filter = match args.get(2) {
         Some(v) => Some(seconds(v)?),
         None => None,
@@ -708,11 +827,17 @@ fn change_by(
         _ => None,
     };
 
-    let qualifies = |from: f32, to: f32| -> bool {
+    let qualifies = |from: M1Scalar, to: M1Scalar| -> bool {
+        let (direction, magnitude) = scalar_change_cmp(from, to, delta);
+        let large_enough = matches!(magnitude, Some(Ordering::Equal | Ordering::Greater));
         match dir {
-            ChangeDir::By => (to - from).abs() >= delta,
-            ChangeDir::Up => to - from >= delta,
-            ChangeDir::Down => from - to >= delta,
+            ChangeDir::By => large_enough,
+            ChangeDir::Up => {
+                matches!(direction, Some(Ordering::Equal | Ordering::Greater)) && large_enough
+            }
+            ChangeDir::Down => {
+                matches!(direction, Some(Ordering::Equal | Ordering::Less)) && large_enough
+            }
         }
     };
 
@@ -846,7 +971,7 @@ fn calculate_stateful(
 /// `Calculate.Stable(x, filter)` — true once `x` has been exactly unchanged for
 /// `>= filter` seconds; any change restarts the timer (output false meanwhile).
 fn calc_stable(args: &[Value], site: CallSite, ctx: &mut EvalCtx) -> Result<Value, EvalError> {
-    let x = numeric_f32(&args[0])?;
+    let x = args[0].m1_scalar()?;
     let filter = seconds(&args[1])?;
     let dt = ctx.dt;
     let slot = ctx.state.entry(site);
@@ -857,7 +982,7 @@ fn calc_stable(args: &[Value], site: CallSite, ctx: &mut EvalCtx) -> Result<Valu
     let (reference, held, output) = match prev {
         None => (x, 0.0, false),
         Some((reference, held)) => {
-            if x != reference {
+            if !scalar_equal(x, reference) {
                 (x, 0.0, false)
             } else {
                 let held = advance_time(held, dt);
@@ -882,12 +1007,15 @@ fn calc_between(
     ctx: &mut EvalCtx,
     beyond: bool,
 ) -> Result<Value, EvalError> {
-    let x = numeric_f32(&args[0])?;
-    let min = numeric_f32(&args[1])?;
-    let max = numeric_f32(&args[2])?;
+    let x = args[0].m1_scalar()?;
+    let min = args[1].m1_scalar()?;
+    let max = args[2].m1_scalar()?;
     let filter = seconds(&args[3])?;
     let dt = ctx.dt;
-    let in_range = x >= min && x <= max;
+    let in_range = matches!(
+        scalar_cmp(x, min),
+        Some(Ordering::Equal | Ordering::Greater)
+    ) && matches!(scalar_cmp(x, max), Some(Ordering::Equal | Ordering::Less));
     let cond = if beyond { !in_range } else { in_range };
     Ok(Value::Bool(timed_predicate(cond, filter, dt, ctx, site)))
 }
@@ -897,15 +1025,18 @@ fn calc_between(
 /// for `>= filter`; holds its state in the dead band. The held-state output and
 /// the timed candidate share the `Timed` slot.
 fn calc_hysteresis(args: &[Value], site: CallSite, ctx: &mut EvalCtx) -> Result<Value, EvalError> {
-    let x = numeric_f32(&args[0])?;
-    let low = numeric_f32(&args[1])?;
-    let high = numeric_f32(&args[2])?;
+    let x = args[0].m1_scalar()?;
+    let low = args[1].m1_scalar()?;
+    let high = args[2].m1_scalar()?;
     let filter = seconds(&args[3])?;
     let dt = ctx.dt;
     // Candidate target: above-high wants true, below-low wants false, else hold.
-    let want = if x >= high {
+    let want = if matches!(
+        scalar_cmp(x, high),
+        Some(Ordering::Equal | Ordering::Greater)
+    ) {
         Some(true)
-    } else if x <= low {
+    } else if matches!(scalar_cmp(x, low), Some(Ordering::Equal | Ordering::Less)) {
         Some(false)
     } else {
         None
@@ -1044,6 +1175,174 @@ mod tests {
 
     fn n(value: f64) -> Value {
         Value::m1_float(value as f32)
+    }
+
+    fn adjacent_scalar_cases() -> [(&'static str, M1Scalar, M1Scalar, M1Scalar); 4] {
+        let float_low = 16_777_216_f32;
+        let float_high = f32::from_bits(float_low.to_bits() + 1);
+        [
+            (
+                "Integer",
+                M1Scalar::Integer(16_777_216),
+                M1Scalar::Integer(16_777_217),
+                M1Scalar::Integer(1),
+            ),
+            (
+                "UnsignedInteger",
+                M1Scalar::UnsignedInteger(u32::MAX - 1),
+                M1Scalar::UnsignedInteger(u32::MAX),
+                M1Scalar::UnsignedInteger(1),
+            ),
+            (
+                "FixedPoint7dps",
+                M1Scalar::FixedPoint7dps(crate::value::FixedPoint7dps::from_raw(i32::MAX - 1)),
+                M1Scalar::FixedPoint7dps(crate::value::FixedPoint7dps::MAX),
+                M1Scalar::FixedPoint7dps(crate::value::FixedPoint7dps::from_raw(1)),
+            ),
+            (
+                "FloatingPoint",
+                M1Scalar::FloatingPoint(float_low),
+                M1Scalar::FloatingPoint(float_high),
+                M1Scalar::FloatingPoint(float_high - float_low),
+            ),
+        ]
+    }
+
+    #[test]
+    fn family_aware_comparisons_keep_adjacent_values_and_full_width_differences() {
+        for (family, low, high, delta) in adjacent_scalar_cases() {
+            assert_eq!(scalar_cmp(low, high), Some(Ordering::Less), "{family}");
+            assert!(!scalar_equal(low, high), "{family}");
+            assert_eq!(
+                scalar_change_cmp(low, high, delta),
+                (Some(Ordering::Greater), Some(Ordering::Equal)),
+                "{family}"
+            );
+        }
+
+        for (family, low, high, delta, magnitude) in [
+            (
+                "Integer",
+                M1Scalar::Integer(i32::MIN),
+                M1Scalar::Integer(i32::MAX),
+                M1Scalar::Integer(i32::MAX),
+                Ordering::Greater,
+            ),
+            (
+                "UnsignedInteger",
+                M1Scalar::UnsignedInteger(0),
+                M1Scalar::UnsignedInteger(u32::MAX),
+                M1Scalar::UnsignedInteger(u32::MAX),
+                Ordering::Equal,
+            ),
+            (
+                "FixedPoint7dps",
+                M1Scalar::FixedPoint7dps(crate::value::FixedPoint7dps::MIN),
+                M1Scalar::FixedPoint7dps(crate::value::FixedPoint7dps::MAX),
+                M1Scalar::FixedPoint7dps(crate::value::FixedPoint7dps::MAX),
+                Ordering::Greater,
+            ),
+        ] {
+            assert_eq!(
+                scalar_change_cmp(low, high, delta),
+                (Some(Ordering::Greater), Some(magnitude)),
+                "{family}"
+            );
+        }
+    }
+
+    #[test]
+    fn mixed_family_comparisons_follow_m1_promotion() {
+        assert!(scalar_equal(
+            M1Scalar::Integer(-1),
+            M1Scalar::UnsignedInteger(u32::MAX)
+        ));
+        assert!(scalar_equal(
+            M1Scalar::FixedPoint7dps(crate::value::FixedPoint7dps::from_raw(10_000_000)),
+            M1Scalar::FloatingPoint(1.0)
+        ));
+
+        // Signed and unsigned operands share the integral overload, whose M1
+        // join selects unsigned without narrowing either sampled value.
+        assert_eq!(
+            scalar_change_cmp(
+                M1Scalar::Integer(16_777_216),
+                M1Scalar::Integer(16_777_217),
+                M1Scalar::UnsignedInteger(1),
+            ),
+            (Some(Ordering::Greater), Some(Ordering::Equal))
+        );
+        assert_eq!(
+            scalar_change_cmp(
+                M1Scalar::FixedPoint7dps(crate::value::FixedPoint7dps::ZERO),
+                M1Scalar::FixedPoint7dps(crate::value::FixedPoint7dps::from_raw(10_000_000)),
+                M1Scalar::FloatingPoint(1.0),
+            ),
+            (Some(Ordering::Greater), Some(Ordering::Equal))
+        );
+
+        let promoted_fixed_difference =
+            M1Scalar::FixedPoint7dps(crate::value::FixedPoint7dps::from_raw(16_777_217)).as_f32();
+        assert_eq!(
+            scalar_change_cmp(
+                M1Scalar::FixedPoint7dps(crate::value::FixedPoint7dps::ZERO),
+                M1Scalar::FixedPoint7dps(crate::value::FixedPoint7dps::from_raw(16_777_217)),
+                M1Scalar::FloatingPoint(promoted_fixed_difference),
+            ),
+            (Some(Ordering::Greater), Some(Ordering::Equal))
+        );
+    }
+
+    #[test]
+    fn mixed_family_stateful_operators_follow_m1_promotion() {
+        let mut change = Harness::new(0.1);
+        let change_args = |value| [Value::m1_integer(value), Value::m1_unsigned(1)];
+        assert!(
+            !change
+                .tick("Change", "By", &change_args(16_777_216))
+                .as_bool()
+                .unwrap()
+        );
+        assert!(
+            change
+                .tick("Change", "By", &change_args(16_777_217))
+                .as_bool()
+                .unwrap()
+        );
+
+        let promoted_equal = [
+            Value::m1_integer(-1),
+            Value::m1_unsigned(u32::MAX),
+            Value::m1_unsigned(u32::MAX),
+            n(0.0),
+        ];
+        let mut between = Harness::new(0.1);
+        assert!(
+            !between
+                .tick("Calculate", "Between", &promoted_equal)
+                .as_bool()
+                .unwrap()
+        );
+        assert!(
+            between
+                .tick("Calculate", "Between", &promoted_equal)
+                .as_bool()
+                .unwrap()
+        );
+
+        let mut stable = Harness::new(0.1);
+        assert!(
+            !stable
+                .tick("Delay", "Stable", &[Value::m1_integer(-1), n(0.0)],)
+                .as_bool()
+                .unwrap()
+        );
+        assert!(
+            stable
+                .tick("Delay", "Stable", &[Value::m1_unsigned(u32::MAX), n(0.0)],)
+                .as_bool()
+                .unwrap()
+        );
     }
 
     #[test]
@@ -1392,6 +1691,40 @@ mod tests {
         assert!(delay_falling(&mut h, true, 0.2)); //  immediate rise
     }
 
+    #[test]
+    fn delay_stable_detects_adjacent_values_in_every_scalar_family() {
+        for (family, low, high, _) in adjacent_scalar_cases() {
+            let mut h = Harness::new(0.1);
+            let stable = |h: &mut Harness, value: M1Scalar| {
+                h.tick("Delay", "Stable", &[Value::M1(value), n(0.0)])
+                    .as_bool()
+                    .unwrap()
+            };
+            assert!(!stable(&mut h, low), "{family} seed");
+            assert!(!stable(&mut h, high), "{family} adjacent change");
+            assert!(stable(&mut h, high), "{family} repeated value");
+        }
+    }
+
+    #[test]
+    fn delay_stable_fixed_tolerance_compares_raw_units() {
+        let mut h = Harness::new(0.1);
+        let fixed = |raw| {
+            Value::M1(M1Scalar::FixedPoint7dps(
+                crate::value::FixedPoint7dps::from_raw(raw),
+            ))
+        };
+        let stable = |h: &mut Harness, raw| {
+            h.tick("Delay", "Stable", &[fixed(raw), n(0.0), n(0.0000001)])
+                .as_bool()
+                .unwrap()
+        };
+
+        assert!(!stable(&mut h, i32::MAX - 2));
+        assert!(stable(&mut h, i32::MAX - 1)); // exactly one raw unit: tolerated
+        assert!(!stable(&mut h, i32::MAX)); // two raw units from the reference
+    }
+
     // ---- Task 18: Debounce.* ----
 
     #[test]
@@ -1474,6 +1807,53 @@ mod tests {
         assert!(c(&mut h, 8.0)); //  delta 6 >= 5
         assert!(!c(&mut h, 8.0)); // delta 0
         assert!(c(&mut h, 1.0)); //  delta 7 >= 5
+    }
+
+    #[test]
+    fn change_by_up_and_down_preserve_every_scalar_family() {
+        for (family, low, high, delta) in adjacent_scalar_cases() {
+            let args = |value| [Value::M1(value), Value::M1(delta)];
+
+            let mut by = Harness::new(0.1);
+            assert!(
+                !by.tick("Change", "By", &args(low)).as_bool().unwrap(),
+                "{family} By seed"
+            );
+            assert!(
+                by.tick("Change", "By", &args(high)).as_bool().unwrap(),
+                "{family} By adjacent change"
+            );
+
+            let mut up = Harness::new(0.1);
+            assert!(!up.tick("Change", "Up", &args(low)).as_bool().unwrap());
+            assert!(
+                up.tick("Change", "Up", &args(high)).as_bool().unwrap(),
+                "{family} Up adjacent change"
+            );
+
+            let mut down = Harness::new(0.1);
+            assert!(!down.tick("Change", "Down", &args(high)).as_bool().unwrap());
+            assert!(
+                down.tick("Change", "Down", &args(low)).as_bool().unwrap(),
+                "{family} Down adjacent change"
+            );
+        }
+    }
+
+    #[test]
+    fn filtered_change_by_keeps_an_exact_integer_reference() {
+        let mut h = Harness::new(0.1);
+        let call = |h: &mut Harness, value| {
+            h.tick(
+                "Change",
+                "By",
+                &[Value::m1_integer(value), Value::m1_integer(1), n(0.0)],
+            )
+            .as_bool()
+            .unwrap()
+        };
+        assert!(!call(&mut h, 16_777_216));
+        assert!(call(&mut h, 16_777_217));
     }
 
     #[test]
@@ -1689,6 +2069,93 @@ mod tests {
         assert!(hy(&mut h, 1.0)); //   timing 0.2 < widened threshold
         assert!(!hy(&mut h, 1.0)); //  timing 0.3 -> false
         assert!(!hy(&mut h, 1.0)); //  stays false
+    }
+
+    #[test]
+    fn calculate_predicates_preserve_every_scalar_family() {
+        for (family, low, high, _) in adjacent_scalar_cases() {
+            let stable_args = |value| [Value::M1(value), n(0.0)];
+            let mut stable = Harness::new(0.1);
+            assert!(
+                !stable
+                    .tick("Calculate", "Stable", &stable_args(low))
+                    .as_bool()
+                    .unwrap(),
+                "{family} Stable seed"
+            );
+            assert!(
+                !stable
+                    .tick("Calculate", "Stable", &stable_args(high))
+                    .as_bool()
+                    .unwrap(),
+                "{family} Stable adjacent change"
+            );
+            assert!(
+                stable
+                    .tick("Calculate", "Stable", &stable_args(high))
+                    .as_bool()
+                    .unwrap(),
+                "{family} Stable repeated value"
+            );
+
+            let range_args = |value| [Value::M1(value), Value::M1(high), Value::M1(high), n(0.0)];
+            let mut between = Harness::new(0.1);
+            assert!(
+                !between
+                    .tick("Calculate", "Between", &range_args(low))
+                    .as_bool()
+                    .unwrap(),
+                "{family} Between below adjacent bound"
+            );
+            assert!(
+                !between
+                    .tick("Calculate", "Between", &range_args(low))
+                    .as_bool()
+                    .unwrap(),
+                "{family} Between remains outside"
+            );
+
+            let mut beyond = Harness::new(0.1);
+            assert!(
+                !beyond
+                    .tick("Calculate", "Beyond", &range_args(low))
+                    .as_bool()
+                    .unwrap(),
+                "{family} Beyond starts timing"
+            );
+            assert!(
+                beyond
+                    .tick("Calculate", "Beyond", &range_args(low))
+                    .as_bool()
+                    .unwrap(),
+                "{family} Beyond accepts adjacent outside value"
+            );
+
+            let hysteresis_args =
+                |value| [Value::M1(value), Value::M1(low), Value::M1(high), n(0.0)];
+            let mut hysteresis = Harness::new(0.1);
+            assert!(
+                !hysteresis
+                    .tick("Calculate", "Hysteresis", &hysteresis_args(low))
+                    .as_bool()
+                    .unwrap(),
+                "{family} Hysteresis low state"
+            );
+            assert!(
+                !hysteresis
+                    .tick("Calculate", "Hysteresis", &hysteresis_args(high))
+                    .as_bool()
+                    .unwrap(),
+                "{family} Hysteresis starts high timing"
+            );
+            assert!(
+                hysteresis
+                    .tick("Calculate", "Hysteresis", &hysteresis_args(high))
+                    .as_bool()
+                    .unwrap(),
+                "{family} Hysteresis accepts adjacent high value"
+            );
+        }
     }
 
     // ---- Task 18: static-local persistence ----
