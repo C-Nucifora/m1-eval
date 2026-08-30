@@ -65,7 +65,7 @@ pub enum RunMode {
     Cone(String),
     /// Run *every* periodically-scheduled function (those whose trigger resolves
     /// to a `call_rate_hz`) each base tick at its own rate, in dependency-then-rate
-    /// order. The faithful mini-ECU: no single target — the runner schedules the
+    /// order. The offline schedule model has no single target: the runner schedules the
     /// whole project.
     WholeProject,
 }

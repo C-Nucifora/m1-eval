@@ -9,8 +9,8 @@
 //! - **dependency-cone** ([`RunMode::Cone`]): the target channel's upstream cone
 //!   of functions executes each tick, in topological (writer-before-reader) order;
 //! - **whole-project** ([`RunMode::WholeProject`]): every periodically-scheduled
-//!   function executes at its **own** rate, in dependency-then-rate order — the
-//!   faithful mini-ECU.
+//!   function executes at its **own** rate, in dependency-then-rate order using
+//!   the documented offline schedule model.
 //!
 //! The grid advances at `base_rate_hz` (tick step `1 / base_rate_hz`). For the
 //! single-function and cone runners every function shares that base rate, so it
