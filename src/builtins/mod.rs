@@ -82,18 +82,24 @@ pub fn dispatch(
         },
         CallRoute::PureLibrary(library_object) => {
             validate_arity(&library_object, object, method, args.len())?;
-            let legacy_args = legacy_builtin_arguments(args);
-            let result = match library_object.as_str() {
-                "Calculate" => calculate::call(method, &legacy_args)?,
-                "Limit" => limit::call(method, &legacy_args)?,
-                "Convert" => convert::call(method, &legacy_args)?,
+            match library_object.as_str() {
+                // Issue #38 migrated Calculate and Convert onto M1 scalars.
+                "Calculate" => {
+                    calculate::call(method, args)?.ok_or_else(|| unsupported(object, method))
+                }
+                "Convert" => {
+                    convert::call(method, args)?.ok_or_else(|| unsupported(object, method))
+                }
+                // Limit remains on the named legacy compatibility boundary
+                // until its own migration slice.
+                "Limit" => {
+                    let legacy_args = legacy_builtin_arguments(args);
+                    match limit::call(method, &legacy_args)? {
+                        Some(value) => value.restore_legacy_builtin_result(),
+                        None => Err(unsupported(object, method)),
+                    }
+                }
                 _ => unreachable!(),
-            };
-            // `Some` -> the submodule handled it. `None` -> a known-but-stateful
-            // or otherwise-unimplemented method on a pure object: fail loud.
-            match result {
-                Some(v) => v.restore_legacy_builtin_result(),
-                None => Err(unsupported(object, method)),
             }
         }
         CallRoute::StatefulLibrary(library_object) => {
@@ -155,9 +161,9 @@ pub fn dispatch(
     }
 }
 
-/// Widen M1 scalar arguments for builtin engines scheduled for migration in
-/// issue #38. Core expressions, tables, project writes, and user functions do
-/// not use this compatibility path.
+/// Widen M1 scalar arguments for builtin engines that have not migrated yet.
+/// Core expressions, Calculate, Convert, tables, project writes, and user
+/// functions do not use this compatibility path.
 fn legacy_builtin_arguments(args: &[Value]) -> Vec<Value> {
     args.iter()
         .cloned()
@@ -595,18 +601,14 @@ const SUPPORTED_PURE_METHODS: &[(&str, &str)] = &[
     ("Calculate", "InverseCos"),
     ("Calculate", "InverseTan"),
     ("Calculate", "InverseTan2"),
+    // Convert.* M1-width conversions.
+    ("Convert", "ToInteger"),
+    ("Convert", "ToUnsignedInteger"),
+    ("Convert", "ToFixed7DP"),
     // Limit.*.
     ("Limit", "Range"),
     ("Limit", "Max"),
     ("Limit", "Min"),
-];
-
-/// Pure implementations with a documented outstanding conformance question.
-const MODELED_PURE_METHODS: &[(&str, &str)] = &[
-    // The current conversion code truncates; exact M1 rounding is awaiting
-    // conformance vectors.
-    ("Convert", "ToInteger"),
-    ("Convert", "ToUnsignedInteger"),
 ];
 
 /// Time-domain implementations based on the evaluator's documented Phase-1
@@ -735,12 +737,6 @@ fn classify_library(object: &str, method: &str) -> CallCapability {
     if SUPPORTED_PURE_METHODS.contains(&pair) {
         return capability(
             BuiltinSupport::Direct,
-            CallRoute::PureLibrary(object.to_string()),
-        );
-    }
-    if MODELED_PURE_METHODS.contains(&pair) {
-        return capability(
-            BuiltinSupport::Modeled,
             CallRoute::PureLibrary(object.to_string()),
         );
     }
@@ -1062,7 +1058,24 @@ mod tests {
         assert_eq!(
             h.call("Convert", "ToInteger", &[Value::m1_float(2.9)])
                 .unwrap(),
-            Value::m1_integer(2)
+            Value::m1_integer(3)
+        );
+    }
+
+    #[test]
+    fn convert_dispatch_stays_on_m1_scalar_values() {
+        let mut h = Harness::new();
+        assert_eq!(
+            h.call("Convert", "ToUnsignedInteger", &[Value::m1_float(-2.6)])
+                .unwrap(),
+            Value::m1_unsigned(0)
+        );
+        assert_eq!(
+            h.call("Convert", "ToFixed7DP", &[Value::m1_integer(1)])
+                .unwrap(),
+            Value::M1(M1Scalar::FixedPoint7dps(
+                crate::value::FixedPoint7dps::from_raw(10_000_000)
+            ))
         );
     }
 
@@ -2019,9 +2032,8 @@ mod tests {
             .iter()
             .map(|&(object, method)| (object, method, BuiltinSupport::Direct))
             .chain(
-                MODELED_PURE_METHODS
+                MODELED_STATEFUL_METHODS
                     .iter()
-                    .chain(MODELED_STATEFUL_METHODS.iter())
                     .chain(MODELED_MATH_METHODS.iter())
                     .map(|&(object, method)| (object, method, BuiltinSupport::Modeled)),
             )

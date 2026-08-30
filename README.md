@@ -68,6 +68,26 @@ dependency-cone runners.
   (`duration_s` + `base_rate_hz`), and input sources (constants or `(t, value)`
   time series), with an optional CSV time-series sidecar.
 
+### Pure numeric builtin behavior
+
+Pure `Calculate` and `Convert` calls use the M1-width scalar model throughout.
+The implemented behavior is still **Assumed** under the maturity contract above:
+
+- `Calculate.Bias(a, b, bias)` maps `-1` to the lower argument, `0` to their
+  average, and `1` to the higher argument, using binary32 arithmetic.
+- `Calculate.Average` returns the joined integral family for its integral
+  overload and binary32 for its floating-point overload. An integral half unit
+  is discarded toward zero.
+- `Calculate.MaximumFloat()` returns the largest finite binary32 value.
+- `Convert.ToInteger` and `Convert.ToUnsignedInteger` round to nearest, with
+  halfway cases away from zero. Results clamp to the destination integer range;
+  in particular, a negative value converted to unsigned becomes zero.
+- `Convert.ToFixed7DP` follows the pinned integral signature and converts by
+  numeric value, not by reinterpreting bits. An input of `1` becomes `1.0000000`.
+  Whole-number inputs `-214..=214` fit the documented signed 32-bit, seven-place
+  representation; values immediately outside that domain fail with a range
+  error.
+
 ## What it adds (Phase 2 — the whole-project multi-rate scheduler)
 
 **Phase 2** adds the whole-project multi-rate scheduler: instead of running one

@@ -18,7 +18,8 @@ use m1_typecheck::Project;
 /// scalar. A raw value of `1` represents `0.0000001`.
 ///
 /// This type only models storage and exact scale conversion. Language-level
-/// rounding and saturation belong to the conversion builtin, not this type.
+/// rounding and range validation belong to the conversion builtin, not this
+/// type.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, PartialOrd, Ord, Hash)]
 pub struct FixedPoint7dps(i32);
 
@@ -279,7 +280,7 @@ impl Value {
     /// `FixedPoint7dps`, which resolves the ambiguity in the legacy model.
     /// Fixed Point restoration accepts only values exactly produced by the 7dps
     /// scale, so it recovers the original raw `i32` without applying the rounding
-    /// or saturation rules owned by `Convert.ToFixed7DP`.
+    /// or range-validation rules owned by `Convert.ToFixed7DP`.
     pub fn try_as_m1_scalar_for(&self, target: M1ScalarKind) -> Result<M1Scalar, EvalError> {
         match (self, target) {
             (Value::M1(value), target) if value.kind() == target => Ok(*value),
