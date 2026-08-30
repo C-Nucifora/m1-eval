@@ -625,7 +625,10 @@ fn edge_delay(
 fn delay_stable(args: &[Value], site: CallSite, ctx: &mut EvalCtx) -> Result<Value, EvalError> {
     let x = args[0].m1_scalar()?;
     let delay = seconds(&args[1])?;
-    let delta = args.get(2).map(Value::m1_scalar).transpose()?;
+    // The catalogue declares `delta` as FloatingPoint even when `argument` is
+    // integral. Preserve the sampled argument/reference in its exact M1 family,
+    // but apply the signature's binary32 coercion at this call boundary.
+    let delta = args.get(2).map(numeric_f32).transpose()?;
     let dt = ctx.dt;
     let slot = ctx.state.entry(site);
     let prev = match slot {
@@ -641,7 +644,10 @@ fn delay_stable(args: &[Value], site: CallSite, ctx: &mut EvalCtx) -> Result<Val
         None => (x, 0.0, false),
         Some((reference, held, _)) => {
             let moved = match delta {
-                Some(delta) => scalar_change_cmp(reference, x, delta).1 == Some(Ordering::Greater),
+                Some(delta) => {
+                    scalar_change_cmp(reference, x, M1Scalar::FloatingPoint(delta)).1
+                        == Some(Ordering::Greater)
+                }
                 None => !scalar_equal(reference, x),
             };
             if moved {
@@ -1723,6 +1729,30 @@ mod tests {
         assert!(!stable(&mut h, i32::MAX - 2));
         assert!(stable(&mut h, i32::MAX - 1)); // exactly one raw unit: tolerated
         assert!(!stable(&mut h, i32::MAX)); // two raw units from the reference
+    }
+
+    #[test]
+    fn delay_stable_coerces_its_declared_float_delta_before_comparing() {
+        let mut h = Harness::new(0.1);
+        let stable = |h: &mut Harness, argument| {
+            h.tick(
+                "Delay",
+                "Stable",
+                &[
+                    Value::m1_integer(argument),
+                    n(0.0),
+                    Value::m1_integer(16_777_219),
+                ],
+            )
+            .as_bool()
+            .unwrap()
+        };
+
+        assert!(!stable(&mut h, 0));
+        // The signature widens delta to binary32, where 16_777_219 rounds to
+        // 16_777_220. The movement therefore equals the tolerance and remains
+        // stable even though the sampled integer reference stays exact.
+        assert!(stable(&mut h, 16_777_220));
     }
 
     // ---- Task 18: Debounce.* ----
