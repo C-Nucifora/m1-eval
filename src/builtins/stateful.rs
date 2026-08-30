@@ -2,7 +2,7 @@
 //! The stateful (time-domain) builtins — the hard core of the evaluator.
 //!
 //! Each operator is a small state machine keyed by its [`CallSite`] and advanced
-//! once per execution by `ctx.time.step_s`. State lives in
+//! once per execution by `ctx.dt`. State lives in
 //! [`crate::env::StateStore`] as an
 //! [`OpState`] variant; a fresh site starts [`OpState::Uninit`] and the operator
 //! seeds itself on its first tick so the discretisation has a defined prior
@@ -205,8 +205,7 @@ fn reduce_time(current: f64, dt: f64) -> f64 {
 /// share one countdown. We therefore key the state by the **object path**
 /// (`object_key`, a [`CallSite`] with the object path in the script slot and a
 /// zero offset) rather than the individual call site — `Start`/`Remaining`/… on
-/// one Timer all address the same state. The countdown advances by
-/// `ctx.time.step_s` each
+/// one Timer all address the same state. The countdown advances by `ctx.dt` each
 /// time `Remaining` is read (the documented Phase-1 model: a
 /// Timer is read once per tick, so reading advances it one tick), clamped at
 /// zero. `Start(period)` (re)loads the period and runs; `Stop` halts without
