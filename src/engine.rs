@@ -426,6 +426,10 @@ mod tests {
             trace.channels["Root.Hardware.StartupTick"],
             vec![Value::m1_unsigned(0); 3]
         );
+        assert_eq!(
+            trace.channels["Root.Hardware.StartupElapsed"],
+            vec![Value::m1_float(0.0); 3]
+        );
         let startup = adapter
             .calls
             .iter()
@@ -442,6 +446,52 @@ mod tests {
                 && record.source == HardwareValueSource::SystemModel
                 && record.canonical_call() == "System.Ticks"
         }));
+    }
+
+    #[test]
+    fn rate_gated_elapsed_time_uses_actual_execution_instants_and_resets_per_run() {
+        let engine = hardware_engine();
+        let scenario = Scenario::from_toml_str(
+            "mode = \"whole-project\"\nduration_s = 0.05\nbase_rate_hz = 100.0\n",
+        )
+        .expect("whole-project hardware scenario parses");
+        let expected = vec![
+            Value::m1_float(0.0),
+            Value::m1_float(0.0),
+            Value::m1_float(0.02),
+            Value::m1_float(0.02),
+            Value::m1_float(0.04),
+        ];
+
+        let mut first_adapter = MetadataAdapter::default();
+        let first = engine
+            .run_with_adapter(&scenario, &mut first_adapter)
+            .expect("first rate-gated run succeeds");
+        assert_eq!(first.channels["Root.Hardware.SlowElapsed"], expected);
+        let slow_calls: Vec<&HardwareCall> = first_adapter
+            .calls
+            .iter()
+            .filter(|call| {
+                call.method == "ElapsedTime" && call.site.script() == "Hardware.Slow.m1scr"
+            })
+            .collect();
+        assert_eq!(
+            slow_calls
+                .iter()
+                .map(|call| call.time.base_tick)
+                .collect::<Vec<_>>(),
+            vec![0, 2, 4]
+        );
+        assert!(slow_calls.iter().all(|call| call.time.step_s == 0.02));
+
+        let mut second_adapter = MetadataAdapter::default();
+        let second = engine
+            .run_with_adapter(&scenario, &mut second_adapter)
+            .expect("fresh run succeeds");
+        assert_eq!(
+            second.channels["Root.Hardware.SlowElapsed"], expected,
+            "a new run must not retain the first run's call-site epoch"
+        );
     }
 
     #[test]

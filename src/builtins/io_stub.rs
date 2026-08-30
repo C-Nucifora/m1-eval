@@ -23,7 +23,7 @@
 //! actionable [`EvalError::MissingHardwareMetadata`]. Every successful route is
 //! recorded as structured provenance in the [`Trace`](crate::trace::Trace).
 
-use crate::env::CallSite;
+use crate::env::{CallSite, OpState};
 use crate::error::EvalError;
 use crate::expr::{EvalCtx, coerce_for_declared_type, coerce_for_scalar_kind};
 use crate::hardware::{
@@ -69,7 +69,7 @@ pub fn call(
         return complete(ctx, &call, value, HardwareValueSource::Adapter);
     }
 
-    if let Some(value) = system_model(library_object, method, args, ctx)? {
+    if let Some(value) = system_model(library_object, method, args, &call.site, ctx)? {
         return complete(ctx, &call, value, HardwareValueSource::SystemModel);
     }
 
@@ -342,14 +342,17 @@ fn system_model(
     object: &str,
     method: &str,
     args: &[Value],
-    ctx: &EvalCtx,
+    site: &CallSite,
+    ctx: &mut EvalCtx,
 ) -> Result<Option<Value>, EvalError> {
     if object != "System" {
         return Ok(None);
     }
     let now = ctx.time.base_tick as u32;
     let v = match (object, method) {
-        ("System", "ElapsedTime") => Value::m1_float(ctx.time.elapsed_s as f32),
+        // The catalogue defines this relative to the line which calls it, so
+        // each occurrence owns an epoch instead of inheriting run-global time.
+        ("System", "ElapsedTime") => elapsed_time(site, ctx),
         ("System", "TickPeriod") | ("System", "HiResTickPeriod") => {
             Value::m1_float(ctx.time.base_period_s as f32)
         }
@@ -366,6 +369,22 @@ fn system_model(
         _ => return Ok(None),
     };
     Ok(Some(v))
+}
+
+/// Seconds since this exact `System.ElapsedTime` occurrence first executed.
+fn elapsed_time(site: &CallSite, ctx: &mut EvalCtx) -> Value {
+    let now = ctx.time.elapsed_s;
+    let slot = ctx.state.entry(site.clone());
+    let first_execution_s = match slot {
+        OpState::SystemElapsed { first_execution_s } => *first_execution_s,
+        state => {
+            *state = OpState::SystemElapsed {
+                first_execution_s: now,
+            };
+            now
+        }
+    };
+    Value::m1_float((now - first_execution_s) as f32)
 }
 
 fn unsigned_arg(args: &[Value], index: usize, method: &str) -> Result<u32, EvalError> {
@@ -724,7 +743,7 @@ mod tests {
                 None,
             )
             .unwrap(),
-            Value::m1_float(1.25)
+            Value::m1_float(0.0)
         );
         assert_eq!(
             h.io_at(
@@ -764,6 +783,80 @@ mod tests {
             "tick differences retain unsigned wraparound"
         );
         assert!(!h.trace.is_external("System.ElapsedTime"));
+    }
+
+    #[test]
+    fn system_elapsed_time_starts_when_the_site_first_executes() {
+        let mut h = Harness::new();
+        let site = CallSite::new("Demo.Update.m1scr", 20);
+        assert_eq!(
+            h.io_at(
+                "System",
+                "ElapsedTime",
+                &[],
+                site.clone(),
+                crate::hardware::EvalTime::periodic(750, 7.5, 0.01, 0.01),
+                None,
+            )
+            .unwrap(),
+            Value::m1_float(0.0),
+            "a late first execution establishes its own zero"
+        );
+        assert_eq!(
+            h.io_at(
+                "System",
+                "ElapsedTime",
+                &[],
+                site,
+                crate::hardware::EvalTime::periodic(800, 8.0, 0.01, 0.01),
+                None,
+            )
+            .unwrap(),
+            Value::m1_float(0.5)
+        );
+    }
+
+    #[test]
+    fn system_elapsed_time_sites_keep_independent_epochs() {
+        let mut h = Harness::new();
+        let first = CallSite::new("Demo.Update.m1scr", 20);
+        let second = CallSite::new("Demo.Update.m1scr", 40);
+
+        assert_eq!(
+            h.io_at(
+                "System",
+                "ElapsedTime",
+                &[],
+                first.clone(),
+                crate::hardware::EvalTime::periodic(100, 1.0, 0.01, 0.01),
+                None,
+            )
+            .unwrap(),
+            Value::m1_float(0.0)
+        );
+        assert_eq!(
+            h.io_at(
+                "System",
+                "ElapsedTime",
+                &[],
+                second.clone(),
+                crate::hardware::EvalTime::periodic(250, 2.5, 0.01, 0.01),
+                None,
+            )
+            .unwrap(),
+            Value::m1_float(0.0)
+        );
+        let same_time = crate::hardware::EvalTime::periodic(300, 3.0, 0.01, 0.01);
+        assert_eq!(
+            h.io_at("System", "ElapsedTime", &[], first, same_time, None,)
+                .unwrap(),
+            Value::m1_float(2.0)
+        );
+        assert_eq!(
+            h.io_at("System", "ElapsedTime", &[], second, same_time, None,)
+                .unwrap(),
+            Value::m1_float(0.5)
+        );
     }
 
     #[test]

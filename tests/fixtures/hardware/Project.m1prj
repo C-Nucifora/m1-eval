@@ -5,16 +5,22 @@
    <Component Classname="BuiltIn.GroupCompound" Name="Root.Hardware"/>
    <Component Classname="BuiltIn.GroupCompound" Name="Root.Events"/>
    <Component Classname="BuiltIn.EventKernel" Name="Root.Events.On 100Hz"/>
+   <Component Classname="BuiltIn.EventKernel" Name="Root.Events.On 50Hz"/>
    <Component Classname="BuiltIn.EventKernel" Name="Root.Events.On Startup"/>
    <Component Classname="BuiltIn.Channel" Name="Root.Hardware.Elapsed"><Props Type="f32"/></Component>
+   <Component Classname="BuiltIn.Channel" Name="Root.Hardware.SlowElapsed"><Props Type="f32"/></Component>
    <Component Classname="BuiltIn.Channel" Name="Root.Hardware.Period"><Props Type="f32"/></Component>
    <Component Classname="BuiltIn.Channel" Name="Root.Hardware.Tick"><Props Type="u32"/></Component>
    <Component Classname="BuiltIn.Channel" Name="Root.Hardware.StartupTick"><Props Type="u32"/></Component>
+   <Component Classname="BuiltIn.Channel" Name="Root.Hardware.StartupElapsed"><Props Type="f32"/></Component>
    <Component Classname="BuiltIn.Channel" Name="Root.Hardware.FlashSizeA"><Props Type="u32"/></Component>
    <Component Classname="BuiltIn.Channel" Name="Root.Hardware.FlashSizeB"><Props Type="u32"/></Component>
    <Component Classname="BuiltIn.Channel" Name="Root.Hardware.FlashFreeValue"><Props Type="u32"/></Component>
    <Component Classname="BuiltIn.FuncUser" Filename="Hardware.Update.m1scr" Name="Root.Hardware.Update">
     <Props SelectedTrigger="Root.Events.On 100Hz"/>
+   </Component>
+   <Component Classname="BuiltIn.FuncUser" Filename="Hardware.Slow.m1scr" Name="Root.Hardware.Slow">
+    <Props SelectedTrigger="Root.Events.On 50Hz"/>
    </Component>
    <Component Classname="BuiltIn.FuncUser" Filename="Hardware.Init.m1scr" Name="Root.Hardware.Init">
     <Props SelectedTrigger="Root.Events.On Startup"/>

@@ -118,6 +118,9 @@ pub enum OpState {
     ChangeEdge { prev: bool, held: f64 },
     /// A countdown `Timer` object: the remaining time and whether it is running.
     Timer { remaining: f64, running: bool },
+    /// `System.ElapsedTime`: evaluator time when this exact call site first ran.
+    /// Later executions subtract this epoch from the deterministic run timeline.
+    SystemElapsed { first_execution_s: f64 },
 }
 
 /// The per-call-site state map for stateful builtins. A new site defaults to
