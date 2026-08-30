@@ -29,7 +29,7 @@ m1-eval [--project P] [--config C]
 | `--log <PATH>` | Counterfactual replay: a recorded MoTeC log held as ground truth (`.csv`, or `.ld` with `--features ld`). Triggers a counterfactual run instead of a scenario run. |
 | `--override <CH=expr>` | Pin a logged channel to a constant or expression for the counterfactual run, recomputing only its downstream cone. Repeatable (override several channels). Requires `--log`. |
 | `--diff <PATH>` | Where to write the per-channel logged-vs-counterfactual delta. Format follows the extension (`.csv` / `.json`). Requires `--log`. |
-| `--coverage` | Print the coverage report (supported / stubbed / unsupported builtins and constructs, plus the per-function execution `Schedule:`) instead of, or alongside, a run. |
+| `--coverage` | Print the coverage report (supported / assumed / stubbed / unsupported builtins and constructs, plus the per-function execution `Schedule:`) instead of, or alongside, a run. |
 | `--version`, `-V` | Print the version and exit `0`. |
 | `--help`, `-h` | Print usage and exit `0`. |
 

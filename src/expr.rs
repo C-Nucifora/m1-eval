@@ -923,26 +923,15 @@ fn eval_call(node: &Node, ctx: &mut EvalCtx) -> Result<Value, EvalError> {
                 .ok_or_else(|| op_shape_err(&callee, "call method"))?;
             let method = method_node.text();
 
-            // A member-expression callee may be an inline *user* function/method
-            // call (`Slip Control.Update(...)`): the whole `object.method` path
-            // names a project `Function`/`Method` symbol. Try that first — its
-            // body is executed inline (P15-D) — and only fall through to library
-            // dispatch when the path is not a user function (`Ok(None)`).
-            let full_path = flatten_member(&callee)?;
-            if let Some(v) = crate::builtins::userfn::call(&full_path, &args, ctx)? {
-                v
-            } else {
-                // Not a user function: dispatch the method on its object. A call
-                // whose object is a single builtin-library identifier
-                // (`Calculate`, `Limit`, …) dispatches as a library builtin;
-                // a project-object method (table `.Lookup`, enum `.AsInteger`,
-                // channel `.Set`, an IO stub, a Timer) is routed inside `dispatch`.
-                let object = match object_node.kind() {
-                    Kind::MemberExpression => flatten_member(&object_node)?,
-                    _ => object_node.text().to_string(),
-                };
-                crate::builtins::dispatch(&object, method, &args, site.clone(), ctx)?
-            }
+            // Runtime and coverage share the project-aware capability model in
+            // `builtins::dispatch`. It resolves a script-backed user function
+            // before library and project-object routes, so a user `Update` does
+            // not collapse into the similarly named IO stub.
+            let object = match object_node.kind() {
+                Kind::MemberExpression => flatten_member(&object_node)?,
+                _ => object_node.text().to_string(),
+            };
+            crate::builtins::dispatch(&object, method, &args, site.clone(), ctx)?
         }
         // A bare-identifier callee `Update(...)` is an inline user-function call
         // (the callee names a project `Function`/`Method` symbol directly). Route
@@ -950,15 +939,7 @@ fn eval_call(node: &Node, ctx: &mut EvalCtx) -> Result<Value, EvalError> {
         // rather than guessing (it is neither a library object nor a value).
         Kind::Identifier => {
             let name = callee.text();
-            match crate::builtins::userfn::call(name, &args, ctx)? {
-                Some(v) => v,
-                None => {
-                    return Err(EvalError::UnsupportedConstruct {
-                        kind: format!("call to non-function {name:?}"),
-                        at: node.byte_range().start,
-                    });
-                }
-            }
+            crate::builtins::dispatch_bare(name, &args, site.clone(), ctx)?
         }
         _ => {
             return Err(EvalError::UnsupportedConstruct {

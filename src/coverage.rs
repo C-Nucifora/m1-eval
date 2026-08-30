@@ -7,9 +7,8 @@
 //! driven), and which it cannot handle at all (and would fail loud on). This
 //! module walks every script's CST and answers that, statically:
 //!
-//! - every `Object.Method(...)` builtin call is classified against the dispatch
-//!   table via [`crate::builtins::classify_builtin`] — supported, stubbed, or
-//!   unsupported;
+//! - every call is resolved through the same project-aware capability model as
+//!   runtime dispatch — supported, assumed, stubbed, or unsupported;
 //! - every statement/expression construct `Kind` is classified against the set
 //!   the evaluator implements.
 //!
@@ -17,13 +16,12 @@
 //! data, no `m1-core`/`m1-typecheck` types — that the CLI prints and the `Engine`
 //! facade returns.
 
-use crate::builtins::{BuiltinSupport, classify_builtin};
-use crate::ident::{Target, classify};
+use crate::builtins::{BuiltinSupport, CapabilityScope, classify_bare_call, classify_member_call};
+use crate::loader::Loaded;
 use m1_core::{Field, Kind, Node};
 use m1_typecheck::Project;
 use m1_typecheck::parsed::ParsedScript;
-use m1_typecheck::symbols::SymbolKind;
-use std::collections::{BTreeSet, HashMap};
+use std::collections::BTreeSet;
 
 /// One thing a script uses, with where it was found. `name` is a `Object.Method`
 /// for a builtin call or a construct kind for a language construct.
@@ -50,6 +48,9 @@ pub enum ItemKind {
 pub struct CoverageReport {
     /// Items the engine implements under its documented maturity contract.
     pub supported: Vec<CoverageItem>,
+    /// Items the engine evaluates deterministically from a documented assumption
+    /// that still needs M1 conformance evidence.
+    pub assumed: Vec<CoverageItem>,
     /// Items handled as documented/scenario-fed stubs (Tier-3 IO).
     pub stubbed: Vec<CoverageItem>,
     /// Items the engine does not handle (would fail loud at runtime).
@@ -57,11 +58,15 @@ pub struct CoverageReport {
     /// The whole-project execution schedule: one `(function symbol, rate)` entry
     /// per script-backed function. `Some(hz)` is the function's periodic rate (it
     /// runs that many times per second in whole-project mode); `None` flags a
-    /// function with no resolvable periodic trigger (`On Startup`, an untriggered
-    /// or `$(…)`-parameterised trigger) — it is **not** run by the whole-project
-    /// scheduler. Sorted `(rate descending, function symbol)` for a deterministic
-    /// report; empty when the analysis had no [`Project`] to resolve rates from.
+    /// function with no resolvable periodic trigger. Startup functions are
+    /// identified separately in [`CoverageReport::startup`]; other `None` entries
+    /// are not run by the whole-project scheduler. Sorted `(rate descending,
+    /// function symbol)` for a deterministic report; empty when the analysis had
+    /// no [`Project`] to resolve rates from.
     pub schedule: Vec<(String, Option<f64>)>,
+    /// Functions the whole-project runner executes exactly once before the
+    /// periodic loop. These also appear in `schedule` with no periodic rate.
+    pub startup: Vec<String>,
 }
 
 impl CoverageReport {
@@ -69,48 +74,75 @@ impl CoverageReport {
     /// context: a member-expression callee is classified on its `(object, method)`
     /// spelling alone, so a user-function call whose method name collides with an
     /// IO-stub method (e.g. `Update`) cannot be distinguished from the stub. Use
-    /// [`CoverageReport::analyse_in`] for project-accurate user-function coverage.
+    /// [`CoverageReport::analyse_in`] for project-accurate receiver and
+    /// user-function coverage.
     pub fn analyse(scripts: &[ParsedScript]) -> CoverageReport {
-        Self::analyse_in(scripts, None)
+        Self::analyse_with_startup(scripts, None, &[])
     }
 
     /// Analyse every script with optional project context. When a [`Project`] is
     /// given, a `CallExpression` whose member-expression callee resolves to a user
     /// `Function`/`Method` symbol is reported **Supported** (it is evaluated inline
     /// — P15-D), disambiguating it from a same-named IO-stub method (`Service
-    /// Bits.Update` vs `Slip Control.Update`). This mirrors `eval_call`, which
-    /// tries `userfn::call` before library/IO dispatch.
+    /// Bits.Update` vs `Slip Control.Update`). Runtime dispatch and coverage both
+    /// use the same receiver-aware capability classifier.
     pub fn analyse_in(scripts: &[ParsedScript], project: Option<&Project>) -> CoverageReport {
+        Self::analyse_with_startup(scripts, project, &[])
+    }
+
+    /// Analyse a complete loaded project, including the loader's exact startup
+    /// trigger set. This is the path used by [`crate::Engine::coverage`].
+    pub fn analyse_loaded(loaded: &Loaded) -> CoverageReport {
+        Self::analyse_with_startup(
+            &loaded.scripts,
+            Some(&loaded.project),
+            &loaded.startup_fn_symbols,
+        )
+    }
+
+    fn analyse_with_startup(
+        scripts: &[ParsedScript],
+        project: Option<&Project>,
+        startup_fn_symbols: &[String],
+    ) -> CoverageReport {
         let mut supported = BTreeSet::new();
+        let mut assumed = BTreeSet::new();
         let mut stubbed = BTreeSet::new();
         let mut unsupported = BTreeSet::new();
         for script in scripts {
             // The script's enclosing group, for resolving group-relative callees.
             let group = project.and_then(|p| p.group_for_script(&script.name));
+            let fn_symbol = project.and_then(|p| p.function_symbol_for_script(&script.name));
             let cx = WalkCtx {
                 project,
                 group: group.as_deref(),
+                fn_symbol: fn_symbol.as_deref(),
+                scripts,
             };
             walk(
                 &script.cst.root(),
                 &cx,
                 &mut supported,
+                &mut assumed,
                 &mut stubbed,
                 &mut unsupported,
             );
         }
-        // A construct/builtin classified supported by one script must not also be
-        // reported unsupported because a *different* occurrence (e.g. a bad-shape
-        // call) hit the fallback; the sets above are already by (name, kind), so
-        // dedup is automatic. We only ensure the buckets are disjoint by
-        // precedence: supported > stubbed > unsupported.
-        stubbed.retain(|i| !supported.contains(i));
-        unsupported.retain(|i| !supported.contains(i) && !stubbed.contains(i));
+        // The public item identity is its displayed `(name, kind)`, so occurrences
+        // in different scripts collapse into one line. Keep the weakest capability
+        // seen for that identity. A supported occurrence must never hide another
+        // occurrence that will be assumed, stubbed, or rejected at runtime.
+        stubbed.retain(|i| !unsupported.contains(i));
+        assumed.retain(|i| !unsupported.contains(i) && !stubbed.contains(i));
+        supported
+            .retain(|i| !unsupported.contains(i) && !stubbed.contains(i) && !assumed.contains(i));
         CoverageReport {
             supported: supported.into_iter().collect(),
+            assumed: assumed.into_iter().collect(),
             stubbed: stubbed.into_iter().collect(),
             unsupported: unsupported.into_iter().collect(),
             schedule: build_schedule(scripts, project),
+            startup: build_startup(scripts, project, startup_fn_symbols),
         }
     }
 
@@ -120,17 +152,18 @@ impl CoverageReport {
     pub fn render(&self) -> String {
         let mut out = String::new();
         render_section(&mut out, "Supported", &self.supported);
+        render_section(&mut out, "Assumed", &self.assumed);
         render_section(&mut out, "Stubbed", &self.stubbed);
         render_section(&mut out, "Unsupported", &self.unsupported);
-        render_schedule(&mut out, &self.schedule);
+        render_schedule(&mut out, &self.schedule, &self.startup);
         out
     }
 }
 
-/// Append the `Schedule:` section: one line per function with its rate, or a flag
-/// that it is unscheduled (and so never runs in whole-project mode). An empty
-/// schedule still prints the label so the output shape is stable.
-fn render_schedule(out: &mut String, schedule: &[(String, Option<f64>)]) {
+/// Append the `Schedule:` section: one line per function with its periodic rate,
+/// startup execution, or unscheduled status. An empty schedule still prints the
+/// label so the output shape is stable.
+fn render_schedule(out: &mut String, schedule: &[(String, Option<f64>)], startup: &[String]) {
     out.push_str("Schedule:\n");
     if schedule.is_empty() {
         out.push_str("  (none)\n");
@@ -139,6 +172,9 @@ fn render_schedule(out: &mut String, schedule: &[(String, Option<f64>)]) {
     for (function, rate) in schedule {
         match rate {
             Some(hz) => out.push_str(&format!("  {function} @ {hz} Hz\n")),
+            None if startup.binary_search(function).is_ok() => {
+                out.push_str(&format!("  {function} (startup, runs once)\n"));
+            }
             None => out.push_str(&format!("  {function} (unscheduled)\n")),
         }
     }
@@ -179,6 +215,31 @@ fn build_schedule(
             .then_with(|| a.0.cmp(&b.0))
     });
     schedule
+}
+
+/// Keep the loader's exact `On Startup` set, restricted to functions that have
+/// a discovered backing script. Sorted for deterministic rendering and binary
+/// lookup in [`render_schedule`].
+fn build_startup(
+    scripts: &[ParsedScript],
+    project: Option<&Project>,
+    startup_fn_symbols: &[String],
+) -> Vec<String> {
+    let Some(project) = project else {
+        return Vec::new();
+    };
+    let script_functions: BTreeSet<String> = scripts
+        .iter()
+        .filter_map(|script| project.function_symbol_for_script(&script.name))
+        .collect();
+    let mut startup: Vec<String> = startup_fn_symbols
+        .iter()
+        .filter(|function| script_functions.contains(*function))
+        .cloned()
+        .collect();
+    startup.sort();
+    startup.dedup();
+    startup
 }
 
 /// Sort key that places a periodic rate by its Hz (descending when compared
@@ -234,12 +295,13 @@ fn is_reportable_construct(kind: Kind) -> bool {
     )
 }
 
-/// The per-script context the coverage walk carries: the optional project model
-/// and the script's enclosing group, used to resolve a call's callee to a user
-/// function (so an inline user-function call is reported Supported, not stubbed).
+/// The per-script context the coverage walk carries, used to resolve each call's
+/// receiver and any script-backed user function exactly as runtime dispatch does.
 struct WalkCtx<'a> {
     project: Option<&'a Project>,
     group: Option<&'a str>,
+    fn_symbol: Option<&'a str>,
+    scripts: &'a [ParsedScript],
 }
 
 /// Recursively walk a node, bucketing builtin calls and reportable constructs.
@@ -247,26 +309,42 @@ fn walk(
     node: &Node,
     cx: &WalkCtx,
     supported: &mut BTreeSet<CoverageItem>,
+    assumed: &mut BTreeSet<CoverageItem>,
     stubbed: &mut BTreeSet<CoverageItem>,
     unsupported: &mut BTreeSet<CoverageItem>,
 ) {
-    // Calls: an inline user-function/method call (member-expr or bare-identifier
-    // callee resolving to a project `Function`/`Method`) is Supported (P15-D);
-    // otherwise classify the `Object.Method` against the builtin dispatch table.
-    if node.kind() == Kind::CallExpression {
-        if let Some(name) = user_function_callee(node, cx) {
-            // A user function the engine evaluates inline.
-            supported.insert(CoverageItem {
+    // Calls use exactly the same project-aware capability model as runtime.
+    if node.kind() == Kind::CallExpression
+        && let Some(callee) = node.child_by_field(Field::Function)
+    {
+        let scope = CapabilityScope {
+            project: cx.project,
+            group: cx.group,
+            fn_symbol: cx.fn_symbol,
+            locals: None,
+            scripts: cx.scripts,
+        };
+        let classified = match callee.kind() {
+            Kind::MemberExpression => call_object_method(node).map(|(object, method)| {
+                let name = format!("{object}.{method}");
+                let support = classify_member_call(&object, &method, &scope).support;
+                (name, support)
+            }),
+            Kind::Identifier => {
+                let name = callee.text().to_string();
+                let support = classify_bare_call(&name, &scope).support;
+                Some((name, support))
+            }
+            _ => None,
+        };
+        if let Some((name, support)) = classified {
+            let item = CoverageItem {
                 name,
                 kind: ItemKind::Builtin,
-            });
-        } else if let Some((object, method)) = call_object_method(node) {
-            let item = CoverageItem {
-                name: format!("{object}.{method}"),
-                kind: ItemKind::Builtin,
             };
-            match classify_builtin(&object, &method) {
+            match support {
                 BuiltinSupport::Supported => supported.insert(item),
+                BuiltinSupport::Assumed => assumed.insert(item),
                 BuiltinSupport::Stubbed => stubbed.insert(item),
                 BuiltinSupport::Unsupported => unsupported.insert(item),
             };
@@ -287,35 +365,8 @@ fn walk(
     }
 
     for child in node.named_children() {
-        walk(&child, cx, supported, stubbed, unsupported);
+        walk(&child, cx, supported, assumed, stubbed, unsupported);
     }
-}
-
-/// The flattened callee path of a `CallExpression` when it resolves (against the
-/// walk's project + group) to a user `Function`/`Method` symbol — i.e. a call the
-/// engine evaluates inline (P15-D). `None` when there is no project context, the
-/// callee does not resolve to a user function, or the callee shape is unexpected.
-///
-/// Both call forms are recognised, mirroring `eval_call`: a member-expression
-/// callee (`Slip Control.Update`) and a bare-identifier callee (`Update`).
-fn user_function_callee(node: &Node, cx: &WalkCtx) -> Option<String> {
-    let project = cx.project?;
-    let callee = node.child_by_field(Field::Function)?;
-    let path = match callee.kind() {
-        Kind::MemberExpression => crate::expr::flatten_member(&callee).ok()?,
-        Kind::Identifier => callee.text().to_string(),
-        _ => return None,
-    };
-    let no_locals = HashMap::new();
-    let Target::Symbol(canon) = classify(&path, cx.group, None, project, &no_locals) else {
-        return None;
-    };
-    let is_user_fn = project
-        .symbols()
-        .get(&canon)
-        .map(|s| matches!(s.kind, SymbolKind::Function | SymbolKind::Method))
-        .unwrap_or(false);
-    is_user_fn.then_some(path)
 }
 
 /// Extract `(object, method)` from a `CallExpression` whose callee is a member
@@ -347,7 +398,7 @@ mod tests {
     }
 
     #[test]
-    fn integral_and_lookup_are_supported_cancomms_is_stubbed() {
+    fn assumptions_stubs_and_unresolved_receivers_are_distinct() {
         let src = r#"
 local i = Integral.Normal(Speed, 0.0, 100.0, false, 0.0);
 local t = Demo.Map.Lookup(Speed, Load);
@@ -357,12 +408,181 @@ Output = i;
         let scripts = scripts_from(src);
         let report = CoverageReport::analyse(&scripts);
 
-        let names: Vec<&str> = report.supported.iter().map(|i| i.name.as_str()).collect();
-        assert!(names.contains(&"Integral.Normal"), "{names:?}");
-        assert!(names.contains(&"Demo.Map.Lookup"), "{names:?}");
+        let assumed: Vec<&str> = report.assumed.iter().map(|i| i.name.as_str()).collect();
+        assert!(assumed.contains(&"Integral.Normal"), "{assumed:?}");
 
         let stub_names: Vec<&str> = report.stubbed.iter().map(|i| i.name.as_str()).collect();
         assert!(stub_names.contains(&"CanComms.GetFloat"), "{stub_names:?}");
+
+        // Without a project, coverage cannot prove that Demo.Map is a table.
+        let unsupported: Vec<&str> = report.unsupported.iter().map(|i| i.name.as_str()).collect();
+        assert!(unsupported.contains(&"Demo.Map.Lookup"), "{unsupported:?}");
+    }
+
+    #[test]
+    fn table_lookup_and_arbitrary_set_use_the_resolved_receiver_kind() {
+        let dir = std::path::Path::new(env!("CARGO_MANIFEST_DIR")).join("tests/fixtures/mini");
+        let loaded = crate::loader::load(
+            &dir.join("Project.m1prj"),
+            Some(&dir.join("parameters.m1cfg")),
+        )
+        .expect("mini fixture loads");
+        let scripts =
+            scripts_from("local x = Map.Lookup(Speed, Speed);\nMap.Set(1);\nOutput = x;\n");
+        let report = CoverageReport::analyse_in(&scripts, Some(&loaded.project));
+
+        let assumed: Vec<&str> = report.assumed.iter().map(|i| i.name.as_str()).collect();
+        assert!(assumed.contains(&"Map.Lookup"), "{assumed:?}");
+        let unsupported: Vec<&str> = report.unsupported.iter().map(|i| i.name.as_str()).collect();
+        assert!(unsupported.contains(&"Map.Set"), "{unsupported:?}");
+    }
+
+    #[test]
+    fn set_is_supported_for_channels_and_stubbed_for_output_objects() {
+        let dir = std::path::Path::new(env!("CARGO_MANIFEST_DIR")).join("tests/fixtures/enums");
+        let loaded =
+            crate::loader::load(&dir.join("Project.m1prj"), None).expect("enums fixture loads");
+        let scripts = scripts_from("Precharge State.Set(1);\nFan Output.Set(1);\n");
+        let report = CoverageReport::analyse_in(&scripts, Some(&loaded.project));
+
+        assert!(
+            report
+                .supported
+                .iter()
+                .any(|item| item.name == "Precharge State.Set")
+        );
+        assert!(
+            report
+                .stubbed
+                .iter()
+                .any(|item| item.name == "Fan Output.Set")
+        );
+    }
+
+    #[test]
+    fn implemented_debounce_filter_is_reported_as_an_assumption() {
+        let report =
+            CoverageReport::analyse(&scripts_from("Output = Debounce.Filter(true, 0.1);\n"));
+        let assumed: Vec<&str> = report.assumed.iter().map(|i| i.name.as_str()).collect();
+        assert!(assumed.contains(&"Debounce.Filter"), "{assumed:?}");
+        assert!(
+            !report
+                .unsupported
+                .iter()
+                .any(|item| item.name == "Debounce.Filter")
+        );
+    }
+
+    #[test]
+    fn local_named_calculate_does_not_change_builtin_coverage() {
+        let dir = std::path::Path::new(env!("CARGO_MANIFEST_DIR")).join("tests/fixtures/mini");
+        let loaded =
+            crate::loader::load(&dir.join("Project.m1prj"), None).expect("mini fixture loads");
+        let scripts = scripts_from("local Calculate = 0;\nOutput = Calculate.Max(1, 2);\n");
+        let report = CoverageReport::analyse_in(&scripts, Some(&loaded.project));
+
+        assert!(
+            report
+                .supported
+                .iter()
+                .any(|item| item.name == "Calculate.Max"),
+            "{report:?}"
+        );
+        assert!(
+            !report
+                .unsupported
+                .iter()
+                .any(|item| item.name == "Calculate.Max"),
+            "{report:?}"
+        );
+    }
+
+    #[test]
+    fn library_qualified_calls_use_the_same_capability_buckets() {
+        let report = CoverageReport::analyse(&scripts_from(
+            "Library.Calculate.Max(1, 2);\n\
+             Library.Debounce.Filter(true, 0.1);\n\
+             Library.Math.fabs(-1.0);\n\
+             Library.CanComms.GetFloat(1, 2);\n",
+        ));
+
+        assert!(
+            report
+                .supported
+                .iter()
+                .any(|item| item.name == "Library.Calculate.Max"),
+            "{report:?}"
+        );
+        for name in ["Library.Debounce.Filter", "Library.Math.fabs"] {
+            assert!(
+                report.assumed.iter().any(|item| item.name == name),
+                "{name}: {report:?}"
+            );
+        }
+        assert!(
+            report
+                .stubbed
+                .iter()
+                .any(|item| item.name == "Library.CanComms.GetFloat"),
+            "{report:?}"
+        );
+    }
+
+    #[test]
+    fn duplicate_display_name_keeps_the_weakest_script_capability() {
+        let dir = std::path::Path::new(env!("CARGO_MANIFEST_DIR")).join("tests/fixtures/userfn");
+        let loaded =
+            crate::loader::load(&dir.join("Project.m1prj"), None).expect("userfn fixture loads");
+        let scripts = parse_all(&[
+            (
+                "Caller.Update.m1scr".to_string(),
+                "Output.Set(1);\n".to_string(),
+            ),
+            (
+                "Helper.Compute.m1scr".to_string(),
+                "Output.Set(1);\n".to_string(),
+            ),
+        ]);
+        let report = CoverageReport::analyse_in(&scripts, Some(&loaded.project));
+
+        assert!(
+            report.stubbed.iter().any(|item| item.name == "Output.Set"),
+            "the unresolved Helper occurrence must remain visible: {report:?}"
+        );
+        assert!(
+            !report
+                .supported
+                .iter()
+                .any(|item| item.name == "Output.Set"),
+            "the supported Caller occurrence must not hide the stub: {report:?}"
+        );
+    }
+
+    #[test]
+    fn duplicate_display_name_keeps_unsupported_over_supported() {
+        let dir = std::path::Path::new(env!("CARGO_MANIFEST_DIR")).join("tests/fixtures/mini");
+        let loaded = crate::loader::load(
+            &dir.join("Project.m1prj"),
+            Some(&dir.join("parameters.m1cfg")),
+        )
+        .expect("mini fixture loads");
+        let scripts = parse_all(&[
+            ("Demo.Update.m1scr".to_string(), "Map.Get(0);\n".to_string()),
+            (
+                "Detached.Update.m1scr".to_string(),
+                "Map.Get(0);\n".to_string(),
+            ),
+        ]);
+        let report = CoverageReport::analyse_in(&scripts, Some(&loaded.project));
+
+        assert!(
+            report.unsupported.iter().any(|item| item.name == "Map.Get"),
+            "the unresolved occurrence must remain visible: {report:?}"
+        );
+        assert!(
+            !report.supported.iter().any(|item| item.name == "Map.Get"),
+            "the resolved table occurrence must not hide the failure: {report:?}"
+        );
     }
 
     #[test]
@@ -467,6 +687,7 @@ Output = i;
         let report = CoverageReport::analyse(&scripts_from(src));
         let text = report.render();
         assert!(text.contains("Supported:"));
+        assert!(text.contains("Assumed:"));
         assert!(text.contains("Stubbed:"));
         assert!(text.contains("Unsupported:"));
         // Stubbed has nothing here.
@@ -474,15 +695,13 @@ Output = i;
     }
 
     #[test]
-    fn schedule_reports_rated_functions_and_flags_unscheduled() {
-        // Task 17: with a project, the report carries a per-function schedule —
-        // each function's `call_rate_hz` (or `None` for an On-Startup function
-        // that never runs in whole-project mode). The multirate fixture has four
-        // periodic functions (two at 100 Hz, two at 50 Hz) and one startup.
+    fn schedule_reports_periodic_and_executed_startup_functions() {
+        // The multirate fixture has four periodic functions and one startup
+        // function that the whole-project runner executes once before tick zero.
         let dir = std::path::Path::new(env!("CARGO_MANIFEST_DIR")).join("tests/fixtures/multirate");
         let loaded =
             crate::loader::load(&dir.join("Project.m1prj"), None).expect("multirate fixture loads");
-        let report = CoverageReport::analyse_in(&loaded.scripts, Some(&loaded.project));
+        let report = CoverageReport::analyse_loaded(&loaded);
 
         // Look the schedule up by function symbol path.
         let by_fn: std::collections::HashMap<&str, Option<f64>> = report
@@ -495,19 +714,17 @@ Output = i;
         assert_eq!(by_fn.get("Root.MR.Fast Reader"), Some(&Some(100.0)));
         assert_eq!(by_fn.get("Root.MR.Slow Writer"), Some(&Some(50.0)));
         assert_eq!(by_fn.get("Root.MR.Slow Integrator"), Some(&Some(50.0)));
-        // The On-Startup function is reported with rate `None` (unscheduled).
+        // Startup has no periodic rate, but its separate set says it executes.
         assert_eq!(by_fn.get("Root.MR.Init"), Some(&None));
+        assert_eq!(report.startup, vec!["Root.MR.Init"]);
     }
 
     #[test]
-    fn render_includes_schedule_section_flagging_unscheduled() {
-        // The `Schedule:` section lists each function with its rate; an
-        // unscheduled (`None`) function is flagged so the user sees it will not
-        // run in whole-project mode.
+    fn render_reports_startup_as_running_once() {
         let dir = std::path::Path::new(env!("CARGO_MANIFEST_DIR")).join("tests/fixtures/multirate");
         let loaded =
             crate::loader::load(&dir.join("Project.m1prj"), None).expect("multirate fixture loads");
-        let report = CoverageReport::analyse_in(&loaded.scripts, Some(&loaded.project));
+        let report = CoverageReport::analyse_loaded(&loaded);
         let text = report.render();
 
         assert!(text.contains("Schedule:"), "no Schedule section: {text}");
@@ -516,8 +733,8 @@ Output = i;
             "rated function not rendered: {text}"
         );
         assert!(
-            text.contains("Root.MR.Init") && text.contains("unscheduled"),
-            "startup function not flagged unscheduled: {text}"
+            text.contains("Root.MR.Init") && text.contains("startup, runs once"),
+            "startup execution not rendered: {text}"
         );
     }
 

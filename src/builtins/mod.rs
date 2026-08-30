@@ -32,8 +32,11 @@ use crate::error::EvalError;
 use crate::expr::EvalCtx;
 use crate::ident::{Target, classify};
 use crate::value::Value;
+use m1_typecheck::Project;
 use m1_typecheck::intrinsics;
+use m1_typecheck::parsed::ParsedScript;
 use m1_typecheck::symbols::SymbolKind;
+use std::collections::HashMap;
 
 /// Dispatch one builtin call `object.method(args)`.
 ///
@@ -43,12 +46,9 @@ use m1_typecheck::symbols::SymbolKind;
 /// to key per-occurrence state. `ctx` carries the evaluation environment
 /// (project model, calibration, value/state stores, `dt`, lexical context).
 ///
-/// Resolution order:
-/// 1. A `Lookup` method on a project [`SymbolKind::Table`] object → table
-///    interpolation over the calibration.
-/// 2. A pure library object (`Calculate`/`Limit`/`Convert`) → the matching
-///    submodule, after arity validation against the intrinsic library.
-/// 3. Anything else → fail loud ([`EvalError::UnsupportedBuiltin`]).
+/// The shared capability model first resolves the receiver and selects the
+/// concrete route: user function, library implementation, project table/enum/
+/// channel/timer, documented IO stub, or fail-loud unsupported call.
 pub fn dispatch(
     object: &str,
     method: &str,
@@ -56,36 +56,33 @@ pub fn dispatch(
     site: CallSite,
     ctx: &mut EvalCtx,
 ) -> Result<Value, EvalError> {
-    // 1. Table `.Lookup()` — the object is a project table symbol, not a library
-    //    object. Classify it against the project; a Table + `Lookup` interpolates.
-    if method == "Lookup"
-        && let Some(value) = try_table_lookup(object, args, ctx)?
-    {
-        return Ok(value);
-    }
-    // 1b. Table `.Get(site)` — a raw read of one body cell by flat site index
-    //     (row-major), no interpolation. Same object classification as Lookup.
-    if method == "Get"
-        && let Some(value) = try_table_get(object, args, ctx)?
-    {
-        return Ok(value);
-    }
+    let capability = {
+        let scope = CapabilityScope {
+            project: Some(ctx.project),
+            group: ctx.group,
+            fn_symbol: ctx.fn_symbol,
+            locals: Some(&ctx.env.locals),
+            scripts: ctx.scripts,
+        };
+        classify_member_call(object, method, &scope)
+    };
 
-    // 2. Pure library objects. Validate arity against the intrinsic signatures
-    //    first (a wrong arg count is a BadCall, an unknown method an
-    //    UnsupportedBuiltin), then route to the implementing submodule.
-    match object {
-        "Calculate" | "Limit" | "Convert" => {
-            validate_arity(object, method, args.len())?;
-            // A stateful `Calculate.*` method (Stable/Hysteresis/Between/Beyond)
-            // is a time-domain operator, not a pure one: route it to the stateful
-            // engine. The pure `Calculate.*` math stays in its own submodule.
-            if object == "Calculate"
-                && let Some(v) = stateful::call(object, method, args, site.clone(), ctx)?
-            {
-                return Ok(v);
-            }
-            let result = match object {
+    match capability.route {
+        CallRoute::UserFunction(canon) => match userfn::call(&canon, args, ctx)? {
+            Some(value) => Ok(value),
+            None => Err(unsupported(object, method)),
+        },
+        CallRoute::TableLookup => match try_table_lookup(object, args, ctx)? {
+            Some(value) => Ok(value),
+            None => Err(unsupported(object, method)),
+        },
+        CallRoute::TableGet => match try_table_get(object, args, ctx)? {
+            Some(value) => Ok(value),
+            None => Err(unsupported(object, method)),
+        },
+        CallRoute::PureLibrary(library_object) => {
+            validate_arity(&library_object, object, method, args.len())?;
+            let result = match library_object.as_str() {
                 "Calculate" => calculate::call(method, args)?,
                 "Limit" => limit::call(method, args)?,
                 "Convert" => convert::call(method, args)?,
@@ -98,30 +95,18 @@ pub fn dispatch(
                 None => Err(unsupported(object, method)),
             }
         }
-        // 3. Stateful (time-domain) library objects: each is a state machine keyed
-        //    by `site` and advanced by `ctx.dt`. Validate arity, then evaluate.
-        "Filter" | "Integral" | "Derivative" | "Debounce" | "Delay" | "Change" => {
-            validate_arity(object, method, args.len())?;
-            match stateful::call(object, method, args, site, ctx)? {
+        CallRoute::StatefulLibrary(library_object) => {
+            validate_arity(&library_object, object, method, args.len())?;
+            match stateful::call(&library_object, method, args, site, ctx)? {
                 Some(v) => Ok(v),
-                // The object is stateful but this specific method is not yet
-                // implemented (e.g. the buffered `Delay.SignalN`): fail loud.
                 None => Err(unsupported(object, method)),
             }
         }
-        // 4. Tier-3 IO objects: scenario-fed / documented stubs.
-        "CanComms" | "Serial" | "System" | "Logging" => io_stub::call(object, method, args, ctx),
-        // 4b. `Math` is a *calibration-only* library object (its functions are
-        //     flagged `calibrationOnly` in the intrinsics) and is not, strictly,
-        //     valid in ECU `.m1scr` scripts — yet real EV-M1 control scripts
-        //     reference `Math.atan2`. We route that one function to the same
-        //     `y.atan2(x)` as `Calculate.InverseTan2` (a pragmatic implementation)
-        //     and flag it `Stubbed` in coverage so the user sees it is
-        //     a calibration-only object surfaced in an ECU script. Every other
-        //     `Math.*` method is left to fail loud (we do not implement the
-        //     calibration maths library wholesale).
-        "Math" => {
-            validate_arity(object, method, args.len())?;
+        CallRoute::IoLibrary(library_object) => {
+            io_stub::call(&library_object, object, method, args, ctx)
+        }
+        CallRoute::MathAssumption(library_object) => {
+            validate_arity(&library_object, object, method, args.len())?;
             match method {
                 "atan2" => {
                     let y = args[0].as_f64()?;
@@ -135,72 +120,58 @@ pub fn dispatch(
                 _ => Err(unsupported(object, method)),
             }
         }
-        // 5. Not a library object and not a table lookup. It may be a project
-        //    object (e.g. a `Timer`) carrying an intrinsic object-method, or
-        //    something genuinely unsupported.
-        _ => dispatch_object_method(object, method, args, site, ctx),
+        CallRoute::EnumAsInteger => {
+            validate_object_arity(object, method, args.len())?;
+            match enum_conv::as_integer(object, ctx)? {
+                Some(value) => Ok(value),
+                None => Err(unsupported(object, method)),
+            }
+        }
+        CallRoute::ChannelSet => match try_channel_set(object, args, ctx)? {
+            Some(value) => Ok(value),
+            None => Err(unsupported(object, method)),
+        },
+        CallRoute::Timer => {
+            validate_object_arity(object, method, args.len())?;
+            let object_key = timer_object_key(object, ctx);
+            match stateful::timer(method, args, object_key, ctx)? {
+                Some(value) => Ok(value),
+                None => Err(unsupported(object, method)),
+            }
+        }
+        CallRoute::ProjectIo => io_stub::project_object_call(object, method, args, ctx),
+        CallRoute::Unsupported => Err(unsupported(object, method)),
     }
 }
 
-/// Dispatch a method call whose `object` is not a firmware library object — it is
-/// a project object (a `Timer`, an enum source, a CAN signal, …) carrying an
-/// *object method* (`AsInteger`/`Start`/`Remaining`/`Receive`/…) from the
-/// intrinsic registry. The enum `.AsInteger` accessor and the stateful `Timer`
-/// methods are implemented; everything else fails loud.
-fn dispatch_object_method(
-    object: &str,
-    method: &str,
+/// Dispatch a bare user-function call such as `Update(...)`. Bare callees cannot
+/// name a library builtin, so the shared capability model either resolves a
+/// script-backed function or rejects the call.
+pub(crate) fn dispatch_bare(
+    callee: &str,
     args: &[Value],
-    _site: CallSite,
+    site: CallSite,
     ctx: &mut EvalCtx,
 ) -> Result<Value, EvalError> {
-    // Enum `.AsInteger()` — always called with empty parens. The object is either
-    // an enum-type-qualified member literal (`Drive State.Idle`) or a
-    // value-holding enum source (an enum channel / value-compound). Resolved at
-    // runtime against the enum model; an object that is no enum source returns
-    // `Ok(None)` here and falls through to the Timer attempt below. An object that
-    // *is* an enum source but cannot convert (unknown member, unset channel)
-    // fails loud inside `as_integer`.
-    if method == "AsInteger"
-        && args.is_empty()
-        && let Some(v) = enum_conv::as_integer(object, ctx)?
+    let capability = {
+        let scope = CapabilityScope {
+            project: Some(ctx.project),
+            group: ctx.group,
+            fn_symbol: ctx.fn_symbol,
+            locals: Some(&ctx.env.locals),
+            scripts: ctx.scripts,
+        };
+        classify_bare_call(callee, &scope)
+    };
+    if let CallRoute::UserFunction(canon) = capability.route
+        && let Some(value) = userfn::call(&canon, args, ctx)?
     {
-        return Ok(v);
+        return Ok(value);
     }
-
-    // Channel `.Set(value)` — the imperative setter. When the object resolves to a
-    // `Channel`/`Parameter` symbol, this is a *write* of that channel (exactly
-    // what `m1-typecheck` `schedule.rs` and `summary::io_sets` treat `Chan.Set*`
-    // as), not a fail-loud unknown method. Falls through to IO/Timer routing when
-    // the object is not a channel.
-    if method == "Set"
-        && let Some(v) = try_channel_set(object, args, ctx)?
-    {
-        return Ok(v);
-    }
-
-    // Project-object IO (DBC CAN messages/signals, a `Service Bits` GroupCompound
-    // push, a package `Output.SetState`, a buzzer's `.Buzze`). These are the
-    // project-object analogue of the Tier-3 library stubs: externally driven,
-    // never truly evaluated offline. Route an object that classifies to a
-    // package/group/reference symbol — or an unresolved DBC object (no `.m1dbc`
-    // loaded) — through the IO stub, *before* the Timer fallback so a real Timer
-    // (which resolves to its own object) is never swallowed by a stub method that
-    // a Timer does not carry.
-    if is_io_stub_object(object, ctx) && is_project_object_io_method(method) {
-        return io_stub::project_object_call(object, method, args, ctx);
-    }
-
-    // The Timer object methods (Start/Stop/Reset/Remaining) are stateful and must
-    // share one countdown across all of an object's method calls — so key the
-    // state by the object *path*, not the individual call site. A canonical path
-    // is preferred (so `This.MyTimer` and `Root.Demo.MyTimer` address the same
-    // timer); fall back to the source spelling if the object does not resolve.
-    let object_key = timer_object_key(object, ctx);
-    if let Some(v) = stateful::timer(method, args, object_key, ctx)? {
-        return Ok(v);
-    }
-    Err(unsupported(object, method))
+    Err(EvalError::UnsupportedConstruct {
+        kind: format!("call to non-function {callee:?}"),
+        at: site.offset(),
+    })
 }
 
 /// Attempt a channel `.Set(value)` imperative setter. Returns `Ok(Some(unit))`
@@ -252,47 +223,6 @@ fn try_channel_set(
     // The setter is a statement-level write; reuse the unit value the IO void
     // writers return so an expression-statement call succeeds.
     Ok(Some(Value::Bool(true)))
-}
-
-/// Whether `method` is a project-object IO stub method (a CAN Tx/Get/Receive, a
-/// GroupCompound `.Update`, an `Output.SetState`, a buzzer `.Buzze`).
-fn is_project_object_io_method(method: &str) -> bool {
-    io_stub::PROJECT_OBJECT_STUB_METHODS.contains(&method)
-}
-
-/// Whether `object` is a project object whose IO methods are externally-driven
-/// stubs: it classifies to a package/group/reference symbol (`Object`/`Group`/
-/// `Reference`/`Other`) — or it does not resolve at all, which is how a DBC CAN
-/// object appears when no `.m1dbc` is loaded. A library object, a channel, a
-/// table, or a function is *not* an IO-stub object (each has its own route).
-fn is_io_stub_object(object: &str, ctx: &EvalCtx) -> bool {
-    match classify(
-        object,
-        ctx.group,
-        ctx.fn_symbol,
-        ctx.project,
-        &ctx.env.locals,
-    ) {
-        Target::Symbol(canon) => ctx
-            .project
-            .symbols()
-            .get(&canon)
-            .map(|s| {
-                matches!(
-                    s.kind,
-                    SymbolKind::Object
-                        | SymbolKind::Group
-                        | SymbolKind::Reference
-                        | SymbolKind::Other
-                )
-            })
-            .unwrap_or(false),
-        // An unresolved object spelling is the DBC case (the CAN message/signal is
-        // sourced from a `.m1dbc` we did not load). A builtin/library object or a
-        // resolved local is handled elsewhere and is never an IO-stub object.
-        Target::Unresolved => true,
-        Target::Local(_) | Target::Builtin { .. } => false,
-    }
 }
 
 /// The state key for a Timer object: a [`CallSite`] whose script slot is the
@@ -472,10 +402,36 @@ fn try_table_get(
 /// signature registry. The method must exist on the object (else
 /// [`EvalError::UnsupportedBuiltin`]) and `argc` must match some overload's
 /// parameter count (else [`EvalError::BadCall`]).
-fn validate_arity(object: &str, method: &str, argc: usize) -> Result<(), EvalError> {
-    let overloads = intrinsics::get().library_overloads(object, method);
+fn validate_arity(
+    library_object: &str,
+    source_object: &str,
+    method: &str,
+    argc: usize,
+) -> Result<(), EvalError> {
+    let overloads = intrinsics::get().library_overloads(library_object, method);
     if overloads.is_empty() {
         // The registry lists no such method on this object.
+        return Err(unsupported(source_object, method));
+    }
+    let accepted: Vec<usize> = overloads.iter().map(|o| o.params.len()).collect();
+    if accepted.contains(&argc) {
+        Ok(())
+    } else {
+        Err(EvalError::BadCall {
+            detail: format!(
+                "{source_object}.{method} expects {} argument(s), got {argc}",
+                arities_display(&accepted)
+            ),
+        })
+    }
+}
+
+/// Validate a resolved project-object method against the object-method catalog.
+/// Receiver eligibility has already been decided by the capability model; this
+/// check only enforces the declared argument count.
+fn validate_object_arity(object: &str, method: &str, argc: usize) -> Result<(), EvalError> {
+    let overloads = intrinsics::get().object_method(method);
+    if overloads.is_empty() {
         return Err(unsupported(object, method));
     }
     let accepted: Vec<usize> = overloads.iter().map(|o| o.params.len()).collect();
@@ -511,25 +467,68 @@ fn unsupported(object: &str, method: &str) -> EvalError {
     }
 }
 
-/// How the engine handles a given builtin `Object.Method`. Drives the `--coverage`
-/// report (Task 28): a method is **supported** when the dispatch table evaluates
-/// it directly, **stubbed** when a Tier-3 IO object returns a documented offline
-/// value (or is scenario-fed), and **unsupported** when no branch implements it
-/// (it would fail loud at runtime).
+/// What the evaluator does with a resolved call. Runtime dispatch and coverage
+/// both consume this classification, so the report describes the route that will
+/// actually run for this receiver in this project.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum BuiltinSupport {
     /// Implemented by the dispatch table under the documented maturity contract.
     Supported,
+    /// A deterministic implementation whose exact M1 behavior still needs
+    /// conformance evidence.
+    Assumed,
     /// A Tier-3 IO object handled as a documented/scenario-fed stub.
     Stubbed,
     /// Not implemented — fails loud at runtime.
     Unsupported,
 }
 
-/// Library/object methods implemented by the evaluator (Tier-1 + Tier-2). Kept in sync
-/// with the dispatch arms above; this is the single source of truth the coverage
-/// report consults so it never disagrees with what `dispatch` actually evaluates.
-const SUPPORTED_METHODS: &[(&str, &str)] = &[
+#[derive(Debug, Clone, PartialEq, Eq)]
+enum CallRoute {
+    UserFunction(String),
+    PureLibrary(String),
+    StatefulLibrary(String),
+    IoLibrary(String),
+    MathAssumption(String),
+    TableLookup,
+    TableGet,
+    EnumAsInteger,
+    ChannelSet,
+    Timer,
+    ProjectIo,
+    Unsupported,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub(crate) struct CallCapability {
+    pub(crate) support: BuiltinSupport,
+    route: CallRoute,
+}
+
+/// The lexical and project information needed to resolve a call. Runtime supplies
+/// the active frame for bare callees. Member calls resolve the complete dotted
+/// callee first, matching the type checker: a scalar local cannot shadow a
+/// qualified library call such as `Calculate.Max`.
+pub(crate) struct CapabilityScope<'a> {
+    pub(crate) project: Option<&'a Project>,
+    pub(crate) group: Option<&'a str>,
+    pub(crate) fn_symbol: Option<&'a str>,
+    pub(crate) locals: Option<&'a HashMap<String, Value>>,
+    pub(crate) scripts: &'a [ParsedScript],
+}
+
+fn capability(support: BuiltinSupport, route: CallRoute) -> CallCapability {
+    CallCapability { support, route }
+}
+
+fn unsupported_capability() -> CallCapability {
+    capability(BuiltinSupport::Unsupported, CallRoute::Unsupported)
+}
+
+/// Direct pure-library implementations. The method catalog lives here, not in
+/// coverage, and dispatch refuses any library call that this model does not
+/// route.
+const SUPPORTED_PURE_METHODS: &[(&str, &str)] = &[
     // Calculate.* pure math.
     ("Calculate", "Max"),
     ("Calculate", "Min"),
@@ -554,18 +553,28 @@ const SUPPORTED_METHODS: &[(&str, &str)] = &[
     ("Calculate", "InverseCos"),
     ("Calculate", "InverseTan"),
     ("Calculate", "InverseTan2"),
-    // Calculate.* stateful predicates.
+    // Limit.*.
+    ("Limit", "Range"),
+    ("Limit", "Max"),
+    ("Limit", "Min"),
+];
+
+/// Pure implementations with a documented outstanding conformance question.
+const ASSUMED_PURE_METHODS: &[(&str, &str)] = &[
+    // The current conversion code truncates; exact M1 rounding is awaiting
+    // conformance vectors.
+    ("Convert", "ToInteger"),
+    ("Convert", "ToUnsignedInteger"),
+];
+
+/// Time-domain implementations based on the evaluator's documented Phase-1
+/// model. They run deterministically, but remain assumptions until checked
+/// against M1 Sim. Keep this list aligned with `stateful::call`.
+const ASSUMED_STATEFUL_METHODS: &[(&str, &str)] = &[
     ("Calculate", "Stable"),
     ("Calculate", "Hysteresis"),
     ("Calculate", "Between"),
     ("Calculate", "Beyond"),
-    // Limit.* and Convert.*.
-    ("Limit", "Range"),
-    ("Limit", "Max"),
-    ("Limit", "Min"),
-    ("Convert", "ToInteger"),
-    ("Convert", "ToUnsignedInteger"),
-    // Stateful Filter/Integral/Derivative.
     ("Filter", "FirstOrder"),
     ("Filter", "Maximum"),
     ("Filter", "Minimum"),
@@ -580,6 +589,7 @@ const SUPPORTED_METHODS: &[(&str, &str)] = &[
     ("Debounce", "Stable"),
     ("Debounce", "Fast"),
     ("Debounce", "Verify"),
+    ("Debounce", "Filter"),
     ("Change", "By"),
     ("Change", "Up"),
     ("Change", "Down"),
@@ -588,69 +598,232 @@ const SUPPORTED_METHODS: &[(&str, &str)] = &[
     ("Change", "Either"),
 ];
 
-/// Project-object methods supported regardless of the object's *name* — the
-/// object varies per project (a timer is `Startup Delay`, an enum source is
-/// `Drive State.Idle` or `Control.Drive State`), but the method name fixes the
-/// runtime route, so coverage classifies on the method alone:
-///
-/// - `AsInteger` is the enum→integer accessor (P15-B): resolved at runtime
-///   against the enum model. Like `Lookup`, coverage cannot see the value, so it
-///   is reported supported and the runtime fails loud if the object is not an
-///   enum source.
-/// - `Start`/`Stop`/`Reset`/`Remaining` are the project `Timer` object methods,
-///   evaluated by `stateful::timer` at runtime. They were already evaluated but
-///   the coverage report formerly flagged them unsupported; listing them here
-///   reconciles coverage with what `dispatch_object_method` actually does.
-/// - `Set` is the imperative channel setter (P15-C): resolved at runtime to a
-///   channel write. Like `AsInteger`, coverage classifies on the method alone and
-///   the runtime fails loud if the object is not a channel.
-const SUPPORTED_OBJECT_METHODS: &[&str] =
-    &["AsInteger", "Set", "Start", "Stop", "Reset", "Remaining"];
-
 /// The Tier-3 IO library objects: their methods are handled as documented/
 /// scenario-fed stubs (flagged externally driven), not evaluated as hardware.
 const STUB_OBJECTS: &[&str] = &["CanComms", "Serial", "System", "Logging"];
 
-/// Individual `(object, method)` pairs handled as documented stubs even though
-/// their object is not a whole stub object. `Math.atan2` is the calibration-only
-/// `Math` object surfaced in an ECU script: it is routed (to `y.atan2(x)`) but
-/// flagged external/stubbed so coverage stays honest about its provenance.
-const STUB_METHODS: &[(&str, &str)] = &[("Math", "atan2"), ("Math", "fabs")];
+/// Calibration-only `Math` methods that real ECU scripts nevertheless use. They
+/// have deterministic standard-library implementations here, but remain explicit
+/// assumptions because their ECU-script validity and exact M1 behavior are not
+/// established.
+const ASSUMED_MATH_METHODS: &[(&str, &str)] = &[("Math", "atan2"), ("Math", "fabs")];
 
-/// Classify a builtin `object.method` for the coverage report.
-///
-/// A `Lookup` method on any object is treated as **supported** here — it is the
-/// table-interpolation path, resolved at runtime against a project table symbol
-/// (coverage cannot see the calibration, so it reports the construct as supported
-/// and the runtime fails loud if the specific object is not a table).
-pub fn classify_builtin(object: &str, method: &str) -> BuiltinSupport {
-    // `Lookup` (interpolation) and `Get` (raw site read) are the table paths,
-    // resolved at runtime against a project table symbol — classified on the
-    // method alone; the runtime fails loud if the object is not a table.
-    if method == "Lookup" || method == "Get" {
-        return BuiltinSupport::Supported;
+/// Classify a member call with the same receiver resolution runtime dispatch
+/// uses. A user function is checked first because `Service Bits.Update` and a
+/// script-backed `Slip Control.Update` share a method spelling but take different
+/// routes.
+pub(crate) fn classify_member_call(
+    object: &str,
+    method: &str,
+    scope: &CapabilityScope<'_>,
+) -> CallCapability {
+    let full_path = format!("{object}.{method}");
+    if let Some(canon) = script_backed_user_function(&full_path, scope) {
+        return capability(BuiltinSupport::Supported, CallRoute::UserFunction(canon));
     }
-    // Object-name-independent project-object methods (`AsInteger` enum accessor,
-    // the `Timer` Start/Stop/Reset/Remaining) — classified on the method alone,
-    // because the object spelling is the project symbol's name, not a fixed
-    // library object.
-    if SUPPORTED_OBJECT_METHODS.contains(&method) {
-        return BuiltinSupport::Supported;
+
+    let Some(project) = scope.project else {
+        return classify_without_project(object, method);
+    };
+
+    // Resolve the complete callee before the receiver. The M1 resolver only
+    // applies local shadowing to a single-segment path, so a local named
+    // `Calculate` does not turn `Calculate.Max` into a call on that scalar. This
+    // also normalizes the explicit `Library.Calculate.Max` spelling to the
+    // canonical `Calculate` catalog object.
+    let no_locals = HashMap::new();
+    let locals = scope.locals.unwrap_or(&no_locals);
+    if let Target::Builtin {
+        object: library_object,
+    } = classify(&full_path, scope.group, scope.fn_symbol, project, locals)
+    {
+        return classify_library(&library_object, method);
     }
-    if SUPPORTED_METHODS.contains(&(object, method)) {
-        return BuiltinSupport::Supported;
+
+    if method == "AsInteger" && is_enum_literal(object, project) {
+        return capability(BuiltinSupport::Supported, CallRoute::EnumAsInteger);
     }
-    // Project-object IO methods (DBC CAN Tx/Get/Receive, GroupCompound `.Update`,
-    // `Output.SetState`, a buzzer `.Buzze`) are externally-driven documented stubs.
-    // Classified on the method name alone — the object varies per project, but the
-    // method fixes the offline route (matching `dispatch_object_method`).
+
+    // `Library.` explicitly selects the intrinsic namespace. An unknown object
+    // under that anchor cannot fall through to the project-object stub catalog.
+    if object == "Library" || object.starts_with("Library.") {
+        return unsupported_capability();
+    }
+
+    match classify(object, scope.group, scope.fn_symbol, project, locals) {
+        Target::Builtin { object: builtin } => classify_library(&builtin, method),
+        Target::Symbol(canon) => classify_project_method(&canon, method, project),
+        Target::Unresolved => classify_unresolved_project_method(method),
+        Target::Local(_) => unsupported_capability(),
+    }
+}
+
+/// Classify a bare callee. Only a project function or method with a discovered
+/// script is executable through this syntax.
+pub(crate) fn classify_bare_call(callee: &str, scope: &CapabilityScope<'_>) -> CallCapability {
+    match script_backed_user_function(callee, scope) {
+        Some(canon) => capability(BuiltinSupport::Supported, CallRoute::UserFunction(canon)),
+        None => unsupported_capability(),
+    }
+}
+
+fn classify_without_project(object: &str, method: &str) -> CallCapability {
+    if let Some(library_object) = canonical_library_object(object) {
+        return classify_library(library_object, method);
+    }
+    if object == "Library" || object.starts_with("Library.") {
+        return unsupported_capability();
+    }
+    classify_unresolved_project_method(method)
+}
+
+/// Normalize a source receiver that directly names a library object. The
+/// explicit `Library.` anchor is source syntax, not part of the intrinsic
+/// catalog key.
+fn canonical_library_object(object: &str) -> Option<&'static str> {
+    let candidate = object.strip_prefix("Library.").unwrap_or(object);
+    if candidate.contains('.') {
+        return None;
+    }
+    intrinsics::get().library_object_name(candidate)
+}
+
+fn classify_library(object: &str, method: &str) -> CallCapability {
+    let pair = (object, method);
+    if SUPPORTED_PURE_METHODS.contains(&pair) {
+        return capability(
+            BuiltinSupport::Supported,
+            CallRoute::PureLibrary(object.to_string()),
+        );
+    }
+    if ASSUMED_PURE_METHODS.contains(&pair) {
+        return capability(
+            BuiltinSupport::Assumed,
+            CallRoute::PureLibrary(object.to_string()),
+        );
+    }
+    if ASSUMED_STATEFUL_METHODS.contains(&pair) {
+        return capability(
+            BuiltinSupport::Assumed,
+            CallRoute::StatefulLibrary(object.to_string()),
+        );
+    }
+    if ASSUMED_MATH_METHODS.contains(&pair) {
+        return capability(
+            BuiltinSupport::Assumed,
+            CallRoute::MathAssumption(object.to_string()),
+        );
+    }
+    if STUB_OBJECTS.contains(&object)
+        && !intrinsics::get()
+            .library_overloads(object, method)
+            .is_empty()
+    {
+        return capability(
+            BuiltinSupport::Stubbed,
+            CallRoute::IoLibrary(object.to_string()),
+        );
+    }
+    unsupported_capability()
+}
+
+fn classify_project_method(canon: &str, method: &str, project: &Project) -> CallCapability {
+    let Some(symbol) = project.symbols().get(canon) else {
+        return unsupported_capability();
+    };
+
+    if symbol.kind == SymbolKind::Table {
+        return match method {
+            "Lookup" => capability(BuiltinSupport::Assumed, CallRoute::TableLookup),
+            "Get" => capability(BuiltinSupport::Supported, CallRoute::TableGet),
+            _ => unsupported_capability(),
+        };
+    }
+    if method == "AsInteger" && is_enum_source(canon, project) {
+        return capability(BuiltinSupport::Supported, CallRoute::EnumAsInteger);
+    }
+    if method == "Set" && matches!(symbol.kind, SymbolKind::Channel | SymbolKind::Parameter) {
+        return capability(BuiltinSupport::Supported, CallRoute::ChannelSet);
+    }
+    if symbol.classname.as_deref() == Some("BuiltIn.Timer")
+        && matches!(method, "Start" | "Stop" | "Reset" | "Remaining")
+    {
+        return capability(BuiltinSupport::Assumed, CallRoute::Timer);
+    }
+    if matches!(
+        symbol.kind,
+        SymbolKind::Object | SymbolKind::Group | SymbolKind::Reference | SymbolKind::Other
+    ) && io_stub::PROJECT_OBJECT_STUB_METHODS.contains(&method)
+    {
+        return capability(BuiltinSupport::Stubbed, CallRoute::ProjectIo);
+    }
+    unsupported_capability()
+}
+
+fn classify_unresolved_project_method(method: &str) -> CallCapability {
     if io_stub::PROJECT_OBJECT_STUB_METHODS.contains(&method) {
-        return BuiltinSupport::Stubbed;
+        capability(BuiltinSupport::Stubbed, CallRoute::ProjectIo)
+    } else {
+        unsupported_capability()
     }
-    if STUB_OBJECTS.contains(&object) || STUB_METHODS.contains(&(object, method)) {
-        return BuiltinSupport::Stubbed;
+}
+
+fn is_enum_literal(object: &str, project: &Project) -> bool {
+    object.rsplit_once('.').is_some_and(|(prefix, member)| {
+        project
+            .symbols()
+            .enum_by_name(prefix)
+            .is_some_and(|id| project.symbols().enum_has_member(id, member))
+    })
+}
+
+fn is_enum_source(canon: &str, project: &Project) -> bool {
+    let Some(symbol) = project.symbols().get(canon) else {
+        return false;
+    };
+    match symbol.kind {
+        SymbolKind::Channel | SymbolKind::Parameter => symbol.value_type.is_enum(),
+        SymbolKind::Group => project
+            .symbols()
+            .get(&format!("{canon}.Value"))
+            .is_some_and(|value| value.value_type.is_enum()),
+        _ => false,
     }
-    BuiltinSupport::Unsupported
+}
+
+fn script_backed_user_function(callee: &str, scope: &CapabilityScope<'_>) -> Option<String> {
+    let project = scope.project?;
+    let no_locals = HashMap::new();
+    let locals = scope.locals.unwrap_or(&no_locals);
+    let Target::Symbol(canon) = classify(callee, scope.group, scope.fn_symbol, project, locals)
+    else {
+        return None;
+    };
+    let symbol = project.symbols().get(&canon)?;
+    if !matches!(symbol.kind, SymbolKind::Function | SymbolKind::Method) {
+        return None;
+    }
+    scope
+        .scripts
+        .iter()
+        .any(|script| project.function_symbol_for_script(&script.name).as_deref() == Some(&canon))
+        .then_some(canon)
+}
+
+/// Project-free compatibility helper. New runtime and coverage paths call the
+/// project-aware classifier above. Without a project, receiver-specific methods
+/// are conservative: an unresolved IO writer is a stub, while table, enum,
+/// channel, and timer methods are unsupported because their receiver kind cannot
+/// be proven.
+pub fn classify_builtin(object: &str, method: &str) -> BuiltinSupport {
+    let scope = CapabilityScope {
+        project: None,
+        group: None,
+        fn_symbol: None,
+        locals: None,
+        scripts: &[],
+    };
+    classify_member_call(object, method, &scope).support
 }
 
 #[cfg(test)]
@@ -659,6 +832,7 @@ mod tests {
     use crate::calib::Calibration;
     use crate::env::{Env, StateStore};
     use m1_typecheck::Project;
+    use m1_typecheck::parsed::parse_all;
     use std::path::Path;
 
     /// Load the synthetic mini fixture project (with calibration) for the
@@ -670,6 +844,23 @@ mod tests {
             Some(&dir.join("parameters.m1cfg")),
         )
         .expect("mini fixture loads")
+    }
+
+    fn support_in(
+        loaded: &crate::loader::Loaded,
+        group: Option<&str>,
+        fn_symbol: Option<&str>,
+        object: &str,
+        method: &str,
+    ) -> BuiltinSupport {
+        let scope = CapabilityScope {
+            project: Some(&loaded.project),
+            group,
+            fn_symbol,
+            locals: None,
+            scripts: &loaded.scripts,
+        };
+        classify_member_call(object, method, &scope).support
     }
 
     /// A harness owning the stores so a fresh `EvalCtx` can be built per call.
@@ -730,6 +921,66 @@ mod tests {
                 .unwrap(),
             Value::Int(3)
         );
+    }
+
+    #[test]
+    fn local_named_calculate_does_not_shadow_qualified_builtin_call() {
+        let mut h = Harness::new();
+        h.env.set_local("Calculate", Value::Int(0));
+
+        assert_eq!(
+            h.call("Calculate", "Max", &[Value::Int(1), Value::Int(2)])
+                .unwrap(),
+            Value::Int(2)
+        );
+    }
+
+    #[test]
+    fn library_qualified_calls_dispatch_through_canonical_objects() {
+        let mut h = Harness::new();
+
+        assert_eq!(
+            h.call("Library.Calculate", "Max", &[Value::Int(1), Value::Int(2)])
+                .unwrap(),
+            Value::Int(2)
+        );
+        assert_eq!(
+            h.call(
+                "Library.Debounce",
+                "Filter",
+                &[Value::Bool(true), Value::Float(0.1)]
+            )
+            .unwrap(),
+            Value::Bool(true)
+        );
+        assert_eq!(
+            h.call("Library.Math", "fabs", &[Value::Float(-3.5)])
+                .unwrap(),
+            Value::Float(3.5)
+        );
+        assert_eq!(
+            h.call(
+                "Library.CanComms",
+                "GetFloat",
+                &[Value::Uint(1), Value::Int(2)]
+            )
+            .unwrap(),
+            Value::Float(0.0)
+        );
+    }
+
+    #[test]
+    fn unknown_library_anchored_object_does_not_fall_through_to_project_stub() {
+        assert_eq!(
+            classify_builtin("Library.NoSuchObject", "Set"),
+            BuiltinSupport::Unsupported
+        );
+
+        let mut h = Harness::new();
+        assert!(matches!(
+            h.call("Library.NoSuchObject", "Set", &[Value::Int(1)]),
+            Err(EvalError::UnsupportedBuiltin { .. })
+        ));
     }
 
     #[test]
@@ -817,6 +1068,24 @@ mod tests {
     }
 
     #[test]
+    fn debounce_filter_is_classified_and_dispatched_as_assumed() {
+        let mut h = Harness::new();
+        assert_eq!(
+            classify_builtin("Debounce", "Filter"),
+            BuiltinSupport::Assumed
+        );
+        assert_eq!(
+            h.call(
+                "Debounce",
+                "Filter",
+                &[Value::Bool(true), Value::Float(0.1)]
+            )
+            .unwrap(),
+            Value::Bool(true)
+        );
+    }
+
+    #[test]
     fn stateful_wrong_arity_is_bad_call() {
         let mut h = Harness::new();
         // Integral.Normal needs five arguments; fewer is a BadCall, not a guess.
@@ -856,7 +1125,8 @@ mod tests {
         let mut h = Harness::new();
         // atan2(1, 1) = pi/4. The calibration-only `Math` object is surfaced in
         // real ECU scripts; we route its `atan2` to the same evaluation as
-        // Calculate.InverseTan2 (and flag it Stubbed for coverage).
+        // Calculate.InverseTan2. Coverage marks the calibration-only route as an
+        // assumption, not a hardware stub.
         match h.call("Math", "atan2", &[Value::Float(1.0), Value::Float(1.0)]) {
             Ok(Value::Float(x)) => assert!((x - std::f64::consts::FRAC_PI_4).abs() < 1e-12),
             other => panic!("expected Float(pi/4), got {other:?}"),
@@ -874,24 +1144,27 @@ mod tests {
     }
 
     #[test]
-    fn math_atan2_is_classified_stubbed() {
-        // Coverage flags Math.atan2 as a stub: it is a calibration-only object
-        // surfaced in an ECU script, routed pragmatically but marked external.
-        assert_eq!(classify_builtin("Math", "atan2"), BuiltinSupport::Stubbed);
+    fn math_atan2_is_classified_assumed() {
+        assert_eq!(classify_builtin("Math", "atan2"), BuiltinSupport::Assumed);
     }
 
     #[test]
-    fn math_fabs_is_classified_stubbed() {
+    fn math_fabs_is_classified_assumed() {
         // Same provenance rationale as atan2: routed, but calibration-only.
-        assert_eq!(classify_builtin("Math", "fabs"), BuiltinSupport::Stubbed);
+        assert_eq!(classify_builtin("Math", "fabs"), BuiltinSupport::Assumed);
     }
 
     #[test]
     fn table_get_is_classified_supported() {
-        // `.Get` is the raw-site-read path, resolved at runtime against a
-        // project table symbol — classified on the method alone, like Lookup.
+        let loaded = mini_loaded();
         assert_eq!(
-            classify_builtin("Demo.Map", "Get"),
+            support_in(
+                &loaded,
+                Some("Root.Demo"),
+                Some("Root.Demo.Update"),
+                "Map",
+                "Get"
+            ),
             BuiltinSupport::Supported
         );
     }
@@ -958,6 +1231,18 @@ mod tests {
         match h.call("Map", "Lookup", &[Value::Float(0.0), Value::Float(0.0)]) {
             Err(EvalError::MissingCalibration { .. }) => {}
             other => panic!("expected MissingCalibration, got {other:?}"),
+        }
+    }
+
+    #[test]
+    fn set_on_a_table_is_unsupported() {
+        let mut h = Harness::new();
+        match h.call("Map", "Set", &[Value::Int(1)]) {
+            Err(EvalError::UnsupportedBuiltin { object, method }) => {
+                assert_eq!(object, "Map");
+                assert_eq!(method, "Set");
+            }
+            other => panic!("expected receiver-aware UnsupportedBuiltin, got {other:?}"),
         }
     }
 
@@ -1137,27 +1422,69 @@ mod tests {
 
     #[test]
     fn as_integer_is_classified_supported() {
-        // Coverage reports `.AsInteger` supported on any object (resolved at
-        // runtime against the enum model, like `Lookup`).
+        let dir = Path::new(env!("CARGO_MANIFEST_DIR")).join("tests/fixtures/enums");
+        let loaded =
+            crate::loader::load(&dir.join("Project.m1prj"), None).expect("enums fixture loads");
         assert_eq!(
-            classify_builtin("Drive State.Idle", "AsInteger"),
+            support_in(
+                &loaded,
+                Some("Root.Demo"),
+                Some("Root.Demo.Update"),
+                "Drive State.Idle",
+                "AsInteger"
+            ),
             BuiltinSupport::Supported
         );
         assert_eq!(
-            classify_builtin("Control.Drive State", "AsInteger"),
+            support_in(
+                &loaded,
+                Some("Root.Demo"),
+                Some("Root.Demo.Update"),
+                "Mode",
+                "AsInteger"
+            ),
             BuiltinSupport::Supported
+        );
+        assert_eq!(
+            support_in(
+                &loaded,
+                Some("Root.Demo"),
+                Some("Root.Demo.Update"),
+                "Precharge State",
+                "AsInteger"
+            ),
+            BuiltinSupport::Unsupported,
+            "a non-enum channel is not an AsInteger receiver"
         );
     }
 
     #[test]
-    fn timer_methods_are_classified_supported() {
-        // The project Timer methods are evaluated by `stateful::timer` at runtime;
-        // coverage now matches reality and reports them supported.
+    fn timer_methods_require_a_timer_receiver_and_are_assumed() {
+        let dir = Path::new(env!("CARGO_MANIFEST_DIR")).join("tests/fixtures/enums");
+        let loaded =
+            crate::loader::load(&dir.join("Project.m1prj"), None).expect("enums fixture loads");
         for method in ["Start", "Stop", "Reset", "Remaining"] {
             assert_eq!(
-                classify_builtin("Startup Delay", method),
-                BuiltinSupport::Supported,
-                "Timer.{method} should be supported"
+                support_in(
+                    &loaded,
+                    Some("Root.Demo"),
+                    Some("Root.Demo.Update"),
+                    "Startup Delay",
+                    method
+                ),
+                BuiltinSupport::Assumed,
+                "Timer.{method} should use the documented timer assumption"
+            );
+            assert_eq!(
+                support_in(
+                    &loaded,
+                    Some("Root.Demo"),
+                    Some("Root.Demo.Update"),
+                    "Precharge State",
+                    method
+                ),
+                BuiltinSupport::Unsupported,
+                "a channel cannot use Timer.{method}"
             );
         }
     }
@@ -1257,13 +1584,161 @@ mod tests {
     }
 
     #[test]
-    fn set_is_classified_supported() {
-        // Coverage reports `.Set` supported on any object (resolved at runtime to a
-        // channel write; the runtime fails loud if the object is not a channel).
+    fn timer_dispatch_requires_a_timer_receiver() {
+        let mut h = ProjectObjHarness::new();
         assert_eq!(
-            classify_builtin("Precharge State", "Set"),
+            h.call("Startup Delay", "Start", &[Value::Float(0.03)])
+                .unwrap(),
+            Value::Bool(true)
+        );
+        let remaining = h
+            .call("Startup Delay", "Remaining", &[])
+            .unwrap()
+            .as_f64()
+            .unwrap();
+        assert!((remaining - 0.02).abs() < 1e-12);
+        match h.call("Precharge State", "Start", &[Value::Float(0.03)]) {
+            Err(EvalError::UnsupportedBuiltin { .. }) => {}
+            other => panic!("expected channel.Start to be unsupported, got {other:?}"),
+        }
+    }
+
+    #[test]
+    fn set_is_classified_supported() {
+        let dir = Path::new(env!("CARGO_MANIFEST_DIR")).join("tests/fixtures/enums");
+        let loaded =
+            crate::loader::load(&dir.join("Project.m1prj"), None).expect("enums fixture loads");
+        assert_eq!(
+            support_in(
+                &loaded,
+                Some("Root.Demo"),
+                Some("Root.Demo.Update"),
+                "Precharge State",
+                "Set"
+            ),
             BuiltinSupport::Supported
         );
+        assert_eq!(
+            support_in(
+                &loaded,
+                Some("Root.Demo"),
+                Some("Root.Demo.Update"),
+                "Fan Output",
+                "Set"
+            ),
+            BuiltinSupport::Stubbed
+        );
+    }
+
+    #[test]
+    fn project_object_catalog_matches_coverage_and_runtime_dispatch() {
+        let mut harness = ProjectObjHarness::new();
+        let scripts = parse_all(&[(
+            "Demo.Update.m1scr".to_string(),
+            "Mode.AsInteger();\n\
+             Precharge State.Set(1);\n\
+             Startup Delay.Start(1.0);\n\
+             Startup Delay.Stop();\n\
+             Startup Delay.Reset();\n\
+             Startup Delay.Remaining();\n\
+             Service Bits.Update();\n\
+             Fan Output.Set(1);\n\
+             DashVals.TxOpen();\n\
+             DashVals.Aux Switch.GetScaled();\n\
+             DashVals.Aux Switch.Receive();\n"
+                .to_string(),
+        )]);
+        let report = crate::coverage::CoverageReport::analyse_in(&scripts, Some(&harness.project));
+
+        for name in ["Mode.AsInteger", "Precharge State.Set"] {
+            assert!(
+                report.supported.iter().any(|item| item.name == name),
+                "{name} should be supported: {report:?}"
+            );
+        }
+        for name in [
+            "Startup Delay.Start",
+            "Startup Delay.Stop",
+            "Startup Delay.Reset",
+            "Startup Delay.Remaining",
+        ] {
+            assert!(
+                report.assumed.iter().any(|item| item.name == name),
+                "{name} should be assumed: {report:?}"
+            );
+        }
+        for name in [
+            "Service Bits.Update",
+            "Fan Output.Set",
+            "DashVals.TxOpen",
+            "DashVals.Aux Switch.GetScaled",
+            "DashVals.Aux Switch.Receive",
+        ] {
+            assert!(
+                report.stubbed.iter().any(|item| item.name == name),
+                "{name} should be stubbed: {report:?}"
+            );
+        }
+
+        let enum_id = harness
+            .project
+            .symbols()
+            .enum_by_name("Drive State")
+            .unwrap();
+        harness.env.set(
+            "Root.Demo.Mode",
+            Value::Enum {
+                id: enum_id,
+                member: "Idle".to_string(),
+            },
+        );
+        let calls = [
+            ("Mode", "AsInteger", vec![]),
+            ("Precharge State", "Set", vec![Value::Int(1)]),
+            ("Startup Delay", "Start", vec![Value::Float(1.0)]),
+            ("Startup Delay", "Stop", vec![]),
+            ("Startup Delay", "Reset", vec![]),
+            ("Startup Delay", "Remaining", vec![]),
+            ("Service Bits", "Update", vec![]),
+            ("Fan Output", "Set", vec![Value::Int(1)]),
+            ("DashVals", "TxOpen", vec![]),
+            ("DashVals.Aux Switch", "GetScaled", vec![]),
+            ("DashVals.Aux Switch", "Receive", vec![]),
+        ];
+        for (object, method, args) in calls {
+            if let Err(error) = harness.call(object, method, &args) {
+                panic!(
+                    "coverage classified {object}.{method} executable, dispatch failed: {error}"
+                );
+            }
+        }
+
+        let mini = mini_loaded();
+        let table_scripts = parse_all(&[(
+            "Demo.Update.m1scr".to_string(),
+            "Map.Lookup(0.0, 0.0);\nMap.Get(0);\n".to_string(),
+        )]);
+        let table_report =
+            crate::coverage::CoverageReport::analyse_in(&table_scripts, Some(&mini.project));
+        assert!(
+            table_report
+                .assumed
+                .iter()
+                .any(|item| item.name == "Map.Lookup")
+        );
+        assert!(
+            table_report
+                .supported
+                .iter()
+                .any(|item| item.name == "Map.Get")
+        );
+        let mut table_harness = Harness::new();
+        table_harness
+            .call("Map", "Lookup", &[Value::Float(0.0), Value::Float(0.0)])
+            .expect("coverage-classified table lookup dispatches");
+        table_harness
+            .call("Map", "Get", &[Value::Int(0)])
+            .expect("coverage-classified table get dispatches");
     }
 
     // ---- Task 7: project-object IO stubs ----
@@ -1417,6 +1892,87 @@ mod tests {
                 BuiltinSupport::Supported,
                 "Calculate.{method} should be Supported"
             );
+        }
+    }
+
+    #[test]
+    fn library_catalog_matches_coverage_and_runtime_dispatch() {
+        let mut cases = SUPPORTED_PURE_METHODS
+            .iter()
+            .map(|&(object, method)| (object, method, BuiltinSupport::Supported))
+            .chain(
+                ASSUMED_PURE_METHODS
+                    .iter()
+                    .chain(ASSUMED_STATEFUL_METHODS.iter())
+                    .chain(ASSUMED_MATH_METHODS.iter())
+                    .map(|&(object, method)| (object, method, BuiltinSupport::Assumed)),
+            )
+            .collect::<Vec<_>>();
+        for &object in STUB_OBJECTS {
+            let library = intrinsics::get()
+                .library_object(object)
+                .expect("stub object is in the intrinsic catalog");
+            cases.extend(
+                library
+                    .functions
+                    .iter()
+                    .map(|overload| (object, overload.name.as_str(), BuiltinSupport::Stubbed)),
+            );
+        }
+        cases.sort_by_key(|(object, method, _)| (*object, *method));
+        cases.dedup_by_key(|(object, method, _)| (*object, *method));
+
+        let mut source = String::new();
+        for (object, method, _) in &cases {
+            let overload = intrinsics::get().library_overloads(object, method)[0];
+            let args = overload
+                .params
+                .iter()
+                .map(|param| match param.ty.as_str() {
+                    "Boolean" => "true",
+                    "String" => "\"x\"",
+                    _ => "1",
+                })
+                .collect::<Vec<_>>()
+                .join(", ");
+            source.push_str(&format!("{object}.{method}({args});\n"));
+        }
+        let scripts = parse_all(&[("Demo.Update.m1scr".to_string(), source)]);
+        let report = crate::coverage::CoverageReport::analyse(&scripts);
+
+        for (object, method, expected) in cases {
+            let name = format!("{object}.{method}");
+            let bucket = match expected {
+                BuiltinSupport::Supported => &report.supported,
+                BuiltinSupport::Assumed => &report.assumed,
+                BuiltinSupport::Stubbed => &report.stubbed,
+                _ => unreachable!("catalog test covers executable methods"),
+            };
+            assert!(
+                bucket.iter().any(|item| item.name == name),
+                "coverage did not put {name} in {expected:?}: {report:?}"
+            );
+
+            let overload = intrinsics::get().library_overloads(object, method)[0];
+            let args: Vec<Value> = overload
+                .params
+                .iter()
+                .map(|param| match param.ty.as_str() {
+                    "Boolean" => Value::Bool(true),
+                    "Integer" => Value::Int(1),
+                    "UnsignedInteger" => Value::Uint(1),
+                    "String" => Value::Str("x".to_string()),
+                    _ => Value::Float(1.0),
+                })
+                .collect();
+            let mut harness = Harness::new();
+            match harness.call(object, method, &args) {
+                Err(EvalError::UnsupportedBuiltin { .. }) => {
+                    panic!("coverage says {expected:?}, but dispatch rejects {name}")
+                }
+                Err(error) => panic!("dispatch failed for classified {name}: {error}"),
+                Ok(_) => {}
+            }
         }
     }
 

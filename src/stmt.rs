@@ -794,6 +794,15 @@ mod tests {
             .expect("TickPeriod is a documented stub");
     }
 
+    #[test]
+    fn qualified_builtin_call_is_not_shadowed_by_same_named_local() {
+        let mut h = Harness::new();
+        h.run("local Calculate = 0;\nOutput = Calculate.Max(1, 2);\n")
+            .expect("the complete builtin callee resolves before its receiver");
+
+        assert_eq!(h.env.get("Root.Demo.Output"), Some(&Value::Int(2)));
+    }
+
     // ---- Task 21: if/else ----
 
     #[test]

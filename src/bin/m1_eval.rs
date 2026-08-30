@@ -86,7 +86,7 @@ struct Args {
     out: Option<PathBuf>,
 
     /// Print the coverage report (which constructs/builtins are supported,
-    /// stubbed, or unsupported) instead of, or alongside, running.
+    /// assumed, stubbed, or unsupported) instead of, or alongside, running.
     #[arg(long)]
     coverage: bool,
 
