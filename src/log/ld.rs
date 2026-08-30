@@ -41,9 +41,9 @@
 //! Each raw sample's physical (engineering-unit) value is recovered from the
 //! channel's `scale` / `dec_places` / `mul` fields (the same formula `motec_i2`
 //! documents): `value = raw / scale * 10^-dec_places * mul`. [`from_ld`] applies
-//! that decode to produce `f64` values and derives each sample's time as
-//! `index / sample_rate` seconds (zero-order-hold keyframes), mapping each `.ld`
-//! channel to a [`crate::InputSeries`] under its verbatim name.
+//! that decode to produce M1 `Integer` or binary32 values and derives each
+//! sample's time as `index / sample_rate` seconds (zero-order-hold keyframes),
+//! mapping each `.ld` channel to a [`crate::InputSeries`] under its verbatim name.
 //!
 //! ## Fail-loud discipline
 //!
@@ -141,14 +141,21 @@ struct M1Channel {
 }
 
 impl M1Channel {
-    /// Decode one raw sample value (already widened to `f64`) into engineering
+    /// Decode one raw sample value into binary32 engineering
     /// units, applying `scale` / `dec_places` / `mul`. Mirrors the formula the
     /// public `.ld` parsers document: `raw / scale * 10^-dec_places * mul`.
     ///
     /// Callers MUST have rejected a non-zero `offset` first (the decode assumes
     /// zero); this method does not re-check it.
-    fn decode(&self, raw: f64) -> f64 {
-        raw / self.scale as f64 * 10.0_f64.powi(-self.dec_places as i32) * self.mul as f64
+    fn decode(&self, raw: f32) -> f32 {
+        raw / self.scale as f32 * 10.0_f32.powi(-self.dec_places as i32) * self.mul as f32
+    }
+
+    /// Raw signed log samples retain their integer type when the channel has an
+    /// identity engineering transform. A transform with scale or decimal places
+    /// produces an M1 floating-point engineering value.
+    fn has_identity_transform(&self) -> bool {
+        self.scale == 1 && self.dec_places == 0 && self.mul == 1
     }
 }
 
@@ -276,7 +283,7 @@ fn read_channels(bytes: &[u8], meta_ptr: u32) -> Result<Vec<M1Channel>, EvalErro
     Ok(channels)
 }
 
-/// Decode one channel's `data_count` samples to engineering-unit `f64` keyframes,
+/// Decode one channel's `data_count` samples to M1-width keyframes,
 /// each paired with its time `index / sample_rate` seconds (zero-order hold).
 ///
 /// Reads only this channel's contiguous sample region (no whole-file copy), so a
@@ -302,13 +309,30 @@ fn decode_channel_points(bytes: &[u8], ch: &M1Channel) -> Result<Vec<(f64, Value
 
     let mut points = Vec::with_capacity(count);
     for (i, chunk) in data.chunks_exact(width).enumerate() {
-        let raw = match ch.datatype {
-            M1Datatype::I16 => i16::from_le_bytes([chunk[0], chunk[1]]) as f64,
-            M1Datatype::I32 => i32::from_le_bytes([chunk[0], chunk[1], chunk[2], chunk[3]]) as f64,
-            M1Datatype::F32 => f32::from_le_bytes([chunk[0], chunk[1], chunk[2], chunk[3]]) as f64,
+        let value = match ch.datatype {
+            M1Datatype::I16 => {
+                let raw = i32::from(i16::from_le_bytes([chunk[0], chunk[1]]));
+                if ch.has_identity_transform() {
+                    Value::m1_integer(raw)
+                } else {
+                    Value::m1_float(ch.decode(raw as f32))
+                }
+            }
+            M1Datatype::I32 => {
+                let raw = i32::from_le_bytes([chunk[0], chunk[1], chunk[2], chunk[3]]);
+                if ch.has_identity_transform() {
+                    Value::m1_integer(raw)
+                } else {
+                    Value::m1_float(ch.decode(raw as f32))
+                }
+            }
+            M1Datatype::F32 => {
+                let raw = f32::from_le_bytes([chunk[0], chunk[1], chunk[2], chunk[3]]);
+                Value::m1_float(ch.decode(raw))
+            }
         };
         let t = i as f64 / rate;
-        points.push((t, Value::Float(ch.decode(raw))));
+        points.push((t, value));
     }
     Ok(points)
 }
@@ -438,7 +462,7 @@ mod tests {
     use super::{M1Channel, M1Datatype, check_decodable, from_ld};
     use crate::error::EvalError;
     use crate::scenario::InputKind;
-    use crate::value::Value;
+    use crate::value::{M1Scalar, Value};
     use motec_i2::{ChannelMetadata, Datatype, Header, LDReader, LDWriter, Sample};
     use std::io::Cursor;
 
@@ -505,6 +529,27 @@ mod tests {
         assert_eq!(le_1024, 1024);
         let le_146 = i32::from_le_bytes([0x92, 0x00, 0x00, 0x00]);
         assert_eq!(le_146, 146);
+    }
+
+    #[test]
+    fn identity_i32_samples_preserve_signed_width() {
+        let samples = [i32::MIN, -1, i32::MAX];
+        let bytes: Vec<u8> = samples
+            .iter()
+            .flat_map(|sample| sample.to_le_bytes())
+            .collect();
+        let mut channel = m1_channel(M1Datatype::I32);
+        channel.data_count = samples.len() as u32;
+
+        let points = super::decode_channel_points(&bytes, &channel).expect("i32 samples decode");
+        let values: Vec<Value> = points.into_iter().map(|(_, value)| value).collect();
+        assert_eq!(
+            values,
+            samples
+                .into_iter()
+                .map(|value| Value::M1(M1Scalar::Integer(value)))
+                .collect::<Vec<_>>()
+        );
     }
 
     /// Build a synthetic `.ld` byte image with two channels:
@@ -718,7 +763,7 @@ mod tests {
         for (got, want) in values.iter().zip([10.0_f64, 20.0, 30.0, 40.0].iter()) {
             assert!((got - want).abs() < 1e-9, "decoded {got} != {want}");
         }
-        assert_eq!(sensor.sample(0.0), Value::Float(10.0));
+        assert_eq!(sensor.sample(0.0), Value::m1_float(10.0));
     }
 
     #[test]

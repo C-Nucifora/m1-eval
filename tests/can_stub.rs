@@ -54,7 +54,7 @@ base_rate_hz = 100.0
         .expect("Bus Value channel present in the trace");
     assert_eq!(
         bus_value,
-        &vec![Value::Float(0.0); 5],
+        &vec![Value::m1_float(0.0); 5],
         "Bus Value holds the CanComms.GetFloat external stub on every tick"
     );
 
@@ -102,7 +102,7 @@ base_rate_hz = 100.0
     // The CAN-read output is the externally-driven float stub on every tick.
     assert_eq!(
         first.channels.get("Root.CanDemo.Bus Value"),
-        Some(&vec![Value::Float(0.0); 3])
+        Some(&vec![Value::m1_float(0.0); 3])
     );
 }
 
@@ -137,11 +137,11 @@ series = [[0.0, 12.5], [0.03, 99.0]]
     assert_eq!(
         bus_value,
         &vec![
-            Value::Float(12.5),
-            Value::Float(12.5),
-            Value::Float(12.5),
-            Value::Float(99.0),
-            Value::Float(99.0),
+            Value::m1_float(12.5),
+            Value::m1_float(12.5),
+            Value::m1_float(12.5),
+            Value::m1_float(99.0),
+            Value::m1_float(99.0),
         ],
         "Bus Value follows the [[io]] series, resampled each tick"
     );
@@ -176,7 +176,7 @@ const = 7.25
     let trace = engine.run(&scenario).expect("io-driven run completes");
     assert_eq!(
         trace.channels.get("Root.CanDemo.Bus Value"),
-        Some(&vec![Value::Float(7.25); 2]),
+        Some(&vec![Value::m1_float(7.25); 2]),
         "Bus Value reads the [[io]] const in function mode"
     );
 }

@@ -15,10 +15,11 @@
 //!
 //! Value reads are **fail-loud** for true runtime inputs: an unset channel is a
 //! [`EvalError::MissingInput`] and an unresolved name a
-//! [`EvalError::UnresolvedSymbol`] — never a guessed number. A parameter/constant
-//! is a *tunable calibration value*, not a runtime input: an unseeded one (no
-//! `.m1cfg`, no override) defaults to its declared-type zero, flagged externally
-//! driven, like the Tier-3 IO stubs (see `read_symbol`).
+//! [`EvalError::UnresolvedSymbol`] — never a guessed number. A parameter is a
+//! tunable calibration value: an unseeded one (no `.m1cfg`, no override) defaults
+//! to its declared-type zero, flagged externally driven, like the Tier-3 IO stubs
+//! (see `read_symbol`). A constant instead comes from its target-typed project
+//! value and cannot be replaced by a calibration cell.
 //!
 //! Identifier paths may contain spaces (`Cooling Fan`); we only ever split paths
 //! on `.`, never on whitespace.
@@ -27,10 +28,10 @@ use crate::calib::Calibration;
 use crate::env::{CallSite, Env, StateStore};
 use crate::error::EvalError;
 use crate::ident::{Target, classify};
-use crate::value::{M1Scalar, Value};
+use crate::value::{FixedPoint7dps, M1Scalar, M1ScalarKind, Value};
 use m1_core::{Field, Kind, Node};
 use m1_typecheck::Project;
-use m1_typecheck::symbols::SymbolKind;
+use m1_typecheck::symbols::{Symbol, SymbolKind};
 use m1_typecheck::types::{ValueType, numeric_join, type_of_number_literal};
 use std::collections::{HashMap, HashSet};
 
@@ -64,6 +65,10 @@ pub struct EvalCtx<'a> {
     /// callee symbol (the reverse of `function_symbol_for_script`). Threaded from
     /// the runner; an empty slice in unit tests that never call a user function.
     pub scripts: &'a [m1_typecheck::parsed::ParsedScript],
+    /// Exact numeric families retained from raw project function signatures.
+    /// `None` is supported for direct expression users that did not load a
+    /// project through [`crate::loader::load`].
+    pub signature_m1_types: Option<&'a crate::loader::SignatureM1Types>,
     /// Current inline-call nesting depth. `0` at the top of a tick; incremented
     /// each time [`crate::builtins::userfn::call`] enters a callee body, so a
     /// runtime call cycle fails loud past a fixed bound rather than overflowing
@@ -102,28 +107,33 @@ pub fn eval(node: &Node, ctx: &mut EvalCtx) -> Result<Value, EvalError> {
 fn eval_number(node: &Node) -> Result<Value, EvalError> {
     let text = node.text().trim();
     match type_of_number_literal(text) {
-        ValueType::Unsigned => parse_uint(text).map(Value::Uint),
-        ValueType::Float => text
-            .parse::<f64>()
-            .map(Value::Float)
-            .map_err(|_| bad_number(text)),
+        ValueType::Unsigned => parse_uint(text).map(Value::m1_unsigned),
+        ValueType::Float => {
+            let host = text.parse::<f64>().map_err(|_| bad_number(text))?;
+            let narrowed = host as f32;
+            if !host.is_finite() || narrowed.is_infinite() {
+                Err(bad_number(text))
+            } else {
+                Ok(Value::m1_float(narrowed))
+            }
+        }
         // Integer (and any Unknown fallback the literal typer never returns here).
         _ => text
-            .parse::<i64>()
-            .map(Value::Int)
+            .parse::<i32>()
+            .map(Value::m1_integer)
             .map_err(|_| bad_number(text)),
     }
 }
 
 /// Parse an unsigned literal: hex (`0x…`, optional trailing `u`) or a decimal
 /// with an optional trailing `u`.
-fn parse_uint(text: &str) -> Result<u64, EvalError> {
+fn parse_uint(text: &str) -> Result<u32, EvalError> {
     let lower = text.to_ascii_lowercase();
     let body = lower.strip_suffix('u').unwrap_or(&lower);
     let parsed = if let Some(hex) = body.strip_prefix("0x") {
-        u64::from_str_radix(hex, 16)
+        u32::from_str_radix(hex, 16)
     } else {
-        body.parse::<u64>()
+        body.parse::<u32>()
     };
     parsed.map_err(|_| bad_number(text))
 }
@@ -310,18 +320,17 @@ fn enum_member_literal(path: &str, ctx: &EvalCtx) -> Option<Value> {
 
 /// Read a resolved project symbol's current value. The store depends on the
 /// symbol kind: channels come from the value store (fail loud if unset), while
-/// parameters/constants come from calibration (with an `Env` override taking
-/// precedence). A table or group has no scalar value.
+/// parameters come from calibration and constants come from their `.m1prj`
+/// value (with an explicit `Env` override taking precedence). A table or group
+/// has no scalar value.
 ///
-/// A parameter/constant is a *tunable calibration value*: its real value lives in
-/// a `.m1cfg` export, not the `.m1prj` (which declares no defaults). When neither
-/// an `Env` override nor a loaded calibration supplies one, it is an unseeded
-/// externally-driven input — like a CAN read — so it resolves to the type-correct
-/// default for its declared type (flagged externally driven in the trace), not a
-/// fail-loud abort. A real calibration or a scenario override always wins. This is
-/// the calibration-side analogue of the Tier-3 IO stubs (see
-/// [`crate::builtins::io_stub`]); it never invents a *meaningful* number, only the
-/// determinate zero/false/empty of the parameter's type.
+/// A parameter is a tunable calibration value: its real value lives in a
+/// `.m1cfg` export. When neither an `Env` override nor a loaded calibration
+/// supplies one, it is an unseeded externally-driven input, like a CAN read, so
+/// it resolves to the type-correct default for its declared type (flagged
+/// externally driven in the trace), not a fail-loud abort. A constant's raw
+/// `<Props Value>` is fixed by the project and is parsed directly into its
+/// declared M1 storage family. A same-name calibration cell cannot replace it.
 pub(crate) fn read_symbol(canon: &str, ctx: &mut EvalCtx) -> Result<Value, EvalError> {
     read_symbol_inner(canon, ctx, &mut HashSet::new())
 }
@@ -347,17 +356,35 @@ fn read_symbol_inner(
     let symbol = ctx.project.symbols().get(canon);
     let kind = symbol.map(|s| s.kind);
     match kind {
-        Some(SymbolKind::Parameter | SymbolKind::Constant) => {
-            // A loaded calibration value wins; otherwise default to the parameter's
-            // declared-type zero (externally driven), so a no-calibration run does
-            // not abort on the first tunable read. An *enum*-typed parameter (e.g.
-            // a `Universal Switch State` calibration switch) defaults to its enum's
-            // initial member, so an `eq <Enum>.<Member>` comparison is type-correct.
-            if let Some(v) = calib_param(canon, ctx.calib) {
-                return Ok(v);
+        Some(SymbolKind::Constant) => {
+            let symbol = symbol.expect("a matched symbol kind has a symbol");
+            if let Some(value) = project_constant_value(symbol, ctx.project)? {
+                return Ok(value);
             }
-            let value_type = symbol.map(|s| s.value_type).unwrap_or(ValueType::Unknown);
-            let default = typed_io_input_default(value_type, ctx.project);
+            // Preserve the historical zero for a project that declares a
+            // constant without a Value. It is project-owned, so it is not marked
+            // as an external input and no calibration cell is consulted.
+            Ok(typed_io_input_default(
+                symbol.value_type,
+                symbol.declared_type.as_deref(),
+                ctx.project,
+            ))
+        }
+        Some(SymbolKind::Parameter) => {
+            // A loaded calibration value wins; otherwise default to the
+            // parameter's declared-type zero (externally driven), so a
+            // no-calibration run does not abort on the first tunable read. An
+            // enum-typed parameter defaults to its enum's initial member, so an
+            // `eq <Enum>.<Member>` comparison is type-correct.
+            if let Some(v) = calib_param(canon, ctx.calib) {
+                return coerce_for_channel(canon, v, ctx.project);
+            }
+            let symbol = symbol.expect("a matched symbol kind has a symbol");
+            let default = typed_io_input_default(
+                symbol.value_type,
+                symbol.declared_type.as_deref(),
+                ctx.project,
+            );
             if let Some(trace) = ctx.trace.as_deref_mut() {
                 trace.mark_external(canon);
             }
@@ -371,8 +398,12 @@ fn read_symbol_inner(
             // type-correct startup default, flagged externally driven — never a
             // guessed *meaningful* value, only the determinate zero of its type.
             if ctx.env.default_unseeded_channels {
-                let value_type = symbol.map(|s| s.value_type).unwrap_or(ValueType::Unknown);
-                let default = typed_io_input_default(value_type, ctx.project);
+                let symbol = symbol.expect("a matched symbol kind has a symbol");
+                let default = typed_io_input_default(
+                    symbol.value_type,
+                    symbol.declared_type.as_deref(),
+                    ctx.project,
+                );
                 if let Some(trace) = ctx.trace.as_deref_mut() {
                     // Report the substitution honestly: the channel, the value
                     // GUESSED for it, and the script whose read triggered it.
@@ -394,10 +425,14 @@ fn read_symbol_inner(
         // externally driven — never a fail-loud abort. An object with no determinate
         // value type (a CAN message, a bare group) still has no scalar value.
         Some(SymbolKind::Object | SymbolKind::Reference | SymbolKind::Other)
-            if symbol.map(|s| s.value_type.is_known()).unwrap_or(false) =>
+            if symbol.map(has_determinate_default).unwrap_or(false) =>
         {
-            let value_type = symbol.map(|s| s.value_type).unwrap_or(ValueType::Unknown);
-            let default = typed_io_input_default(value_type, ctx.project);
+            let symbol = symbol.expect("a matched symbol kind has a symbol");
+            let default = typed_io_input_default(
+                symbol.value_type,
+                symbol.declared_type.as_deref(),
+                ctx.project,
+            );
             if let Some(trace) = ctx.trace.as_deref_mut() {
                 trace.mark_external(canon);
             }
@@ -457,20 +492,143 @@ fn read_symbol_inner(
     }
 }
 
-/// The type-correct externally-driven default for an unseeded parameter/constant
-/// of declared type `value_type`. A determinate zero/false/empty — never a guessed
+/// Parse a constant's project-owned `<Props Value>` directly against its target
+/// storage type. This is deliberately separate from source-literal inference:
+/// for example, a `u32` constant may use `4294967295` without a trailing `u`.
+fn project_constant_value(symbol: &Symbol, project: &Project) -> Result<Option<Value>, EvalError> {
+    let Some(text) = symbol
+        .static_value
+        .as_deref()
+        .map(str::trim)
+        .filter(|text| !text.is_empty())
+    else {
+        return Ok(None);
+    };
+
+    let invalid = || EvalError::TypeError {
+        detail: format!(
+            "constant {:?} value {text:?} does not fit declared type {:?}",
+            symbol.path, symbol.declared_type
+        ),
+    };
+
+    if let ValueType::Enum(id) = symbol.value_type {
+        let enum_type = project.symbols().enum_type(id);
+        if enum_type.members.iter().any(|(member, _)| member == text) {
+            return Ok(Some(Value::Enum {
+                id,
+                member: text.to_string(),
+            }));
+        }
+        return Err(invalid());
+    }
+
+    if let Some(declared) = symbol.declared_type.as_deref() {
+        let normalized = declared.to_ascii_lowercase();
+        let value = match normalized.as_str() {
+            "f32" | "f64" => {
+                let host = text.parse::<f64>().map_err(|_| invalid())?;
+                let narrowed = host as f32;
+                if !host.is_finite() || narrowed.is_infinite() {
+                    return Err(invalid());
+                }
+                Value::m1_float(narrowed)
+            }
+            "s8" | "s16" | "s32" | "s64" => text
+                .parse::<i64>()
+                .ok()
+                .and_then(|value| i32::try_from(value).ok())
+                .map(Value::m1_integer)
+                .ok_or_else(invalid)?,
+            "u8" | "u16" | "u32" | "u64" => parse_uint(text)
+                .map(Value::m1_unsigned)
+                .map_err(|_| invalid())?,
+            "fixedpoint7dps" | "fixed7dps" => {
+                let host = text.parse::<f64>().map_err(|_| invalid())?;
+                let scalar = Value::Float(host)
+                    .try_as_m1_scalar_for(M1ScalarKind::FixedPoint7dps)
+                    .map_err(|_| invalid())?;
+                Value::M1(scalar)
+            }
+            "bool" => match text.to_ascii_lowercase().as_str() {
+                "true" => Value::Bool(true),
+                "false" => Value::Bool(false),
+                _ => return Err(invalid()),
+            },
+            "string" => Value::Str(text.to_string()),
+            _ => {
+                return Err(EvalError::TypeError {
+                    detail: format!(
+                        "constant {:?} has unsupported declared type {declared:?}",
+                        symbol.path
+                    ),
+                });
+            }
+        };
+        return Ok(Some(value));
+    }
+
+    // Older projects sometimes omit Type on numeric constants. Preserve that
+    // input shape through a named compatibility rule while still narrowing the
+    // inferred source-literal family to M1 width.
+    if symbol.value_type == ValueType::Boolean {
+        return match text.to_ascii_lowercase().as_str() {
+            "true" => Ok(Some(Value::Bool(true))),
+            "false" => Ok(Some(Value::Bool(false))),
+            _ => Err(invalid()),
+        };
+    }
+    if symbol.value_type == ValueType::String {
+        return Ok(Some(Value::Str(text.to_string())));
+    }
+    let value = match type_of_number_literal(text) {
+        ValueType::Unsigned => parse_uint(text).map(Value::m1_unsigned),
+        ValueType::Float => {
+            let host = text.parse::<f64>().map_err(|_| invalid())?;
+            let narrowed = host as f32;
+            if !host.is_finite() || narrowed.is_infinite() {
+                return Err(invalid());
+            }
+            Ok(Value::m1_float(narrowed))
+        }
+        _ => text
+            .parse::<i32>()
+            .map(Value::m1_integer)
+            .map_err(|_| bad_number(text)),
+    }
+    .map_err(|_| invalid())?;
+    Ok(Some(value))
+}
+
+fn has_determinate_default(symbol: &Symbol) -> bool {
+    symbol.value_type.is_known()
+        || symbol.declared_type.as_deref().is_some_and(|declared| {
+            is_fixed_point_type(declared) || declared.eq_ignore_ascii_case("string")
+        })
+}
+
+/// The type-correct externally-driven default for an unseeded parameter of
+/// declared type `value_type`. A determinate zero/false/empty, never a guessed
 /// reading. An `Unknown`/`Enum`-typed tunable (no determinate scalar zero) falls
-/// back to `Float(0.0)`, the numeric default real calibration cells take.
-fn typed_param_default(value_type: ValueType) -> Value {
+/// back to M1 `FloatingPoint(0.0)`, the numeric default real calibration cells
+/// take. The raw declaration retains FixedPoint7dps when the upstream type
+/// lattice reports it as `Unknown`.
+fn typed_param_default(value_type: ValueType, declared_type: Option<&str>) -> Value {
+    if declared_type.is_some_and(is_fixed_point_type) {
+        return Value::M1(M1Scalar::FixedPoint7dps(FixedPoint7dps::ZERO));
+    }
+    if declared_type.is_some_and(|declared| declared.eq_ignore_ascii_case("string")) {
+        return Value::Str(String::new());
+    }
     match value_type {
         ValueType::Boolean => Value::Bool(false),
-        ValueType::Integer => Value::Int(0),
-        ValueType::Unsigned => Value::Uint(0),
-        ValueType::Float => Value::Float(0.0),
+        ValueType::Integer => Value::m1_integer(0),
+        ValueType::Unsigned => Value::m1_unsigned(0),
+        ValueType::Float => Value::m1_float(0.0),
         ValueType::String => Value::Str(String::new()),
         // An enum-typed or untyped tunable has no determinate scalar zero; a
         // calibration cell is numeric, so default to the float zero.
-        ValueType::Enum(_) | ValueType::Unknown => Value::Float(0.0),
+        ValueType::Enum(_) | ValueType::Unknown => Value::m1_float(0.0),
     }
 }
 
@@ -480,7 +638,11 @@ fn typed_param_default(value_type: ValueType) -> Value {
 /// its enum's initial state (the declared `default` member, else the first
 /// member), so an `eq <Enum>.<Member>` comparison is type-correct. Scalar types
 /// reuse [`typed_param_default`].
-fn typed_io_input_default(value_type: ValueType, project: &Project) -> Value {
+fn typed_io_input_default(
+    value_type: ValueType,
+    declared_type: Option<&str>,
+    project: &Project,
+) -> Value {
     match value_type {
         ValueType::Enum(id) => {
             let enum_type = project.symbols().enum_type(id);
@@ -492,59 +654,169 @@ fn typed_io_input_default(value_type: ValueType, project: &Project) -> Value {
                 Some(member) => Value::Enum { id, member },
                 // A member-less (open firmware) enum has no determinate offline
                 // member; fall back to the numeric zero rather than invent one.
-                None => Value::Float(0.0),
+                None => Value::m1_float(0.0),
             }
         }
-        other => typed_param_default(other),
+        other => typed_param_default(other, declared_type),
     }
 }
 
 /// Coerce a value being written to channel/parameter `canon` to that symbol's
-/// declared type, for the one case M1 implicitly converts on assignment: writing a
-/// **numeric** value to an **enum**-typed channel. M1 enum channels store an
-/// integer, so `Precharge State.Set(Convert.ToInteger(...))` and `… .Set(0)` write
-/// an integer the firmware interprets as the enum member with that declared value.
-/// We mirror that by resolving the integer to its [`Value::Enum`] member, so the
-/// channel holds a typed enum value and an `eq <Enum>.<Member>` comparison is
-/// type-correct. A numeric value with no matching member, or any non-enum target,
-/// is returned unchanged (the write is stored as-is — never a guessed member).
-pub(crate) fn coerce_for_channel(canon: &str, value: Value, project: &Project) -> Value {
-    // Only a numeric value written to an enum-typed symbol is coerced.
-    let n = match &value {
-        Value::Int(_) | Value::Uint(_) | Value::Float(_) => value.as_f64().ok(),
-        _ => None,
-    };
-    let Some(n) = n else { return value };
+/// declared M1 storage family. Integer/unsigned assignment conversions operate
+/// on the same 32-bit pattern, integral values widen to binary32 for float
+/// targets, and an invalid float-to-integral narrowing fails loud. Numeric enum
+/// writes resolve their exact declared member value.
+pub(crate) fn coerce_for_channel(
+    canon: &str,
+    value: Value,
+    project: &Project,
+) -> Result<Value, EvalError> {
     let Some(symbol) = project.symbols().get(canon) else {
-        return value;
+        return Ok(value);
     };
-    let ValueType::Enum(id) = symbol.value_type else {
-        return value;
+    if symbol
+        .declared_type
+        .as_deref()
+        .is_some_and(is_fixed_point_type)
+    {
+        return coerce_for_scalar_kind(canon, value, M1ScalarKind::FixedPoint7dps);
+    }
+    coerce_for_declared_type(canon, value, symbol.value_type, project)
+}
+
+/// Coerce a value at an assignment or call boundary to its declared M1 type.
+/// This is shared by project channels, typed locals, user-function parameters,
+/// and return slots so a value cannot change storage family between them.
+pub(crate) fn coerce_for_declared_type(
+    target: &str,
+    value: Value,
+    declared: ValueType,
+    project: &Project,
+) -> Result<Value, EvalError> {
+    match (&value, declared) {
+        (_, ValueType::Unknown) => return Ok(value),
+        (Value::Bool(_), ValueType::Boolean) | (Value::Str(_), ValueType::String) => {
+            return Ok(value);
+        }
+        (Value::Enum { id, .. }, ValueType::Enum(expected)) if *id == expected => {
+            return Ok(value);
+        }
+        _ => {}
+    }
+
+    let scalar = match &value {
+        Value::M1(scalar) => *scalar,
+        Value::Int(_) | Value::Uint(_) | Value::Float(_) => {
+            return Err(value.m1_scalar().unwrap_err());
+        }
+        _ => {
+            return Err(declared_type_error(
+                target,
+                &value,
+                declared_type_name(declared),
+            ));
+        }
     };
-    // The member whose declared integer equals the written number (exactly — a
-    // fractional value matches no member and is left as-is).
-    let member = project
-        .symbols()
-        .enum_type(id)
-        .members
-        .iter()
-        .find(|(_, decl)| (*decl as f64) == n)
-        .map(|(name, _)| name.clone());
-    match member {
-        Some(member) => Value::Enum { id, member },
-        None => value,
+
+    match declared {
+        ValueType::Integer => coerce_for_scalar_kind(target, value, M1ScalarKind::Integer),
+        ValueType::Unsigned => coerce_for_scalar_kind(target, value, M1ScalarKind::UnsignedInteger),
+        ValueType::Float => coerce_for_scalar_kind(target, value, M1ScalarKind::FloatingPoint),
+        ValueType::Enum(id) => {
+            let n = scalar.as_f64();
+            let member = project
+                .symbols()
+                .enum_type(id)
+                .members
+                .iter()
+                .find(|(_, declared)| (*declared as f64) == n)
+                .map(|(name, _)| name.clone());
+            match member {
+                Some(member) => Ok(Value::Enum { id, member }),
+                None => Err(declared_type_error(
+                    target,
+                    &value,
+                    "a declared enum member",
+                )),
+            }
+        }
+        ValueType::Boolean | ValueType::String | ValueType::Unknown => Err(declared_type_error(
+            target,
+            &value,
+            declared_type_name(declared),
+        )),
+    }
+}
+
+/// Coerce a value to an exact runtime scalar family. Existing-value assignment
+/// uses this when the static type model cannot distinguish `FloatingPoint` from
+/// `FixedPoint7dps`.
+pub(crate) fn coerce_for_scalar_kind(
+    target: &str,
+    value: Value,
+    kind: M1ScalarKind,
+) -> Result<Value, EvalError> {
+    let scalar = value.m1_scalar()?;
+    let converted = match (kind, scalar) {
+        (M1ScalarKind::Integer, M1Scalar::Integer(value)) => M1Scalar::Integer(value),
+        (M1ScalarKind::Integer, M1Scalar::UnsignedInteger(value)) => {
+            M1Scalar::Integer(value as i32)
+        }
+        (M1ScalarKind::UnsignedInteger, M1Scalar::Integer(value)) => {
+            M1Scalar::UnsignedInteger(value as u32)
+        }
+        (M1ScalarKind::UnsignedInteger, M1Scalar::UnsignedInteger(value)) => {
+            M1Scalar::UnsignedInteger(value)
+        }
+        (M1ScalarKind::FloatingPoint, scalar) => M1Scalar::FloatingPoint(scalar.as_f32()),
+        (M1ScalarKind::FixedPoint7dps, M1Scalar::FixedPoint7dps(value)) => {
+            M1Scalar::FixedPoint7dps(value)
+        }
+        _ => return Err(declared_type_error(target, &value, scalar_kind_name(kind))),
+    };
+    Ok(Value::M1(converted))
+}
+
+fn declared_type_name(value_type: ValueType) -> &'static str {
+    match value_type {
+        ValueType::Boolean => "Boolean",
+        ValueType::Integer => "Integer",
+        ValueType::Unsigned => "UnsignedInteger",
+        ValueType::Float => "FloatingPoint",
+        ValueType::String => "String",
+        ValueType::Enum(_) => "Enumeration",
+        ValueType::Unknown => "a known type",
+    }
+}
+
+fn scalar_kind_name(kind: M1ScalarKind) -> &'static str {
+    match kind {
+        M1ScalarKind::FloatingPoint => "FloatingPoint",
+        M1ScalarKind::Integer => "Integer",
+        M1ScalarKind::UnsignedInteger => "UnsignedInteger",
+        M1ScalarKind::FixedPoint7dps => "FixedPoint7dps",
+    }
+}
+
+fn is_fixed_point_type(declared: &str) -> bool {
+    declared.eq_ignore_ascii_case("FixedPoint7dps") || declared.eq_ignore_ascii_case("fixed7dps")
+}
+
+fn declared_type_error(target: &str, value: &Value, required: &str) -> EvalError {
+    EvalError::TypeError {
+        detail: format!("cannot store {value:?} in {target:?}, which requires {required}"),
     }
 }
 
 /// Look up a parameter/constant calibration value by its canonical symbol path.
 /// Real `.m1cfg` exports omit the implicit leading `Root.` group prefix that the
 /// symbol table uses, so try the canonical path first, then the `Root.`-stripped
-/// form. Returns the value as a [`Value::Float`] (calibration cells are numeric).
+/// form. Calibration values already carry their M1 storage type.
 fn calib_param(canon: &str, calib: &Calibration) -> Option<Value> {
     calib
         .param(canon)
         .or_else(|| canon.strip_prefix("Root.").and_then(|p| calib.param(p)))
-        .map(Value::Float)
+        .map(Value::M1)
 }
 
 /// Evaluate a unary expression (`- ! ~ not`).
@@ -558,13 +830,25 @@ fn eval_unary(node: &Node, ctx: &mut EvalCtx) -> Result<Value, EvalError> {
         .into_iter()
         .find(|c| c.byte_range() != op.byte_range())
         .ok_or_else(|| op_shape_err(node, "unary operand"))?;
+    // `2147483648` is outside positive i32, but its negation is the valid M1
+    // minimum. Recognise that one grammar shape before evaluating the positive
+    // child literal; every larger magnitude still fails the width check.
+    if op.kind() == Kind::Minus
+        && operand.kind() == Kind::Number
+        && type_of_number_literal(operand.text().trim()) == ValueType::Integer
+        && operand.text().trim().parse::<i64>().ok() == Some(i64::from(i32::MAX) + 1)
+    {
+        return Ok(Value::m1_integer(i32::MIN));
+    }
     let v = eval(&operand, ctx)?;
     match op.kind() {
         Kind::Minus => match v {
-            Value::Int(x) => Ok(Value::Int(-x)),
-            Value::Float(x) => Ok(Value::Float(-x)),
-            // Negating an unsigned yields a signed result.
-            Value::Uint(x) => Ok(Value::Int(-(x as i64))),
+            Value::M1(M1Scalar::Integer(x)) => Ok(Value::m1_integer(x.wrapping_neg())),
+            Value::M1(M1Scalar::FloatingPoint(x)) => Ok(Value::m1_float(-x)),
+            Value::M1(M1Scalar::FixedPoint7dps(x)) => Ok(Value::M1(M1Scalar::FixedPoint7dps(
+                crate::value::FixedPoint7dps::from_raw(x.raw().wrapping_neg()),
+            ))),
+            Value::M1(M1Scalar::UnsignedInteger(x)) => Ok(Value::m1_unsigned(x.wrapping_neg())),
             other => Err(EvalError::TypeError {
                 detail: format!("cannot negate {other:?}"),
             }),
@@ -573,8 +857,8 @@ fn eval_unary(node: &Node, ctx: &mut EvalCtx) -> Result<Value, EvalError> {
         Kind::Not | Kind::Bang => Ok(Value::Bool(!v.as_bool()?)),
         // `~` is bitwise complement: integral only.
         Kind::Tilde => match v {
-            Value::Int(x) => Ok(Value::Int(!x)),
-            Value::Uint(x) => Ok(Value::Uint(!x)),
+            Value::M1(M1Scalar::Integer(x)) => Ok(Value::m1_integer(!x)),
+            Value::M1(M1Scalar::UnsignedInteger(x)) => Ok(Value::m1_unsigned(!x)),
             other => Err(EvalError::TypeError {
                 detail: format!("cannot bitwise-complement {other:?}"),
             }),
@@ -673,8 +957,8 @@ fn arithmetic(op: Kind, l: &Value, r: &Value) -> Result<Value, EvalError> {
 
     match joined {
         ValueType::Float => {
-            let a = l.as_f64()?;
-            let b = r.as_f64()?;
+            let a = l.m1_scalar()?.as_f32();
+            let b = r.m1_scalar()?.as_f32();
             let out = match op {
                 Kind::Plus => a + b,
                 Kind::Minus => a - b,
@@ -683,17 +967,17 @@ fn arithmetic(op: Kind, l: &Value, r: &Value) -> Result<Value, EvalError> {
                 Kind::Percent => a % b,
                 _ => unreachable!("arithmetic called with non-arith op"),
             };
-            Ok(Value::Float(out))
+            Ok(Value::m1_float(out))
         }
         ValueType::Unsigned => {
-            let a = as_u64(l)?;
-            let b = as_u64(r)?;
-            int_op_u64(op, a, b)
+            let a = as_u32_bits(l)?;
+            let b = as_u32_bits(r)?;
+            int_op_u32(op, a, b)
         }
         ValueType::Integer => {
-            let a = as_i64(l)?;
-            let b = as_i64(r)?;
-            int_op_i64(op, a, b)
+            let a = as_i32(l)?;
+            let b = as_i32(r)?;
+            int_op_i32(op, a, b)
         }
         // One operand is non-numeric (Bool/Enum/String) or Unknown.
         _ => Err(EvalError::TypeError {
@@ -702,7 +986,7 @@ fn arithmetic(op: Kind, l: &Value, r: &Value) -> Result<Value, EvalError> {
     }
 }
 
-fn int_op_i64(op: Kind, a: i64, b: i64) -> Result<Value, EvalError> {
+fn int_op_i32(op: Kind, a: i32, b: i32) -> Result<Value, EvalError> {
     let out = match op {
         Kind::Plus => a.wrapping_add(b),
         Kind::Minus => a.wrapping_sub(b),
@@ -721,10 +1005,10 @@ fn int_op_i64(op: Kind, a: i64, b: i64) -> Result<Value, EvalError> {
         }
         _ => unreachable!(),
     };
-    Ok(Value::Int(out))
+    Ok(Value::m1_integer(out))
 }
 
-fn int_op_u64(op: Kind, a: u64, b: u64) -> Result<Value, EvalError> {
+fn int_op_u32(op: Kind, a: u32, b: u32) -> Result<Value, EvalError> {
     let out = match op {
         Kind::Plus => a.wrapping_add(b),
         Kind::Minus => a.wrapping_sub(b),
@@ -743,7 +1027,7 @@ fn int_op_u64(op: Kind, a: u64, b: u64) -> Result<Value, EvalError> {
         }
         _ => unreachable!(),
     };
-    Ok(Value::Uint(out))
+    Ok(Value::m1_unsigned(out))
 }
 
 fn div_by_zero() -> EvalError {
@@ -752,19 +1036,36 @@ fn div_by_zero() -> EvalError {
     }
 }
 
-/// Apply an ordered comparison (`< > <= >=`). Numeric operands compare as `f64`;
-/// non-numeric operands are a type error.
+/// Apply an ordered comparison (`< > <= >=`) after the same M1-width promotion
+/// used by arithmetic. Mixed signed/unsigned operands compare as `u32`; an M1
+/// float in either position makes both operands binary32.
 fn compare(op: Kind, l: &Value, r: &Value) -> Result<Value, EvalError> {
-    let a = l.as_f64()?;
-    let b = r.as_f64()?;
-    let out = match op {
+    if let (Value::M1(M1Scalar::FixedPoint7dps(left)), Value::M1(M1Scalar::FixedPoint7dps(right))) =
+        (l, r)
+    {
+        return Ok(Value::Bool(compare_values(op, left.raw(), right.raw())));
+    }
+    let out = match numeric_join(value_type(l), value_type(r)) {
+        ValueType::Float => compare_values(op, l.m1_scalar()?.as_f32(), r.m1_scalar()?.as_f32()),
+        ValueType::Unsigned => compare_values(op, as_u32_bits(l)?, as_u32_bits(r)?),
+        ValueType::Integer => compare_values(op, as_i32(l)?, as_i32(r)?),
+        _ => {
+            return Err(EvalError::TypeError {
+                detail: format!("comparison on non-numeric operands {l:?} and {r:?}"),
+            });
+        }
+    };
+    Ok(Value::Bool(out))
+}
+
+fn compare_values<T: PartialOrd>(op: Kind, a: T, b: T) -> bool {
+    match op {
         Kind::Lt => a < b,
         Kind::Gt => a > b,
         Kind::LtEq => a <= b,
         Kind::GtEq => a >= b,
-        _ => unreachable!("compare called with non-comparison op"),
-    };
-    Ok(Value::Bool(out))
+        _ => unreachable!("compare_values called with non-comparison op"),
+    }
 }
 
 /// Structural equality for the `eq`/`==` (and negated `neq`/`!=`) operators.
@@ -779,10 +1080,15 @@ fn values_equal(l: &Value, r: &Value) -> Result<bool, EvalError> {
         (Bool(a), Bool(b)) => Ok(a == b),
         (Str(a), Str(b)) => Ok(a == b),
         (Enum { id: i1, member: m1 }, Enum { id: i2, member: m2 }) => Ok(i1 == i2 && m1 == m2),
-        // Any numeric pairing compares by f64 value.
-        (Int(_) | Uint(_) | Float(_), Int(_) | Uint(_) | Float(_)) => {
-            Ok(l.as_f64()? == r.as_f64()?)
+        (M1(M1Scalar::FixedPoint7dps(left)), M1(M1Scalar::FixedPoint7dps(right))) => {
+            Ok(left.raw() == right.raw())
         }
+        (M1(_), M1(_)) => match numeric_join(value_type(l), value_type(r)) {
+            ValueType::Float => Ok(l.m1_scalar()?.as_f32() == r.m1_scalar()?.as_f32()),
+            ValueType::Unsigned => Ok(as_u32_bits(l)? == as_u32_bits(r)?),
+            ValueType::Integer => Ok(as_i32(l)? == as_i32(r)?),
+            _ => unreachable!("M1 scalars always have a numeric ValueType"),
+        },
         _ => Err(EvalError::TypeError {
             detail: format!("cannot compare {l:?} with {r:?} for equality"),
         }),
@@ -793,42 +1099,41 @@ fn values_equal(l: &Value, r: &Value) -> Result<bool, EvalError> {
 /// a non-integral operand is a type error. Mixed signed/unsigned operands are
 /// allowed — real M1 code freely combines them (`(Status Word >> 8) & 0x01`, an
 /// `s32` masked with a hex `u32`). Bit operations act on the two's-complement bit
-/// pattern, so the result type follows [`numeric_join`]: `Unsigned` only when both
-/// operands are unsigned, otherwise `Integer` (the same rule as `+`/`-`).
+/// pattern. M1's result type follows the left operand, including the signedness
+/// of a right shift; the right operand contributes only its 32-bit pattern or
+/// shift count.
 fn bitwise(op: Kind, l: &Value, r: &Value) -> Result<Value, EvalError> {
-    match (l, r) {
-        // Both unsigned: compute and keep unsigned.
-        (Value::Uint(a), Value::Uint(b)) => Ok(Value::Uint(bit_u64(op, *a, *b))),
-        // Any integral mix (signed/signed, signed/unsigned, unsigned/signed):
-        // compute on the i64 bit pattern; the result is signed per `numeric_join`.
-        (Value::Int(_) | Value::Uint(_), Value::Int(_) | Value::Uint(_)) => {
-            Ok(Value::Int(bit_i64(op, as_i64(l)?, as_i64(r)?)))
+    let right = as_u32_bits(r)?;
+    match l {
+        Value::M1(M1Scalar::UnsignedInteger(left)) => {
+            Ok(Value::m1_unsigned(bit_u32(op, *left, right)))
         }
-        _ => Err(EvalError::TypeError {
-            detail: format!("bitwise operator requires integral operands, got {l:?} and {r:?}"),
+        Value::M1(M1Scalar::Integer(left)) => Ok(Value::m1_integer(bit_i32(op, *left, right))),
+        other => Err(EvalError::TypeError {
+            detail: format!("bitwise operator requires integral operands, got {other:?} and {r:?}"),
         }),
     }
 }
 
-fn bit_u64(op: Kind, a: u64, b: u64) -> u64 {
+fn bit_u32(op: Kind, a: u32, b: u32) -> u32 {
     match op {
         Kind::Amp => a & b,
         Kind::Pipe => a | b,
         Kind::Caret => a ^ b,
-        Kind::LtLt => a.wrapping_shl(b as u32),
-        Kind::GtGt => a.wrapping_shr(b as u32),
-        _ => unreachable!("bit_u64 called with non-bitwise op"),
+        Kind::LtLt => a.wrapping_shl(b),
+        Kind::GtGt => a.wrapping_shr(b),
+        _ => unreachable!("bit_u32 called with non-bitwise op"),
     }
 }
 
-fn bit_i64(op: Kind, a: i64, b: i64) -> i64 {
+fn bit_i32(op: Kind, a: i32, b: u32) -> i32 {
     match op {
-        Kind::Amp => a & b,
-        Kind::Pipe => a | b,
-        Kind::Caret => a ^ b,
-        Kind::LtLt => a.wrapping_shl(b as u32),
-        Kind::GtGt => a.wrapping_shr(b as u32),
-        _ => unreachable!("bit_i64 called with non-bitwise op"),
+        Kind::Amp => a & b as i32,
+        Kind::Pipe => a | b as i32,
+        Kind::Caret => a ^ b as i32,
+        Kind::LtLt => a.wrapping_shl(b),
+        Kind::GtGt => a.wrapping_shr(b),
+        _ => unreachable!("bit_i32 called with non-bitwise op"),
     }
 }
 
@@ -848,24 +1153,24 @@ fn value_type(v: &Value) -> ValueType {
     }
 }
 
-/// Coerce to `i64` for integer arithmetic; an unsigned value fits via `as`.
-fn as_i64(v: &Value) -> Result<i64, EvalError> {
+/// Extract a signed M1 integer.
+fn as_i32(v: &Value) -> Result<i32, EvalError> {
     match v {
-        Value::Int(x) => Ok(*x),
-        Value::Uint(x) => Ok(*x as i64),
+        Value::M1(M1Scalar::Integer(x)) => Ok(*x),
         other => Err(EvalError::TypeError {
             detail: format!("{other:?} is not an integer"),
         }),
     }
 }
 
-/// Coerce to `u64` for unsigned arithmetic.
-fn as_u64(v: &Value) -> Result<u64, EvalError> {
+/// Read an integral M1 value as its 32-bit bit pattern. Signed operands use the
+/// language's mixed-integer conversion to unsigned.
+fn as_u32_bits(v: &Value) -> Result<u32, EvalError> {
     match v {
-        Value::Uint(x) => Ok(*x),
-        Value::Int(x) => Ok(*x as u64),
+        Value::M1(M1Scalar::UnsignedInteger(x)) => Ok(*x),
+        Value::M1(M1Scalar::Integer(x)) => Ok(*x as u32),
         other => Err(EvalError::TypeError {
-            detail: format!("{other:?} is not an unsigned integer"),
+            detail: format!("{other:?} is not an integral M1 value"),
         }),
     }
 }
@@ -1007,6 +1312,7 @@ mod tests {
                 script_name: "Demo.Update.m1scr",
                 dt: 0.01,
                 scripts: &[],
+                signature_m1_types: None,
                 depth: 0,
                 trace: None,
             }
@@ -1030,11 +1336,44 @@ mod tests {
     #[test]
     fn number_literals_pick_the_right_variant() {
         let mut h = Harness::new();
-        assert_eq!(rhs_value("2.5", &mut h).unwrap(), Value::Float(2.5));
-        assert_eq!(rhs_value("7", &mut h).unwrap(), Value::Int(7));
-        assert_eq!(rhs_value("0xFF", &mut h).unwrap(), Value::Uint(255));
-        assert_eq!(rhs_value("10u", &mut h).unwrap(), Value::Uint(10));
-        assert_eq!(rhs_value("1e3", &mut h).unwrap(), Value::Float(1000.0));
+        assert_eq!(rhs_value("2.5", &mut h).unwrap(), Value::m1_float(2.5));
+        assert_eq!(rhs_value("7", &mut h).unwrap(), Value::m1_integer(7));
+        assert_eq!(rhs_value("0xFF", &mut h).unwrap(), Value::m1_unsigned(255));
+        assert_eq!(rhs_value("10u", &mut h).unwrap(), Value::m1_unsigned(10));
+        assert_eq!(rhs_value("1e3", &mut h).unwrap(), Value::m1_float(1000.0));
+    }
+
+    #[test]
+    fn exact_target_directs_fixed_point_assignment() {
+        let h = Harness::new();
+        let fixed = Value::M1(M1Scalar::FixedPoint7dps(
+            crate::value::FixedPoint7dps::from_raw(12_345_678),
+        ));
+        assert_eq!(
+            coerce_for_declared_type("target", fixed.clone(), ValueType::Float, &h.project)
+                .unwrap(),
+            Value::m1_float(1.2345678)
+        );
+        assert_eq!(
+            coerce_for_scalar_kind("target", fixed.clone(), M1ScalarKind::FixedPoint7dps).unwrap(),
+            fixed
+        );
+    }
+
+    #[test]
+    fn project_target_metadata_distinguishes_float_and_fixed_point() {
+        let h = Harness::new();
+        let fixed = Value::M1(M1Scalar::FixedPoint7dps(FixedPoint7dps::from_raw(
+            12_345_678,
+        )));
+        assert_eq!(
+            coerce_for_channel("Root.Demo.FloatTarget", fixed.clone(), &h.project).unwrap(),
+            Value::m1_float(1.2345678)
+        );
+        assert_eq!(
+            coerce_for_channel("Root.Demo.FixedTarget", fixed.clone(), &h.project).unwrap(),
+            fixed
+        );
     }
 
     #[test]
@@ -1051,7 +1390,7 @@ mod tests {
     #[test]
     fn parentheses_pass_through() {
         let mut h = Harness::new();
-        assert_eq!(rhs_value("(2.5)", &mut h).unwrap(), Value::Float(2.5));
+        assert_eq!(rhs_value("(2.5)", &mut h).unwrap(), Value::m1_float(2.5));
     }
 
     #[test]
@@ -1063,8 +1402,8 @@ mod tests {
             other => panic!("expected MissingInput, got {other:?}"),
         }
         // Seed the channel; now it reads back.
-        h.env.set("Root.Demo.Speed", Value::Float(42.0));
-        assert_eq!(rhs_value("Speed", &mut h).unwrap(), Value::Float(42.0));
+        h.env.set("Root.Demo.Speed", Value::m1_float(42.0));
+        assert_eq!(rhs_value("Speed", &mut h).unwrap(), Value::m1_float(42.0));
     }
 
     #[test]
@@ -1073,21 +1412,113 @@ mod tests {
         // No calibration value: a parameter is a tunable calibration value, so an
         // unseeded read defaults to its declared-type zero (externally driven),
         // rather than aborting a no-calibration run. `Gain` is a float parameter.
-        assert_eq!(rhs_value("Gain", &mut h).unwrap(), Value::Float(0.0));
+        assert_eq!(rhs_value("Gain", &mut h).unwrap(), Value::m1_float(0.0));
         // Provide it under the Root-stripped name real exports use; calibration
         // now wins over the default.
-        h.calib.params.insert("Demo.Gain".to_string(), 2.5);
-        assert_eq!(rhs_value("Gain", &mut h).unwrap(), Value::Float(2.5));
+        h.calib
+            .params
+            .insert("Demo.Gain".to_string(), M1Scalar::Integer(2));
+        assert_eq!(rhs_value("Gain", &mut h).unwrap(), Value::m1_float(2.0));
+        h.calib
+            .params
+            .insert("Demo.Gain".to_string(), M1Scalar::FloatingPoint(2.5));
+        assert_eq!(rhs_value("Gain", &mut h).unwrap(), Value::m1_float(2.5));
+    }
+
+    #[test]
+    fn fixed_point_defaults_retain_the_declared_project_family() {
+        let mut h = Harness::new();
+        assert_eq!(
+            rhs_value("FixedGain", &mut h).unwrap(),
+            Value::M1(M1Scalar::FixedPoint7dps(FixedPoint7dps::ZERO))
+        );
+
+        h.env.default_unseeded_channels = true;
+        assert_eq!(
+            rhs_value("FixedTarget", &mut h).unwrap(),
+            Value::M1(M1Scalar::FixedPoint7dps(FixedPoint7dps::ZERO))
+        );
+
+        // A legacy-untyped calibration cell parses as binary32. It cannot
+        // silently change an explicitly fixed parameter's storage family.
+        h.calib
+            .params
+            .insert("Demo.FixedGain".to_string(), M1Scalar::FloatingPoint(1.0));
+        assert!(matches!(
+            rhs_value("FixedGain", &mut h),
+            Err(EvalError::TypeError { .. })
+        ));
+    }
+
+    #[test]
+    fn project_constants_are_target_typed_and_outrank_calibration() {
+        let mut h = Harness::new();
+        h.calib.params.insert(
+            "Demo.UnsignedConstant".to_string(),
+            M1Scalar::UnsignedInteger(7),
+        );
+
+        assert_eq!(
+            rhs_value("SignedConstant", &mut h).unwrap(),
+            Value::m1_integer(i32::MIN)
+        );
+        assert_eq!(
+            rhs_value("UnsignedConstant", &mut h).unwrap(),
+            Value::m1_unsigned(u32::MAX)
+        );
+        assert_eq!(
+            rhs_value("FloatConstant", &mut h).unwrap(),
+            Value::m1_float(16_777_216.0)
+        );
+        assert_eq!(
+            rhs_value("FixedConstant", &mut h).unwrap(),
+            Value::M1(M1Scalar::FixedPoint7dps(FixedPoint7dps::from_raw(
+                12_345_678,
+            )))
+        );
+        assert_eq!(
+            rhs_value("LegacyConstant", &mut h).unwrap(),
+            Value::m1_integer(100)
+        );
+        assert_eq!(
+            rhs_value("BooleanConstant", &mut h).unwrap(),
+            Value::Bool(true)
+        );
+    }
+
+    #[test]
+    fn out_of_range_project_constants_fail_loud() {
+        let h = Harness::new();
+        let mut symbol = h
+            .project
+            .symbols()
+            .get("Root.Demo.SignedConstant")
+            .unwrap()
+            .clone();
+        for (declared, raw) in [
+            ("s32", "2147483648"),
+            ("u32", "4294967296"),
+            ("f32", "1e39"),
+            ("f32", "1e9999"),
+            ("FixedPoint7dps", "214.7483648"),
+        ] {
+            symbol.declared_type = Some(declared.to_string());
+            symbol.static_value = Some(raw.to_string());
+            assert!(
+                project_constant_value(&symbol, &h.project).is_err(),
+                "unexpectedly accepted {declared} constant {raw}"
+            );
+        }
     }
 
     #[test]
     fn group_default_value_reads_declared_nested_symbol() {
         let mut h = Harness::new();
         h.env
-            .set("Root.Demo.Sensor Compound.Sensor", Value::Float(87.5));
+            .set("Root.Demo.Sensor Compound.Sensor", Value::m1_float(87.5));
         assert_eq!(
             rhs_value("Sensor Compound", &mut h).unwrap(),
-            Value::Float(87.5)
+            Value::m1_float(87.5)
         );
     }
 
@@ -1103,8 +1534,8 @@ mod tests {
     #[test]
     fn local_identifier_reads_local_store() {
         let mut h = Harness::new();
-        h.env.set_local("scaled", Value::Int(9));
-        assert_eq!(rhs_value("scaled", &mut h).unwrap(), Value::Int(9));
+        h.env.set_local("scaled", Value::m1_integer(9));
+        assert_eq!(rhs_value("scaled", &mut h).unwrap(), Value::m1_integer(9));
     }
 
     // ---- Task 9: member expressions ----
@@ -1113,28 +1544,31 @@ mod tests {
     fn this_member_rewrites_to_group() {
         let mut h = Harness::new();
         // `This.Output` from group Root.Demo resolves to Root.Demo.Output.
-        h.env.set("Root.Demo.Output", Value::Float(3.0));
-        assert_eq!(rhs_value("This.Output", &mut h).unwrap(), Value::Float(3.0));
+        h.env.set("Root.Demo.Output", Value::m1_float(3.0));
+        assert_eq!(
+            rhs_value("This.Output", &mut h).unwrap(),
+            Value::m1_float(3.0)
+        );
     }
 
     #[test]
     fn absolute_member_path_reads() {
         let mut h = Harness::new();
-        h.env.set("Root.Sibling", Value::Float(11.0));
+        h.env.set("Root.Sibling", Value::m1_float(11.0));
         assert_eq!(
             rhs_value("Root.Sibling", &mut h).unwrap(),
-            Value::Float(11.0)
+            Value::m1_float(11.0)
         );
     }
 
     #[test]
     fn parent_member_walks_up() {
         let mut h = Harness::new();
-        h.env.set("Root.Sibling", Value::Float(5.0));
+        h.env.set("Root.Sibling", Value::m1_float(5.0));
         // From Root.Demo, Parent.Sibling is Root.Sibling.
         assert_eq!(
             rhs_value("Parent.Sibling", &mut h).unwrap(),
-            Value::Float(5.0)
+            Value::m1_float(5.0)
         );
     }
 
@@ -1153,18 +1587,54 @@ mod tests {
     #[test]
     fn arithmetic_int_and_float() {
         let mut h = Harness::new();
-        assert_eq!(rhs_value("2 + 3", &mut h).unwrap(), Value::Int(5));
-        assert_eq!(rhs_value("2 * 3", &mut h).unwrap(), Value::Int(6));
-        assert_eq!(rhs_value("7 % 3", &mut h).unwrap(), Value::Int(1));
+        assert_eq!(rhs_value("2 + 3", &mut h).unwrap(), Value::m1_integer(5));
+        assert_eq!(rhs_value("2 * 3", &mut h).unwrap(), Value::m1_integer(6));
+        assert_eq!(rhs_value("7 % 3", &mut h).unwrap(), Value::m1_integer(1));
         // A float operand promotes the result to float (numeric_join).
-        assert_eq!(rhs_value("2 + 1.5", &mut h).unwrap(), Value::Float(3.5));
-        assert_eq!(rhs_value("3.0 / 2.0", &mut h).unwrap(), Value::Float(1.5));
+        assert_eq!(rhs_value("2 + 1.5", &mut h).unwrap(), Value::m1_float(3.5));
+        assert_eq!(
+            rhs_value("3.0 / 2.0", &mut h).unwrap(),
+            Value::m1_float(1.5)
+        );
     }
 
     #[test]
     fn unsigned_arithmetic_stays_unsigned() {
         let mut h = Harness::new();
-        assert_eq!(rhs_value("10u + 5u", &mut h).unwrap(), Value::Uint(15));
+        assert_eq!(
+            rhs_value("10u + 5u", &mut h).unwrap(),
+            Value::m1_unsigned(15)
+        );
+    }
+
+    #[test]
+    fn m1_integer_arithmetic_wraps_at_32_bits() {
+        let mut h = Harness::new();
+        assert_eq!(
+            rhs_value("2147483647 + 1", &mut h).unwrap(),
+            Value::m1_integer(i32::MIN)
+        );
+        assert_eq!(
+            rhs_value("0u - 1u", &mut h).unwrap(),
+            Value::m1_unsigned(u32::MAX)
+        );
+        assert_eq!(
+            rhs_value("-1 + 0u", &mut h).unwrap(),
+            Value::m1_unsigned(u32::MAX)
+        );
+        assert_eq!(rhs_value("-1 < 0u", &mut h).unwrap(), Value::Bool(false));
+    }
+
+    #[test]
+    fn binary32_rounding_happens_at_each_expression_operation() {
+        let mut h = Harness::new();
+        assert_eq!(
+            rhs_value("16777216.0 + 1.0", &mut h).unwrap(),
+            Value::m1_float(16_777_216.0)
+        );
+        assert_eq!(rhs_value("1e-50", &mut h).unwrap(), Value::m1_float(0.0));
+        assert!(rhs_value("1e39", &mut h).is_err());
+        assert!(rhs_value("1e9999", &mut h).is_err());
     }
 
     #[test]
@@ -1201,6 +1671,18 @@ mod tests {
         assert_eq!(rhs_value("2 >= 2", &mut h).unwrap(), Value::Bool(true));
         assert_eq!(rhs_value("1 < 0", &mut h).unwrap(), Value::Bool(false));
         assert_eq!(rhs_value("2.0 <= 1.5", &mut h).unwrap(), Value::Bool(false));
+    }
+
+    #[test]
+    fn fixed_point_comparison_uses_exact_raw_storage() {
+        let left = Value::M1(M1Scalar::FixedPoint7dps(FixedPoint7dps::from_raw(
+            1_000_000_000,
+        )));
+        let right = Value::M1(M1Scalar::FixedPoint7dps(FixedPoint7dps::from_raw(
+            1_000_000_001,
+        )));
+        assert_eq!(compare(Kind::Lt, &left, &right).unwrap(), Value::Bool(true));
+        assert!(!values_equal(&left, &right).unwrap());
     }
 
     #[test]
@@ -1267,8 +1749,13 @@ mod tests {
     #[test]
     fn unary_operators() {
         let mut h = Harness::new();
-        assert_eq!(rhs_value("-5", &mut h).unwrap(), Value::Int(-5));
-        assert_eq!(rhs_value("-2.5", &mut h).unwrap(), Value::Float(-2.5));
+        assert_eq!(rhs_value("-5", &mut h).unwrap(), Value::m1_integer(-5));
+        assert_eq!(
+            rhs_value("-2147483648", &mut h).unwrap(),
+            Value::m1_integer(i32::MIN)
+        );
+        assert!(rhs_value("-2147483649", &mut h).is_err());
+        assert_eq!(rhs_value("-2.5", &mut h).unwrap(), Value::m1_float(-2.5));
         assert_eq!(rhs_value("not true", &mut h).unwrap(), Value::Bool(false));
         assert_eq!(rhs_value("!false", &mut h).unwrap(), Value::Bool(true));
     }
@@ -1276,12 +1763,27 @@ mod tests {
     #[test]
     fn bitwise_and_shift() {
         let mut h = Harness::new();
-        assert_eq!(rhs_value("12u & 10u", &mut h).unwrap(), Value::Uint(8));
-        assert_eq!(rhs_value("12u | 1u", &mut h).unwrap(), Value::Uint(13));
-        assert_eq!(rhs_value("6u ^ 3u", &mut h).unwrap(), Value::Uint(5));
-        assert_eq!(rhs_value("1u << 4u", &mut h).unwrap(), Value::Uint(16));
-        assert_eq!(rhs_value("16u >> 2u", &mut h).unwrap(), Value::Uint(4));
-        assert_eq!(rhs_value("~0u", &mut h).unwrap(), Value::Uint(u64::MAX));
+        assert_eq!(
+            rhs_value("12u & 10u", &mut h).unwrap(),
+            Value::m1_unsigned(8)
+        );
+        assert_eq!(
+            rhs_value("12u | 1u", &mut h).unwrap(),
+            Value::m1_unsigned(13)
+        );
+        assert_eq!(rhs_value("6u ^ 3u", &mut h).unwrap(), Value::m1_unsigned(5));
+        assert_eq!(
+            rhs_value("1u << 4u", &mut h).unwrap(),
+            Value::m1_unsigned(16)
+        );
+        assert_eq!(
+            rhs_value("16u >> 2u", &mut h).unwrap(),
+            Value::m1_unsigned(4)
+        );
+        assert_eq!(
+            rhs_value("~0u", &mut h).unwrap(),
+            Value::m1_unsigned(u32::MAX)
+        );
     }
 
     #[test]
@@ -1298,20 +1800,34 @@ mod tests {
         let mut h = Harness::new();
         // Real M1 code masks a signed value with a hex (unsigned) literal, e.g.
         // `(Status Word >> 8) & 0x01`. Mixed integral operands are allowed; the
-        // result is signed (per numeric_join), the bit pattern is preserved.
-        assert_eq!(rhs_value("13 & 6u", &mut h).unwrap(), Value::Int(4));
-        assert_eq!(rhs_value("6u & 13", &mut h).unwrap(), Value::Int(4));
-        // A shift of a signed value by an unsigned count.
-        assert_eq!(rhs_value("256 >> 4u", &mut h).unwrap(), Value::Int(16));
+        // result follows the left operand, and the bit pattern is preserved.
+        assert_eq!(rhs_value("13 & 6u", &mut h).unwrap(), Value::m1_integer(4));
+        assert_eq!(rhs_value("6u & 13", &mut h).unwrap(), Value::m1_unsigned(4));
+        // A shift of a signed value by an unsigned count stays signed, including
+        // arithmetic right-shift behavior for a negative left operand.
+        assert_eq!(
+            rhs_value("256 >> 4u", &mut h).unwrap(),
+            Value::m1_integer(16)
+        );
+        assert_eq!(
+            rhs_value("-8 >> 1u", &mut h).unwrap(),
+            Value::m1_integer(-4)
+        );
     }
 
     #[test]
     fn operator_precedence_via_grammar() {
         let mut h = Harness::new();
         // 2 + 3 * 4 = 14 (the grammar nests the multiply tighter).
-        assert_eq!(rhs_value("2 + 3 * 4", &mut h).unwrap(), Value::Int(14));
+        assert_eq!(
+            rhs_value("2 + 3 * 4", &mut h).unwrap(),
+            Value::m1_integer(14)
+        );
         // Parentheses override: (2 + 3) * 4 = 20.
-        assert_eq!(rhs_value("(2 + 3) * 4", &mut h).unwrap(), Value::Int(20));
+        assert_eq!(
+            rhs_value("(2 + 3) * 4", &mut h).unwrap(),
+            Value::m1_integer(20)
+        );
     }
 
     // ---- Task 11: ternary + call dispatch ----
@@ -1319,12 +1835,18 @@ mod tests {
     #[test]
     fn ternary_picks_branch() {
         let mut h = Harness::new();
-        assert_eq!(rhs_value("true ? 1 : 2", &mut h).unwrap(), Value::Int(1));
-        assert_eq!(rhs_value("false ? 1 : 2", &mut h).unwrap(), Value::Int(2));
+        assert_eq!(
+            rhs_value("true ? 1 : 2", &mut h).unwrap(),
+            Value::m1_integer(1)
+        );
+        assert_eq!(
+            rhs_value("false ? 1 : 2", &mut h).unwrap(),
+            Value::m1_integer(2)
+        );
         // The non-taken branch is not evaluated: an undefined channel there is fine.
         assert_eq!(
             rhs_value("true ? 7 : Speed", &mut h).unwrap(),
-            Value::Int(7)
+            Value::m1_integer(7)
         );
     }
 
@@ -1344,7 +1866,7 @@ mod tests {
         // builtins::dispatch and computes a real value (3).
         assert_eq!(
             rhs_value("Calculate.Max(2, 3)", &mut h).unwrap(),
-            Value::Int(3)
+            Value::m1_integer(3)
         );
     }
 

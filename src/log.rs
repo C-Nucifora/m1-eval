@@ -31,15 +31,14 @@
 //!   [`LogMeta::units`] (channel → unit) and *not* read as a value row, matching
 //!   real i2 exports. A numeric first cell means there is no units row.
 //! - **Data rows:** `t_seconds,value,value,…`. `time` is seconds, ascending;
-//!   numeric cells parse to [`Value::Float`]; an empty cell adds no keyframe (the
-//!   zero-order hold simply keeps the prior value). A non-numeric value cell (one
-//!   not in the units row) fails loud — no guessed value, ever.
+//!   numeric cells narrow to M1 binary32 for compatibility with the historical
+//!   untyped CSV format. An empty cell adds no keyframe (the zero-order hold
+//!   simply keeps the prior value). A non-numeric value cell (one not in the
+//!   units row) fails loud — no guessed value, ever.
 //! - **Resampling:** at any tick `t` a channel is sampled by zero-order hold
 //!   ([`InputSeries::sample`]) — the established, deterministic rule used
 //!   throughout the engine.
 //!
-//! [`Value::Float`]: crate::value::Value::Float
-
 use std::collections::BTreeMap;
 
 use crate::error::EvalError;
@@ -208,16 +207,16 @@ mod tests {
         let sensor = InputSeries {
             channel: "Root.CF.Sensor".to_string(),
             kind: InputKind::Series(vec![
-                (0.0, Value::Float(1.0)),
-                (0.5, Value::Float(2.0)),
-                (1.0, Value::Float(3.0)),
+                (0.0, Value::m1_float(1.0)),
+                (0.5, Value::m1_float(2.0)),
+                (1.0, Value::m1_float(3.0)),
             ]),
         };
         let engine_speed = InputSeries {
             channel: "Engine Speed".to_string(),
             kind: InputKind::Series(vec![
-                (0.0, Value::Float(800.0)),
-                (0.25, Value::Float(1200.0)),
+                (0.0, Value::m1_float(800.0)),
+                (0.25, Value::m1_float(1200.0)),
             ]),
         };
         Log {
@@ -237,7 +236,7 @@ mod tests {
         let s = log.series_for("Root.CF.Sensor").expect("Sensor present");
         assert_eq!(s.channel, "Root.CF.Sensor");
         // Zero-order-hold sampling round-trips through the stored series.
-        assert_eq!(s.sample(0.75), Value::Float(2.0));
+        assert_eq!(s.sample(0.75), Value::m1_float(2.0));
     }
 
     #[test]
@@ -275,7 +274,7 @@ mod tests {
         let log = Log {
             channels: vec![InputSeries {
                 channel: "K".to_string(),
-                kind: InputKind::Const(Value::Float(5.0)),
+                kind: InputKind::Const(Value::m1_float(5.0)),
             }],
             meta: LogMeta::default(),
         };
@@ -331,7 +330,7 @@ mod from_csv_tests {
         let es = log
             .series_for("Engine Speed")
             .expect("Engine Speed present");
-        assert_eq!(es.sample(0.0), Value::Float(800.0));
+        assert_eq!(es.sample(0.0), Value::m1_float(800.0));
         // Three data rows -> three keyframes (the units row added none).
         match &es.kind {
             InputKind::Series(points) => assert_eq!(points.len(), 3),
@@ -347,7 +346,7 @@ mod from_csv_tests {
         // No units row: meta.units is empty, and the first data row is a keyframe.
         assert!(log.meta.units.is_empty());
         let es = log.series_for("Engine Speed").expect("present");
-        assert_eq!(es.sample(0.0), Value::Float(800.0));
+        assert_eq!(es.sample(0.0), Value::m1_float(800.0));
         match &es.kind {
             InputKind::Series(points) => assert_eq!(points.len(), 2),
             other => panic!("expected Series, got {other:?}"),
@@ -369,11 +368,11 @@ mod from_csv_tests {
         let log = Log::from_csv(WITH_UNITS, "run.csv").expect("CSV parses");
         let es = log.series_for("Engine Speed").expect("present");
         // Between keyframes (0.5 and 1.0), the earlier keyframe is held.
-        assert_eq!(es.sample(0.75), Value::Float(1200.0));
+        assert_eq!(es.sample(0.75), Value::m1_float(1200.0));
         // After the last keyframe, the last value is held.
-        assert_eq!(es.sample(2.0), Value::Float(3000.0));
+        assert_eq!(es.sample(2.0), Value::m1_float(3000.0));
         // Before the first keyframe, the first value is held.
-        assert_eq!(es.sample(-1.0), Value::Float(800.0));
+        assert_eq!(es.sample(-1.0), Value::m1_float(800.0));
     }
 
     #[test]
@@ -441,8 +440,8 @@ mod from_csv_tests {
         let log = Log::from_csv(csv, "run.csv").expect("CSV parses");
         let es = log.series_for("Engine Speed").expect("present");
         // No keyframe at t=0.5, so 0.7 holds the 0.0 value (800).
-        assert_eq!(es.sample(0.7), Value::Float(800.0));
-        assert_eq!(es.sample(1.0), Value::Float(1200.0));
+        assert_eq!(es.sample(0.7), Value::m1_float(800.0));
+        assert_eq!(es.sample(1.0), Value::m1_float(1200.0));
         // Two keyframes only (the empty cell added none).
         match &es.kind {
             InputKind::Series(points) => assert_eq!(points.len(), 2),

@@ -31,7 +31,7 @@ use crate::env::CallSite;
 use crate::error::EvalError;
 use crate::expr::EvalCtx;
 use crate::ident::{Target, classify};
-use crate::value::Value;
+use crate::value::{M1Scalar, Value};
 use m1_typecheck::Project;
 use m1_typecheck::intrinsics;
 use m1_typecheck::parsed::ParsedScript;
@@ -82,43 +82,49 @@ pub fn dispatch(
         },
         CallRoute::PureLibrary(library_object) => {
             validate_arity(&library_object, object, method, args.len())?;
+            let legacy_args = legacy_builtin_arguments(args);
             let result = match library_object.as_str() {
-                "Calculate" => calculate::call(method, args)?,
-                "Limit" => limit::call(method, args)?,
-                "Convert" => convert::call(method, args)?,
+                "Calculate" => calculate::call(method, &legacy_args)?,
+                "Limit" => limit::call(method, &legacy_args)?,
+                "Convert" => convert::call(method, &legacy_args)?,
                 _ => unreachable!(),
             };
             // `Some` -> the submodule handled it. `None` -> a known-but-stateful
             // or otherwise-unimplemented method on a pure object: fail loud.
             match result {
-                Some(v) => Ok(v),
+                Some(v) => v.restore_legacy_builtin_result(),
                 None => Err(unsupported(object, method)),
             }
         }
         CallRoute::StatefulLibrary(library_object) => {
             validate_arity(&library_object, object, method, args.len())?;
-            match stateful::call(&library_object, method, args, site, ctx)? {
-                Some(v) => Ok(v),
+            let legacy_args = legacy_builtin_arguments(args);
+            match stateful::call(&library_object, method, &legacy_args, site, ctx)? {
+                Some(v) => v.restore_legacy_builtin_result(),
                 None => Err(unsupported(object, method)),
             }
         }
         CallRoute::IoLibrary(library_object) => {
-            io_stub::call(&library_object, object, method, args, ctx)
+            let legacy_args = legacy_builtin_arguments(args);
+            io_stub::call(&library_object, object, method, &legacy_args, ctx)?
+                .restore_legacy_builtin_result()
         }
         CallRoute::MathAssumption(library_object) => {
             validate_arity(&library_object, object, method, args.len())?;
-            match method {
+            let legacy_args = legacy_builtin_arguments(args);
+            let result = match method {
                 "atan2" => {
-                    let y = args[0].as_f64()?;
-                    let x = args[1].as_f64()?;
+                    let y = legacy_args[0].as_f64()?;
+                    let x = legacy_args[1].as_f64()?;
                     Ok(Value::Float(y.atan2(x)))
                 }
                 // `Math.fabs` also appears in real ECU scripts (AV-M1
                 // Control.Update): a plain absolute value, same routing
                 // rationale as `atan2`.
-                "fabs" => Ok(Value::Float(args[0].as_f64()?.abs())),
+                "fabs" => Ok(Value::Float(legacy_args[0].as_f64()?.abs())),
                 _ => Err(unsupported(object, method)),
-            }
+            }?;
+            result.restore_legacy_builtin_result()
         }
         CallRoute::EnumAsInteger => {
             validate_object_arity(object, method, args.len())?;
@@ -134,14 +140,29 @@ pub fn dispatch(
         CallRoute::Timer => {
             validate_object_arity(object, method, args.len())?;
             let object_key = timer_object_key(object, ctx);
-            match stateful::timer(method, args, object_key, ctx)? {
-                Some(value) => Ok(value),
+            let legacy_args = legacy_builtin_arguments(args);
+            match stateful::timer(method, &legacy_args, object_key, ctx)? {
+                Some(value) => value.restore_legacy_builtin_result(),
                 None => Err(unsupported(object, method)),
             }
         }
-        CallRoute::ProjectIo => io_stub::project_object_call(object, method, args, ctx),
+        CallRoute::ProjectIo => {
+            let legacy_args = legacy_builtin_arguments(args);
+            io_stub::project_object_call(object, method, &legacy_args, ctx)?
+                .restore_legacy_builtin_result()
+        }
         CallRoute::Unsupported => Err(unsupported(object, method)),
     }
+}
+
+/// Widen M1 scalar arguments for builtin engines scheduled for migration in
+/// issue #38. Core expressions, tables, project writes, and user functions do
+/// not use this compatibility path.
+fn legacy_builtin_arguments(args: &[Value]) -> Vec<Value> {
+    args.iter()
+        .cloned()
+        .map(Value::into_legacy_builtin_argument)
+        .collect()
 }
 
 /// Dispatch a bare user-function call such as `Update(...)`. Bare callees cannot
@@ -212,10 +233,10 @@ fn try_channel_set(
             detail: format!("{object}.Set expects 1 argument, got {}", args.len()),
         });
     }
-    // Coerce a numeric value written to an enum-typed channel to its enum member
-    // (M1 enum channels store an integer; `Precharge State.Set(0)` writes the
-    // member with that declared value), so the channel holds a typed enum value.
-    let value = crate::expr::coerce_for_channel(&canon, args[0].clone(), ctx.project);
+    // Apply the target channel's declared M1 family. Integer/unsigned writes use
+    // their shared 32-bit pattern, float promotion rounds to binary32, and an
+    // enum target resolves the exact member value.
+    let value = crate::expr::coerce_for_channel(&canon, args[0].clone(), ctx.project)?;
     ctx.env.set(canon.clone(), value.clone());
     if let Some(trace) = ctx.trace.as_deref_mut() {
         trace.record_channel(canon, value.clone());
@@ -295,7 +316,7 @@ fn try_table_lookup(
             if let Some(trace) = ctx.trace.as_deref_mut() {
                 trace.mark_external(canon.clone());
             }
-            return Ok(Some(Value::Float(0.0)));
+            return Ok(Some(Value::m1_float(0.0)));
         }
         None => {
             return Err(EvalError::MissingCalibration {
@@ -305,14 +326,14 @@ fn try_table_lookup(
     };
 
     // Each lookup coordinate must be numeric; collect them then interpolate.
-    let mut inputs = Vec::with_capacity(args.len());
-    for a in args {
-        inputs.push(a.as_f64()?);
-    }
+    let inputs = args
+        .iter()
+        .map(Value::m1_scalar)
+        .collect::<Result<Vec<_>, _>>()?;
     // `table::lookup` validates arity (inputs vs axes) and clamps out-of-range
     // coordinates, returning a BadCall on a mismatch.
     let value = crate::table::lookup(table, &inputs)?;
-    Ok(Some(Value::Float(value)))
+    Ok(Some(Value::M1(value)))
 }
 
 /// Attempt a table `.Get(site)` — a raw read of one body cell by flat site
@@ -365,7 +386,7 @@ fn try_table_get(
             if let Some(trace) = ctx.trace.as_deref_mut() {
                 trace.mark_external(canon.clone());
             }
-            return Ok(Some(Value::Float(0.0)));
+            return Ok(Some(Value::m1_float(0.0)));
         }
         None => {
             return Err(EvalError::MissingCalibration {
@@ -380,21 +401,38 @@ fn try_table_get(
             detail: format!("{object}.Get expects 1 site argument, got {}", args.len()),
         });
     }
-    let site = args[0].as_f64()?;
-    if site < 0.0 || site.fract() != 0.0 {
-        return Err(EvalError::BadCall {
-            detail: format!("{object}.Get site must be a non-negative integer, got {site}"),
-        });
-    }
-    let index = site as usize;
+    let index = table_site_index(&args[0]).ok_or_else(|| EvalError::BadCall {
+        detail: format!(
+            "{object}.Get site must be a non-negative M1 integer, got {:?}",
+            args[0]
+        ),
+    })?;
     match table.body.get(index) {
-        Some(v) => Ok(Some(Value::Float(*v))),
+        Some(v) => Ok(Some(Value::M1(*v))),
         None => Err(EvalError::BadCall {
             detail: format!(
                 "{object}.Get site {index} out of range for a {}-cell table body",
                 table.body.len()
             ),
         }),
+    }
+}
+
+fn table_site_index(value: &Value) -> Option<usize> {
+    match value.m1_scalar().ok()? {
+        M1Scalar::Integer(value) => usize::try_from(value).ok(),
+        M1Scalar::UnsignedInteger(value) => usize::try_from(value).ok(),
+        M1Scalar::FloatingPoint(value)
+            if value.is_finite() && value >= 0.0 && value.fract() == 0.0 =>
+        {
+            Some(value as usize)
+        }
+        M1Scalar::FixedPoint7dps(value) if value.raw() >= 0 => {
+            let raw = value.raw();
+            let scale = i32::try_from(crate::value::FixedPoint7dps::SCALE).ok()?;
+            (raw % scale == 0).then_some((raw / scale) as usize)
+        }
+        _ => None,
     }
 }
 
@@ -903,6 +941,7 @@ mod tests {
                 script_name: "Demo.Update.m1scr",
                 dt: 0.01,
                 scripts: &[],
+                signature_m1_types: None,
                 depth: 0,
                 trace: None,
             }
@@ -921,21 +960,29 @@ mod tests {
     fn calculate_max_dispatches() {
         let mut h = Harness::new();
         assert_eq!(
-            h.call("Calculate", "Max", &[Value::Int(2), Value::Int(3)])
-                .unwrap(),
-            Value::Int(3)
+            h.call(
+                "Calculate",
+                "Max",
+                &[Value::m1_integer(2), Value::m1_integer(3)]
+            )
+            .unwrap(),
+            Value::m1_integer(3)
         );
     }
 
     #[test]
     fn local_named_calculate_does_not_shadow_qualified_builtin_call() {
         let mut h = Harness::new();
-        h.env.set_local("Calculate", Value::Int(0));
+        h.env.set_local("Calculate", Value::m1_integer(0));
 
         assert_eq!(
-            h.call("Calculate", "Max", &[Value::Int(1), Value::Int(2)])
-                .unwrap(),
-            Value::Int(2)
+            h.call(
+                "Calculate",
+                "Max",
+                &[Value::m1_integer(1), Value::m1_integer(2)]
+            )
+            .unwrap(),
+            Value::m1_integer(2)
         );
     }
 
@@ -944,32 +991,36 @@ mod tests {
         let mut h = Harness::new();
 
         assert_eq!(
-            h.call("Library.Calculate", "Max", &[Value::Int(1), Value::Int(2)])
-                .unwrap(),
-            Value::Int(2)
+            h.call(
+                "Library.Calculate",
+                "Max",
+                &[Value::m1_integer(1), Value::m1_integer(2)]
+            )
+            .unwrap(),
+            Value::m1_integer(2)
         );
         assert_eq!(
             h.call(
                 "Library.Debounce",
                 "Filter",
-                &[Value::Bool(true), Value::Float(0.1)]
+                &[Value::Bool(true), Value::m1_float(0.1)]
             )
             .unwrap(),
             Value::Bool(true)
         );
         assert_eq!(
-            h.call("Library.Math", "fabs", &[Value::Float(-3.5)])
+            h.call("Library.Math", "fabs", &[Value::m1_float(-3.5)])
                 .unwrap(),
-            Value::Float(3.5)
+            Value::m1_float(3.5)
         );
         assert_eq!(
             h.call(
                 "Library.CanComms",
                 "GetFloat",
-                &[Value::Uint(1), Value::Int(2)]
+                &[Value::m1_unsigned(1), Value::m1_integer(2)]
             )
             .unwrap(),
-            Value::Float(0.0)
+            Value::m1_float(0.0)
         );
     }
 
@@ -982,7 +1033,7 @@ mod tests {
 
         let mut h = Harness::new();
         assert!(matches!(
-            h.call("Library.NoSuchObject", "Set", &[Value::Int(1)]),
+            h.call("Library.NoSuchObject", "Set", &[Value::m1_integer(1)]),
             Err(EvalError::UnsupportedBuiltin { .. })
         ));
     }
@@ -994,10 +1045,14 @@ mod tests {
             h.call(
                 "Limit",
                 "Range",
-                &[Value::Float(9.0), Value::Float(0.0), Value::Float(5.0)]
+                &[
+                    Value::m1_float(9.0),
+                    Value::m1_float(0.0),
+                    Value::m1_float(5.0)
+                ]
             )
             .unwrap(),
-            Value::Float(5.0)
+            Value::m1_float(5.0)
         );
     }
 
@@ -1005,9 +1060,9 @@ mod tests {
     fn convert_to_integer_dispatches() {
         let mut h = Harness::new();
         assert_eq!(
-            h.call("Convert", "ToInteger", &[Value::Float(2.9)])
+            h.call("Convert", "ToInteger", &[Value::m1_float(2.9)])
                 .unwrap(),
-            Value::Int(2)
+            Value::m1_integer(2)
         );
     }
 
@@ -1017,12 +1072,16 @@ mod tests {
     fn wrong_arity_is_bad_call() {
         let mut h = Harness::new();
         // Calculate.Max takes two arguments; one is a BadCall, not a guess.
-        match h.call("Calculate", "Max", &[Value::Int(1)]) {
+        match h.call("Calculate", "Max", &[Value::m1_integer(1)]) {
             Err(EvalError::BadCall { .. }) => {}
             other => panic!("expected BadCall, got {other:?}"),
         }
         // Limit.Range takes three.
-        match h.call("Limit", "Range", &[Value::Int(1), Value::Int(2)]) {
+        match h.call(
+            "Limit",
+            "Range",
+            &[Value::m1_integer(1), Value::m1_integer(2)],
+        ) {
             Err(EvalError::BadCall { .. }) => {}
             other => panic!("expected BadCall, got {other:?}"),
         }
@@ -1031,7 +1090,7 @@ mod tests {
     #[test]
     fn unknown_method_on_pure_object_is_unsupported() {
         let mut h = Harness::new();
-        match h.call("Calculate", "NotAMethod", &[Value::Int(1)]) {
+        match h.call("Calculate", "NotAMethod", &[Value::m1_integer(1)]) {
             Err(EvalError::UnsupportedBuiltin { object, method }) => {
                 assert_eq!(object, "Calculate");
                 assert_eq!(method, "NotAMethod");
@@ -1049,7 +1108,7 @@ mod tests {
         match h.call(
             "Calculate",
             "Stable",
-            &[Value::Float(1.0), Value::Float(0.1)],
+            &[Value::m1_float(1.0), Value::m1_float(0.1)],
         ) {
             Ok(Value::Bool(false)) => {}
             other => panic!("expected Ok(Bool(false)) on first tick, got {other:?}"),
@@ -1064,9 +1123,9 @@ mod tests {
         match h.call(
             "Filter",
             "FirstOrder",
-            &[Value::Float(1.0), Value::Float(0.1)],
+            &[Value::m1_float(1.0), Value::m1_float(0.1)],
         ) {
-            Ok(Value::Float(x)) => assert!((x - 1.0).abs() < 1e-9),
+            Ok(Value::M1(M1Scalar::FloatingPoint(x))) => assert!((x - 1.0).abs() < 1e-6),
             other => panic!("expected seeded Float(1.0), got {other:?}"),
         }
     }
@@ -1093,7 +1152,7 @@ mod tests {
     fn stateful_wrong_arity_is_bad_call() {
         let mut h = Harness::new();
         // Integral.Normal needs five arguments; fewer is a BadCall, not a guess.
-        match h.call("Integral", "Normal", &[Value::Float(1.0)]) {
+        match h.call("Integral", "Normal", &[Value::m1_float(1.0)]) {
             Err(EvalError::BadCall { .. }) => {}
             other => panic!("expected BadCall, got {other:?}"),
         }
@@ -1104,7 +1163,11 @@ mod tests {
         let mut h = Harness::new();
         // Delay.Signal15 is a buffered sample delay we do not implement; the
         // object is recognised but the method falls through to fail loud.
-        match h.call("Delay", "Signal15", &[Value::Float(1.0), Value::Int(3)]) {
+        match h.call(
+            "Delay",
+            "Signal15",
+            &[Value::m1_float(1.0), Value::m1_integer(3)],
+        ) {
             Err(EvalError::UnsupportedBuiltin { object, method }) => {
                 assert_eq!(object, "Delay");
                 assert_eq!(method, "Signal15");
@@ -1131,8 +1194,14 @@ mod tests {
         // real ECU scripts; we route its `atan2` to the same evaluation as
         // Calculate.InverseTan2. Coverage marks the calibration-only route as an
         // assumption, not a hardware stub.
-        match h.call("Math", "atan2", &[Value::Float(1.0), Value::Float(1.0)]) {
-            Ok(Value::Float(x)) => assert!((x - std::f64::consts::FRAC_PI_4).abs() < 1e-12),
+        match h.call(
+            "Math",
+            "atan2",
+            &[Value::m1_float(1.0), Value::m1_float(1.0)],
+        ) {
+            Ok(Value::M1(M1Scalar::FloatingPoint(x))) => {
+                assert!((x - std::f32::consts::FRAC_PI_4).abs() < 1e-6)
+            }
             other => panic!("expected Float(pi/4), got {other:?}"),
         }
     }
@@ -1141,7 +1210,7 @@ mod tests {
     fn math_atan2_wrong_arity_is_bad_call() {
         let mut h = Harness::new();
         // Math.atan2 takes two arguments (validated against intrinsics).
-        match h.call("Math", "atan2", &[Value::Float(1.0)]) {
+        match h.call("Math", "atan2", &[Value::m1_float(1.0)]) {
             Err(EvalError::BadCall { .. }) => {}
             other => panic!("expected BadCall, got {other:?}"),
         }
@@ -1178,7 +1247,7 @@ mod tests {
         let mut h = Harness::new();
         // Only `atan2` is routed from the calibration-only Math object; anything
         // else fails loud rather than being silently evaluated.
-        match h.call("Math", "Sqrt", &[Value::Float(4.0)]) {
+        match h.call("Math", "Sqrt", &[Value::m1_float(4.0)]) {
             Err(EvalError::UnsupportedBuiltin { object, method }) => {
                 assert_eq!(object, "Math");
                 assert_eq!(method, "Sqrt");
@@ -1195,26 +1264,42 @@ mod tests {
         // The mini fixture's Demo.Map is 2-D: x in {0,100}, y in {0,1}, body
         // (10,20,30,40). Corner and midpoint values come straight from table.rs.
         assert_eq!(
-            h.call("Map", "Lookup", &[Value::Float(0.0), Value::Float(0.0)])
-                .unwrap(),
-            Value::Float(10.0)
+            h.call(
+                "Map",
+                "Lookup",
+                &[Value::m1_float(0.0), Value::m1_float(0.0)]
+            )
+            .unwrap(),
+            Value::m1_float(10.0)
         );
         assert_eq!(
-            h.call("Map", "Lookup", &[Value::Float(100.0), Value::Float(1.0)])
-                .unwrap(),
-            Value::Float(40.0)
+            h.call(
+                "Map",
+                "Lookup",
+                &[Value::m1_float(100.0), Value::m1_float(1.0)]
+            )
+            .unwrap(),
+            Value::m1_float(40.0)
         );
         // Halfway in x at y=0: between 10 and 30 -> 20.
         assert_eq!(
-            h.call("Map", "Lookup", &[Value::Float(50.0), Value::Float(0.0)])
-                .unwrap(),
-            Value::Float(20.0)
+            h.call(
+                "Map",
+                "Lookup",
+                &[Value::m1_float(50.0), Value::m1_float(0.0)]
+            )
+            .unwrap(),
+            Value::m1_float(20.0)
         );
         // Out-of-range inputs clamp.
         assert_eq!(
-            h.call("Map", "Lookup", &[Value::Float(999.0), Value::Float(9.0)])
-                .unwrap(),
-            Value::Float(40.0)
+            h.call(
+                "Map",
+                "Lookup",
+                &[Value::m1_float(999.0), Value::m1_float(9.0)]
+            )
+            .unwrap(),
+            Value::m1_float(40.0)
         );
     }
 
@@ -1222,7 +1307,7 @@ mod tests {
     fn table_lookup_wrong_arity_is_bad_call() {
         let mut h = Harness::new();
         // Demo.Map has two axes; one coordinate is a BadCall.
-        match h.call("Map", "Lookup", &[Value::Float(0.0)]) {
+        match h.call("Map", "Lookup", &[Value::m1_float(0.0)]) {
             Err(EvalError::BadCall { .. }) => {}
             other => panic!("expected BadCall, got {other:?}"),
         }
@@ -1232,7 +1317,11 @@ mod tests {
     fn table_lookup_without_calibration_is_missing() {
         let mut h = Harness::empty_calib();
         // The table symbol resolves, but no calibration cells were loaded.
-        match h.call("Map", "Lookup", &[Value::Float(0.0), Value::Float(0.0)]) {
+        match h.call(
+            "Map",
+            "Lookup",
+            &[Value::m1_float(0.0), Value::m1_float(0.0)],
+        ) {
             Err(EvalError::MissingCalibration { .. }) => {}
             other => panic!("expected MissingCalibration, got {other:?}"),
         }
@@ -1256,8 +1345,8 @@ mod tests {
         // `Math.fabs` appears in real ECU scripts (Control.Update in AV-M1);
         // route it to a plain absolute value like Calculate.Absolute.
         assert_eq!(
-            h.call("Math", "fabs", &[Value::Float(-3.5)]).unwrap(),
-            Value::Float(3.5)
+            h.call("Math", "fabs", &[Value::m1_float(-3.5)]).unwrap(),
+            Value::m1_float(3.5)
         );
     }
 
@@ -1269,16 +1358,16 @@ mod tests {
         // `.Get(i)` is a raw read of body cell i (row-major, no interpolation).
         // Demo.Map's body is (10,20,30,40).
         assert_eq!(
-            h.call("Map", "Get", &[Value::Int(0)]).unwrap(),
-            Value::Float(10.0)
+            h.call("Map", "Get", &[Value::m1_integer(0)]).unwrap(),
+            Value::m1_float(10.0)
         );
         assert_eq!(
-            h.call("Map", "Get", &[Value::Int(2)]).unwrap(),
-            Value::Float(30.0)
+            h.call("Map", "Get", &[Value::m1_integer(2)]).unwrap(),
+            Value::m1_float(30.0)
         );
         assert_eq!(
-            h.call("Map", "Get", &[Value::Uint(3)]).unwrap(),
-            Value::Float(40.0)
+            h.call("Map", "Get", &[Value::m1_unsigned(3)]).unwrap(),
+            Value::m1_float(40.0)
         );
     }
 
@@ -1287,11 +1376,11 @@ mod tests {
         let mut h = Harness::new();
         // A site past the body, or a negative site, fails loud — never clamps:
         // a raw site read has no clamping semantics to borrow.
-        match h.call("Map", "Get", &[Value::Int(4)]) {
+        match h.call("Map", "Get", &[Value::m1_integer(4)]) {
             Err(EvalError::BadCall { .. }) => {}
             other => panic!("expected BadCall, got {other:?}"),
         }
-        match h.call("Map", "Get", &[Value::Int(-1)]) {
+        match h.call("Map", "Get", &[Value::m1_integer(-1)]) {
             Err(EvalError::BadCall { .. }) => {}
             other => panic!("expected BadCall, got {other:?}"),
         }
@@ -1309,7 +1398,7 @@ mod tests {
     #[test]
     fn table_get_without_calibration_is_missing() {
         let mut h = Harness::empty_calib();
-        match h.call("Map", "Get", &[Value::Int(0)]) {
+        match h.call("Map", "Get", &[Value::m1_integer(0)]) {
             Err(EvalError::MissingCalibration { .. }) => {}
             other => panic!("expected MissingCalibration, got {other:?}"),
         }
@@ -1320,7 +1409,7 @@ mod tests {
         let mut h = Harness::new();
         // `Calculate.Lookup` is not a table lookup; Calculate has no Lookup
         // overload either, so it is UnsupportedBuiltin (fail loud), not a panic.
-        match h.call("Calculate", "Lookup", &[Value::Float(0.0)]) {
+        match h.call("Calculate", "Lookup", &[Value::m1_float(0.0)]) {
             Err(EvalError::UnsupportedBuiltin { .. }) => {}
             other => panic!("expected UnsupportedBuiltin, got {other:?}"),
         }
@@ -1365,6 +1454,7 @@ mod tests {
                 script_name: "Demo.Update.m1scr",
                 dt: 0.01,
                 scripts: &[],
+                signature_m1_types: None,
                 depth: 0,
                 trace: None,
             }
@@ -1383,12 +1473,12 @@ mod tests {
         // `Drive State.Idle.AsInteger()` → 0 (ContainerOrder), via the literal form.
         assert_eq!(
             h.call("Drive State.Idle", "AsInteger", &[]).unwrap(),
-            Value::Int(0)
+            Value::m1_integer(0)
         );
         // Precharging is ContainerOrder 2.
         assert_eq!(
             h.call("Drive State.Precharging", "AsInteger", &[]).unwrap(),
-            Value::Int(2)
+            Value::m1_integer(2)
         );
     }
 
@@ -1406,7 +1496,7 @@ mod tests {
         // The value form reads the channel's current enum value and converts it.
         assert_eq!(
             h.call("Root.Demo.Mode", "AsInteger", &[]).unwrap(),
-            Value::Int(2)
+            Value::m1_integer(2)
         );
     }
 
@@ -1535,6 +1625,7 @@ mod tests {
                 script_name: "Demo.Update.m1scr",
                 dt: 0.01,
                 scripts: &[],
+                signature_m1_types: None,
                 depth: 0,
                 trace: Some(&mut self.trace),
             };
@@ -1550,27 +1641,39 @@ mod tests {
         // `Precharge State.Set(1)` writes the channel under its canonical path and
         // records the write to the trace, returning the unit value.
         let result = h
-            .call("Precharge State", "Set", &[Value::Int(1)])
+            .call("Precharge State", "Set", &[Value::m1_integer(1)])
             .expect("Channel.Set succeeds");
         assert_eq!(result, Value::Bool(true), "Set returns the unit value");
         // The canonical path now holds the written value.
-        assert_eq!(h.env.get("Root.Demo.Precharge State"), Some(&Value::Int(1)));
+        assert_eq!(
+            h.env.get("Root.Demo.Precharge State"),
+            Some(&Value::m1_unsigned(1))
+        );
         // And the write was recorded to the trace.
         assert_eq!(
             h.trace.channels.get("Root.Demo.Precharge State"),
-            Some(&vec![Value::Int(1)])
+            Some(&vec![Value::m1_unsigned(1)])
         );
     }
 
     #[test]
     fn channel_set_via_absolute_path_writes_the_channel() {
         let mut h = ProjectObjHarness::new();
-        h.call("Root.Demo.Precharge State", "Set", &[Value::Float(3.5)])
+        h.call("Root.Demo.Precharge State", "Set", &[Value::m1_unsigned(3)])
             .expect("Channel.Set on absolute path succeeds");
         assert_eq!(
             h.env.get("Root.Demo.Precharge State"),
-            Some(&Value::Float(3.5))
+            Some(&Value::m1_unsigned(3))
         );
+    }
+
+    #[test]
+    fn channel_set_rejects_float_to_integral_narrowing() {
+        let mut h = ProjectObjHarness::new();
+        let error = h
+            .call("Root.Demo.Precharge State", "Set", &[Value::m1_float(3.5)])
+            .unwrap_err();
+        assert!(matches!(error, EvalError::TypeError { .. }));
     }
 
     #[test]
@@ -1581,7 +1684,11 @@ mod tests {
             Err(EvalError::BadCall { .. }) => {}
             other => panic!("expected BadCall on zero-arg Set, got {other:?}"),
         }
-        match h.call("Precharge State", "Set", &[Value::Int(1), Value::Int(2)]) {
+        match h.call(
+            "Precharge State",
+            "Set",
+            &[Value::m1_integer(1), Value::m1_integer(2)],
+        ) {
             Err(EvalError::BadCall { .. }) => {}
             other => panic!("expected BadCall on two-arg Set, got {other:?}"),
         }
@@ -1591,7 +1698,7 @@ mod tests {
     fn timer_dispatch_requires_a_timer_receiver() {
         let mut h = ProjectObjHarness::new();
         assert_eq!(
-            h.call("Startup Delay", "Start", &[Value::Float(0.03)])
+            h.call("Startup Delay", "Start", &[Value::m1_float(0.03)])
                 .unwrap(),
             Value::Bool(true)
         );
@@ -1600,8 +1707,8 @@ mod tests {
             .unwrap()
             .as_f64()
             .unwrap();
-        assert!((remaining - 0.02).abs() < 1e-12);
-        match h.call("Precharge State", "Start", &[Value::Float(0.03)]) {
+        assert!((remaining - 0.02).abs() < 1e-7);
+        match h.call("Precharge State", "Start", &[Value::m1_float(0.03)]) {
             Err(EvalError::UnsupportedBuiltin { .. }) => {}
             other => panic!("expected channel.Start to be unsupported, got {other:?}"),
         }
@@ -1698,13 +1805,13 @@ mod tests {
         );
         let calls = [
             ("Mode", "AsInteger", vec![]),
-            ("Precharge State", "Set", vec![Value::Int(1)]),
-            ("Startup Delay", "Start", vec![Value::Float(1.0)]),
+            ("Precharge State", "Set", vec![Value::m1_integer(1)]),
+            ("Startup Delay", "Start", vec![Value::m1_float(1.0)]),
             ("Startup Delay", "Stop", vec![]),
             ("Startup Delay", "Reset", vec![]),
             ("Startup Delay", "Remaining", vec![]),
             ("Service Bits", "Update", vec![]),
-            ("Fan Output", "Set", vec![Value::Int(1)]),
+            ("Fan Output", "Set", vec![Value::m1_integer(1)]),
             ("DashVals", "TxOpen", vec![]),
             ("DashVals.Aux Switch", "GetScaled", vec![]),
             ("DashVals.Aux Switch", "Receive", vec![]),
@@ -1738,10 +1845,14 @@ mod tests {
         );
         let mut table_harness = Harness::new();
         table_harness
-            .call("Map", "Lookup", &[Value::Float(0.0), Value::Float(0.0)])
+            .call(
+                "Map",
+                "Lookup",
+                &[Value::m1_float(0.0), Value::m1_float(0.0)],
+            )
             .expect("coverage-classified table lookup dispatches");
         table_harness
-            .call("Map", "Get", &[Value::Int(0)])
+            .call("Map", "Get", &[Value::m1_integer(0)])
             .expect("coverage-classified table get dispatches");
     }
 
@@ -1752,7 +1863,10 @@ mod tests {
         let mut h = ProjectObjHarness::new();
         // A CAN message object's `.TxOpen()` cannot be evaluated offline; it
         // returns a documented opaque handle and is flagged externally driven.
-        assert_eq!(h.call("DashVals", "TxOpen", &[]).unwrap(), Value::Uint(0));
+        assert_eq!(
+            h.call("DashVals", "TxOpen", &[]).unwrap(),
+            Value::m1_unsigned(0)
+        );
         assert!(h.trace.is_external("DashVals.TxOpen"));
     }
 
@@ -1787,7 +1901,7 @@ mod tests {
         // whole-project run does not abort on every CAN read.
         assert_eq!(
             h.call("DashVals.Aux Switch", "GetScaled", &[]).unwrap(),
-            Value::Float(0.0)
+            Value::m1_float(0.0)
         );
         assert!(h.trace.is_external("DashVals.Aux Switch.GetScaled"));
     }
@@ -1797,10 +1911,10 @@ mod tests {
         let mut h = ProjectObjHarness::new();
         // A scenario can externally drive a CAN read (e.g. from a log replay).
         h.env
-            .set_io_override("DashVals.Aux Switch.GetScaled", Value::Float(42.0));
+            .set_io_override("DashVals.Aux Switch.GetScaled", Value::m1_float(42.0));
         assert_eq!(
             h.call("DashVals.Aux Switch", "GetScaled", &[]).unwrap(),
-            Value::Float(42.0)
+            Value::m1_float(42.0)
         );
         assert!(h.trace.is_external("DashVals.Aux Switch.GetScaled"));
     }
@@ -1963,10 +2077,10 @@ mod tests {
                 .iter()
                 .map(|param| match param.ty.as_str() {
                     "Boolean" => Value::Bool(true),
-                    "Integer" => Value::Int(1),
-                    "UnsignedInteger" => Value::Uint(1),
+                    "Integer" => Value::m1_integer(1),
+                    "UnsignedInteger" => Value::m1_unsigned(1),
                     "String" => Value::Str("x".to_string()),
-                    _ => Value::Float(1.0),
+                    _ => Value::m1_float(1.0),
                 })
                 .collect();
             let mut harness = Harness::new();

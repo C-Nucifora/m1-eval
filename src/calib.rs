@@ -19,10 +19,11 @@
 //! - A `<Parameter Name="...">` holds a single `<Cell Type="..." Unit="...">`.
 //!   Cell content may be a `<![CDATA[...]]>` block or plain text; `roxmltree`'s
 //!   `Node::text()` returns the CDATA content either way.
-//! - Numbers may be in scientific notation (e.g. `1.0000e-003`); `f64::from_str`
-//!   handles that.
-//! - `enum` cells carry a non-numeric member name (e.g. `On`). They are not
-//!   numeric calibration values, so they are skipped here (and surface as a
+//! - Numbers may be in scientific notation (e.g. `1.0000e-003`). They are parsed
+//!   according to the cell's declared type and restored to their M1-width scalar
+//!   family. Untyped and historical `f64` cells narrow to M1 binary32.
+//! - `enum` cells carry a non-numeric member name (e.g. `On`), and `bool` cells
+//!   are not numeric calibration values. Both are skipped here (and surface as
 //!   `MissingCalibration` if some script later reads them as a number).
 //! - A `<Table Name="...">` has ordered `<X>`/`<Y>`/`<Z>` axis children, each
 //!   wrapping a `<Cells>` of breakpoint `<Cell>`s, plus a `<Body><Cells>` of
@@ -34,6 +35,9 @@
 //! kept out of this pure reader.
 
 use crate::error::EvalError;
+#[cfg(test)]
+use crate::value::FixedPoint7dps;
+use crate::value::{M1Scalar, M1ScalarKind, Value};
 use std::collections::HashMap;
 
 /// A calibration table's concrete numbers: one breakpoint vector per input
@@ -48,9 +52,9 @@ use std::collections::HashMap;
 #[derive(Debug, Clone, PartialEq)]
 pub struct CalTable {
     /// Breakpoint values per input axis, outermost first.
-    pub axes: Vec<Vec<f64>>,
+    pub axes: Vec<Vec<M1Scalar>>,
     /// Flat body cells, row-major with axis 0 outermost.
-    pub body: Vec<f64>,
+    pub body: Vec<M1Scalar>,
 }
 
 /// All numeric calibration values read from a `.m1cfg`: scalar parameters and
@@ -58,7 +62,7 @@ pub struct CalTable {
 #[derive(Debug, Clone, Default, PartialEq)]
 pub struct Calibration {
     /// Scalar parameter values, keyed by `<Parameter Name>`.
-    pub params: HashMap<String, f64>,
+    pub params: HashMap<String, M1Scalar>,
     /// Table values, keyed by `<Table Name>`.
     pub tables: HashMap<String, CalTable>,
 }
@@ -66,8 +70,9 @@ pub struct Calibration {
 impl Calibration {
     /// Parse a `.m1cfg` document's numeric values from its XML text.
     ///
-    /// Fails loud only on malformed XML; individual non-numeric cells (e.g.
-    /// `enum` members) are skipped rather than guessed.
+    /// Malformed XML, unsupported numeric types, and values outside their M1
+    /// storage range fail loud. Enum and Boolean cells are skipped because they
+    /// are not numeric calibration values.
     pub fn from_m1cfg_str(xml: &str) -> Result<Calibration, EvalError> {
         let doc = roxmltree::Document::parse(xml).map_err(|e| EvalError::MissingCalibration {
             path: format!(".m1cfg parse error: {e}"),
@@ -81,10 +86,10 @@ impl Calibration {
             let Some(cell) = param.children().find(|c| c.has_tag_name("Cell")) else {
                 continue;
             };
-            // Skip non-numeric cells (enum members etc.) — they are not
+            // Skip non-numeric cells (enum members and booleans) — they are not
             // calibration *numbers*. A script that later reads such a value as
             // a number will fail loud at that read, not here.
-            if let Some(v) = cell_value(cell) {
+            if let Some(v) = cell_value(cell, cell.attribute("Type"), name)? {
                 params.insert(name.to_string(), v);
             }
         }
@@ -101,7 +106,7 @@ impl Calibration {
     }
 
     /// The scalar value of a parameter, if the `.m1cfg` provided a numeric one.
-    pub fn param(&self, path: &str) -> Option<f64> {
+    pub fn param(&self, path: &str) -> Option<M1Scalar> {
         self.params.get(path).copied()
     }
 
@@ -111,24 +116,72 @@ impl Calibration {
     }
 }
 
-/// Parse a single `<Cell>` element's text as an `f64`. Returns `None` for
-/// empty or non-numeric content (e.g. an enum member name).
-fn cell_value(cell: roxmltree::Node<'_, '_>) -> Option<f64> {
-    let text = cell.text()?.trim();
-    text.parse::<f64>().ok()
+/// Parse one calibration cell according to its declared M1 storage type.
+/// Enum and Boolean cells are non-numeric and return `None`. An absent type uses the named
+/// legacy-untyped compatibility rule: old configuration files treated every
+/// numeric cell as floating point, so the value is narrowed to binary32.
+fn cell_value(
+    cell: roxmltree::Node<'_, '_>,
+    declared_type: Option<&str>,
+    context: &str,
+) -> Result<Option<M1Scalar>, EvalError> {
+    let Some(text) = cell.text().map(str::trim).filter(|text| !text.is_empty()) else {
+        return Ok(None);
+    };
+    let ty = declared_type.unwrap_or("legacy-untyped-f32");
+    let width_error = || EvalError::MissingCalibration {
+        path: format!("calibration cell in {context} does not fit M1 type {ty}: {text:?}"),
+    };
+
+    let scalar = match ty {
+        "enum" | "bool" => return Ok(None),
+        "f32" | "f64" | "legacy-untyped-f32" => {
+            let host = text.parse::<f64>().map_err(|_| width_error())?;
+            let narrowed = host as f32;
+            if !host.is_finite() || narrowed.is_infinite() {
+                return Err(width_error());
+            }
+            M1Scalar::FloatingPoint(narrowed)
+        }
+        "s8" | "s16" | "s32" | "s64" => text
+            .parse::<i64>()
+            .ok()
+            .and_then(|value| i32::try_from(value).ok())
+            .map(M1Scalar::Integer)
+            .ok_or_else(width_error)?,
+        "u8" | "u16" | "u32" | "u64" => text
+            .parse::<u64>()
+            .ok()
+            .and_then(|value| u32::try_from(value).ok())
+            .map(M1Scalar::UnsignedInteger)
+            .ok_or_else(width_error)?,
+        "FixedPoint7dps" | "fixed7dps" => {
+            let host = text.parse::<f64>().map_err(|_| width_error())?;
+            Value::Float(host)
+                .try_as_m1_scalar_for(M1ScalarKind::FixedPoint7dps)
+                .map_err(|_| width_error())?
+        }
+        other => {
+            return Err(EvalError::MissingCalibration {
+                path: format!("unsupported calibration cell type {other:?} in {context}"),
+            });
+        }
+    };
+    Ok(Some(scalar))
 }
 
 /// Collect the `<Cell>` breakpoint/body values under a `<Cells>` wrapper found
 /// directly inside `parent` (an axis `<X>/<Y>/<Z>` or a `<Body>`). Non-numeric
 /// cells fail loud, since a table cannot be silently missing interpolation
 /// data.
-fn cells_values(parent: roxmltree::Node<'_, '_>, ctx: &str) -> Result<Vec<f64>, EvalError> {
+fn cells_values(parent: roxmltree::Node<'_, '_>, ctx: &str) -> Result<Vec<M1Scalar>, EvalError> {
     let Some(cells) = parent.children().find(|c| c.has_tag_name("Cells")) else {
         return Ok(Vec::new());
     };
     let mut out = Vec::new();
+    let declared_type = cells.attribute("Type");
     for cell in cells.children().filter(|c| c.has_tag_name("Cell")) {
-        match cell_value(cell) {
+        match cell_value(cell, cell.attribute("Type").or(declared_type), ctx)? {
             Some(v) => out.push(v),
             None => {
                 return Err(EvalError::MissingCalibration {
@@ -161,6 +214,10 @@ fn parse_table(tbl: roxmltree::Node<'_, '_>) -> Result<CalTable, EvalError> {
 mod tests {
     use super::*;
 
+    fn f(value: f32) -> M1Scalar {
+        M1Scalar::FloatingPoint(value)
+    }
+
     /// Synthetic 2-D table + scalar, mirroring the m1cfg fixture shape:
     /// `<Configuration>` root with `<Parameter>`/`<Table>` entries.
     const XML: &str = r#"<Configuration>
@@ -175,12 +232,12 @@ mod tests {
     #[test]
     fn reads_param_and_table() {
         let c = Calibration::from_m1cfg_str(XML).unwrap();
-        assert_eq!(c.param("Root.A.Gain"), Some(2.5));
+        assert_eq!(c.param("Root.A.Gain"), Some(f(2.5)));
         let t = c.table("Root.A.Map").unwrap();
         assert_eq!(t.axes.len(), 2);
-        assert_eq!(t.axes[0], vec![0.0, 100.0]);
-        assert_eq!(t.axes[1], vec![0.0, 1.0]);
-        assert_eq!(t.body, vec![10.0, 20.0, 30.0, 40.0]);
+        assert_eq!(t.axes[0], vec![f(0.0), f(100.0)]);
+        assert_eq!(t.axes[1], vec![f(0.0), f(1.0)]);
+        assert_eq!(t.body, vec![f(10.0), f(20.0), f(30.0), f(40.0)]);
     }
 
     /// A trimmed, *synthetic* approximation of the real export shape: root
@@ -194,6 +251,9 @@ mod tests {
    <Cell Type="enum">
 <![CDATA[On]]>
    </Cell>
+  </Parameter>
+  <Parameter Name="Outputs.Logging.Enabled">
+   <Cell Type="bool"><![CDATA[true]]></Cell>
   </Parameter>
   <Parameter Name="Inputs.APPS.APPS1.Offset">
    <Cell Type="f32" Unit="V">
@@ -211,13 +271,17 @@ mod tests {
     #[test]
     fn reads_real_export_shape() {
         let c = Calibration::from_m1cfg_str(REAL_SHAPE_XML).unwrap();
-        // CDATA + scientific notation parse to f64.
-        assert!((c.param("Inputs.APPS.APPS1.Offset").unwrap() - 3.6701319217681885).abs() < 1e-9);
+        // CDATA + scientific notation narrows to the declared binary32 value.
+        assert_eq!(c.param("Inputs.APPS.APPS1.Offset"), Some(f(3.670_132_f32)));
         assert!(
-            (c.param("Inputs.APPS.CompareThreshold").unwrap() - 0.20000000298023224).abs() < 1e-12
+            (c.param("Inputs.APPS.CompareThreshold").unwrap().as_f64() - 0.20000000298023224).abs()
+                < 1e-12
         );
         // The enum cell is not a numeric calibration value: skipped, not guessed.
         assert_eq!(c.param("Outputs.Logging.LVLogging"), None);
+        // Boolean storage is also outside this numeric calibration model and
+        // must not make an otherwise valid configuration unloadable.
+        assert_eq!(c.param("Outputs.Logging.Enabled"), None);
     }
 
     #[test]
@@ -246,7 +310,55 @@ mod tests {
         let c = Calibration::from_m1cfg_str(xml).unwrap();
         let t = c.table("Root.Curve").unwrap();
         assert_eq!(t.axes.len(), 1);
-        assert_eq!(t.axes[0], vec![0.0, 1.0, 2.0]);
-        assert_eq!(t.body, vec![5.0, 15.0, 25.0]);
+        assert_eq!(t.axes[0], vec![f(0.0), f(1.0), f(2.0)]);
+        assert_eq!(t.body, vec![f(5.0), f(15.0), f(25.0)]);
+    }
+
+    #[test]
+    fn cell_types_preserve_signedness_and_reject_width_overflow() {
+        let xml = r#"<Configuration>
+          <Parameter Name="Signed"><Cell Type="s32">-2147483648</Cell></Parameter>
+          <Parameter Name="Unsigned"><Cell Type="u32">4294967295</Cell></Parameter>
+          <Parameter Name="Fixed"><Cell Type="FixedPoint7dps">1.2345678</Cell></Parameter>
+        </Configuration>"#;
+        let calibration = Calibration::from_m1cfg_str(xml).unwrap();
+        assert_eq!(
+            calibration.param("Signed"),
+            Some(M1Scalar::Integer(i32::MIN))
+        );
+        assert_eq!(
+            calibration.param("Unsigned"),
+            Some(M1Scalar::UnsignedInteger(u32::MAX))
+        );
+        assert_eq!(
+            calibration.param("Fixed"),
+            Some(M1Scalar::FixedPoint7dps(FixedPoint7dps::from_raw(
+                12_345_678
+            )))
+        );
+
+        let overflow = r#"<Configuration>
+          <Parameter Name="Bad"><Cell Type="u32">4294967296</Cell></Parameter>
+        </Configuration>"#;
+        let error = Calibration::from_m1cfg_str(overflow).unwrap_err();
+        assert!(format!("{error}").contains("u32"), "{error}");
+
+        let float_widths = r#"<Configuration>
+          <Parameter Name="Tiny"><Cell Type="f32">1e-50</Cell></Parameter>
+        </Configuration>"#;
+        let calibration = Calibration::from_m1cfg_str(float_widths).unwrap();
+        assert_eq!(calibration.param("Tiny"), Some(f(0.0)));
+
+        let float_overflow = r#"<Configuration>
+          <Parameter Name="Huge"><Cell Type="f32">1e39</Cell></Parameter>
+        </Configuration>"#;
+        let error = Calibration::from_m1cfg_str(float_overflow).unwrap_err();
+        assert!(format!("{error}").contains("f32"), "{error}");
+
+        let host_overflow = r#"<Configuration>
+          <Parameter Name="Huge"><Cell Type="f32">1e9999</Cell></Parameter>
+        </Configuration>"#;
+        let error = Calibration::from_m1cfg_str(host_overflow).unwrap_err();
+        assert!(format!("{error}").contains("f32"), "{error}");
     }
 }

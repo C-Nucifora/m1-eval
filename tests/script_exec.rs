@@ -40,7 +40,7 @@ fn demo_update_script_computes_output() {
         .expect("Demo.Update.m1scr discovered");
 
     let mut env = Env::new();
-    env.set("Root.Demo.Speed", Value::Float(20.0));
+    env.set("Root.Demo.Speed", Value::m1_float(20.0));
     let mut state = StateStore::new();
     let mut trace = Trace::new();
     trace.push_tick(0.0);
@@ -56,6 +56,7 @@ fn demo_update_script_computes_output() {
         script_name: &script.name,
         dt: 0.01,
         scripts: &loaded.scripts,
+        signature_m1_types: Some(&loaded.signature_m1_types),
         depth: 0,
         trace: Some(&mut trace),
     };
@@ -63,11 +64,11 @@ fn demo_update_script_computes_output() {
     exec_script(&root, &mut ctx).expect("script executes end to end");
 
     // The output channel holds the scaled speed.
-    assert_eq!(env.get("Root.Demo.Output"), Some(&Value::Float(50.0)));
+    assert_eq!(env.get("Root.Demo.Output"), Some(&Value::m1_float(50.0)));
     // And it was recorded into the trace's channel column.
     assert_eq!(
         trace.channels.get("Root.Demo.Output"),
-        Some(&vec![Value::Float(50.0)])
+        Some(&vec![Value::m1_float(50.0)])
     );
 }
 
@@ -84,9 +85,9 @@ fn demo_update_is_deterministic_in_inputs() {
     let script = &loaded.scripts[0];
     let root = script.cst.root();
 
-    let run = |speed: f64| -> Value {
+    let run = |speed: f32| -> Value {
         let mut env = Env::new();
-        env.set("Root.Demo.Speed", Value::Float(speed));
+        env.set("Root.Demo.Speed", Value::m1_float(speed));
         let mut state = StateStore::new();
         let mut ctx = EvalCtx {
             project: &loaded.project,
@@ -98,6 +99,7 @@ fn demo_update_is_deterministic_in_inputs() {
             script_name: &script.name,
             dt: 0.01,
             scripts: &loaded.scripts,
+            signature_m1_types: Some(&loaded.signature_m1_types),
             depth: 0,
             trace: None,
         };
@@ -105,8 +107,8 @@ fn demo_update_is_deterministic_in_inputs() {
         env.get("Root.Demo.Output").cloned().expect("output set")
     };
 
-    assert_eq!(run(20.0), Value::Float(50.0));
-    assert_eq!(run(8.0), Value::Float(20.0));
+    assert_eq!(run(20.0), Value::m1_float(50.0));
+    assert_eq!(run(8.0), Value::m1_float(20.0));
     // Same input, same output (no wall-clock / RNG).
     assert_eq!(run(20.0), run(20.0));
 }

@@ -19,7 +19,7 @@
 //!
 //! 1. **Save** the caller frame: a snapshot of `env.locals` and the `Out` slot.
 //! 2. **Enter** a fresh local frame (`Env::enter_function`) and bind each
-//!    declared parameter `(name, _)` as the local `In.<name>` (exactly the key
+//!    declared parameter `(name, type)` as an M1-width local `In.<name>` (exactly the key
 //!    `m1-typecheck`'s `resolve` hands `In.<Param>` references, and that
 //!    `ident::classify` maps to `Target::Local("In.<param>")`).
 //! 3. **Execute** the callee body with `ctx.group`/`ctx.fn_symbol`/
@@ -45,7 +45,7 @@
 //! overflowing the stack.
 
 use crate::error::EvalError;
-use crate::expr::EvalCtx;
+use crate::expr::{EvalCtx, coerce_for_declared_type};
 use crate::ident::{Target, classify};
 use crate::stmt::exec_script;
 use crate::value::Value;
@@ -141,6 +141,27 @@ pub fn call(
         });
     }
 
+    // Apply the same target-family conversion as assignment before switching
+    // frames. Computing every binding first means a conversion error cannot
+    // leave the caller frame half-replaced.
+    let bound_args = match &in_params {
+        Some(params) => params
+            .iter()
+            .zip(args.iter())
+            .map(|((name, ty), value)| {
+                let target = format!("{canon}.In.{name}");
+                match ctx
+                    .signature_m1_types
+                    .and_then(|types| types.param_kind(&canon, name))
+                {
+                    Some(kind) => crate::expr::coerce_for_scalar_kind(&target, value.clone(), kind),
+                    None => coerce_for_declared_type(&target, value.clone(), *ty, ctx.project),
+                }
+            })
+            .collect::<Result<Vec<_>, _>>()?,
+        None => args.to_vec(),
+    };
+
     // The callee's lexical context.
     let callee_group = ctx.project.group_for_script(&script.name);
     let callee_script_name = script.name.clone();
@@ -155,8 +176,8 @@ pub fn call(
     //    local `In.<name>` the callee body reads.
     ctx.env.enter_function();
     if let Some(params) = &in_params {
-        for ((name, _ty), value) in params.iter().zip(args.iter()) {
-            ctx.env.set_local(format!("In.{name}"), value.clone());
+        for ((name, _ty), value) in params.iter().zip(bound_args) {
+            ctx.env.set_local(format!("In.{name}"), value);
         }
     }
 
@@ -184,6 +205,7 @@ pub fn call(
             script_name: &callee_script_name,
             dt: ctx.dt,
             scripts: ctx.scripts,
+            signature_m1_types: ctx.signature_m1_types,
             depth: ctx.depth + 1,
             trace: ctx.trace.as_deref_mut(),
         };
@@ -224,6 +246,7 @@ mod tests {
     use crate::calib::Calibration;
     use crate::env::{Env, StateStore};
     use crate::loader::Loaded;
+    use crate::value::M1Scalar;
     use std::path::Path;
 
     /// A harness over the synthetic `userfn` fixture: a caller (`Caller.Update`)
@@ -267,6 +290,7 @@ mod tests {
                 script_name: "Caller.Update.m1scr",
                 dt: 0.01,
                 scripts,
+                signature_m1_types: Some(&self.loaded.signature_m1_types),
                 depth: 0,
                 trace: None,
             };
@@ -279,13 +303,56 @@ mod tests {
         let mut h = Harness::new();
         // Helper.Compute(3.0) → Out = In.x * 2.0 = 6.0.
         assert_eq!(
-            h.call("Root.Helper.Compute", &[Value::Float(3.0)]).unwrap(),
-            Some(Value::Float(6.0))
+            h.call("Root.Helper.Compute", &[Value::m1_float(3.0)])
+                .unwrap(),
+            Some(Value::m1_float(6.0))
         );
         // And the group-relative spelling the caller would write resolves too.
         assert_eq!(
-            h.call("Helper.Compute", &[Value::Float(5.0)]).unwrap(),
-            Some(Value::Float(10.0))
+            h.call("Helper.Compute", &[Value::m1_float(5.0)]).unwrap(),
+            Some(Value::m1_float(10.0))
+        );
+    }
+
+    #[test]
+    fn signature_types_coerce_parameters_and_returns_to_binary32() {
+        let mut h = Harness::new();
+        assert_eq!(
+            h.call("Root.Helper.Echo", &[Value::m1_integer(7)]).unwrap(),
+            Some(Value::m1_float(7.0))
+        );
+        assert_eq!(
+            h.call("Root.Helper.ReturnInt", &[]).unwrap(),
+            Some(Value::m1_float(7.0))
+        );
+    }
+
+    #[test]
+    fn raw_signature_metadata_directs_fixed_point_boundaries() {
+        let mut h = Harness::new();
+        let fixed = Value::M1(M1Scalar::FixedPoint7dps(
+            crate::value::FixedPoint7dps::from_raw(12_345_678),
+        ));
+        assert_eq!(
+            h.call("Root.Helper.FixedEcho", std::slice::from_ref(&fixed))
+                .unwrap(),
+            Some(fixed)
+        );
+        assert!(
+            h.call("Root.Helper.FixedEcho", &[Value::m1_float(1.0)])
+                .is_err()
+        );
+        assert_eq!(
+            h.call("Root.Helper.FixedToFloat", &[Value::m1_float(0.0)])
+                .unwrap(),
+            Some(Value::m1_float(0.0))
+        );
+        assert_eq!(
+            h.call("Root.Helper.InferredFixed", &[Value::m1_float(0.0)])
+                .unwrap(),
+            Some(Value::M1(M1Scalar::FixedPoint7dps(
+                crate::value::FixedPoint7dps::ZERO,
+            )))
         );
     }
 
@@ -294,9 +361,11 @@ mod tests {
         let mut h = Harness::new();
         // Seed a caller local; calling the helper (which binds its own In.x and
         // runs in a fresh frame) must not clobber it.
-        h.env.set_local("y", Value::Int(42));
-        let _ = h.call("Root.Helper.Compute", &[Value::Float(1.0)]).unwrap();
-        assert_eq!(h.env.get_local("y"), Some(&Value::Int(42)));
+        h.env.set_local("y", Value::m1_integer(42));
+        let _ = h
+            .call("Root.Helper.Compute", &[Value::m1_float(1.0)])
+            .unwrap();
+        assert_eq!(h.env.get_local("y"), Some(&Value::m1_integer(42)));
         // The callee's In.x binding did NOT leak into the caller frame.
         assert_eq!(h.env.get_local("In.x"), None);
         // Nor did the callee's Out slot.
@@ -312,7 +381,7 @@ mod tests {
         // the enclosing group before classification.
         assert_eq!(
             h.call("This.Sub.Checkup", &[]).unwrap(),
-            Some(Value::Float(7.0))
+            Some(Value::m1_float(7.0))
         );
     }
 
@@ -337,7 +406,7 @@ mod tests {
         }
         match h.call(
             "Root.Helper.Compute",
-            &[Value::Float(1.0), Value::Float(2.0)],
+            &[Value::m1_float(1.0), Value::m1_float(2.0)],
         ) {
             Err(EvalError::BadCall { .. }) => {}
             other => panic!("expected BadCall on two args, got {other:?}"),
@@ -351,7 +420,7 @@ mod tests {
         // Without a guard this overflows the stack; the depth guard turns it into
         // a fail-loud UnsupportedConstruct instead.
         let err = h
-            .call("Root.Recur.Loop", &[Value::Float(1.0)])
+            .call("Root.Recur.Loop", &[Value::m1_float(1.0)])
             .expect_err("unbounded recursion fails loud");
         assert!(
             err.to_string().contains("Recur.Loop.m1scr"),
@@ -374,12 +443,14 @@ mod tests {
         // Two calls with different arguments compute independently — the second
         // does not see the first's In.x (fresh frame each time).
         assert_eq!(
-            h.call("Root.Helper.Compute", &[Value::Float(2.0)]).unwrap(),
-            Some(Value::Float(4.0))
+            h.call("Root.Helper.Compute", &[Value::m1_float(2.0)])
+                .unwrap(),
+            Some(Value::m1_float(4.0))
         );
         assert_eq!(
-            h.call("Root.Helper.Compute", &[Value::Float(7.0)]).unwrap(),
-            Some(Value::Float(14.0))
+            h.call("Root.Helper.Compute", &[Value::m1_float(7.0)])
+                .unwrap(),
+            Some(Value::m1_float(14.0))
         );
     }
 }

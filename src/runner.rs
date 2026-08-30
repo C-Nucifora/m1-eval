@@ -51,6 +51,8 @@ use crate::scenario::{InputSeries, RunMode, Scenario};
 use crate::stmt::exec_script;
 use crate::summary::io_sets;
 use crate::trace::Trace;
+#[cfg(test)]
+use crate::value::M1Scalar;
 use crate::value::Value;
 use m1_typecheck::parsed::ParsedScript;
 use std::collections::{BTreeMap, BTreeSet, HashMap};
@@ -481,10 +483,12 @@ fn tick_loop(
     // its own, and its stateful operators see one nominal step.
     if !startup.is_empty() {
         for (path, series) in &inputs {
-            env.set(path.clone(), series.sample(0.0));
+            let value = crate::expr::coerce_for_channel(path, series.sample(0.0), &loaded.project)?;
+            env.set(path.clone(), value);
         }
         for (path, series) in &overrides {
-            env.set(path.clone(), series.sample(0.0));
+            let value = crate::expr::coerce_for_channel(path, series.sample(0.0), &loaded.project)?;
+            env.set(path.clone(), value);
         }
         for io in &scenario.io {
             env.set_io_override(io.call.clone(), io.sample(0.0));
@@ -501,6 +505,7 @@ fn tick_loop(
                 script_name: &sched.script.name,
                 dt: 1.0 / base_rate_hz,
                 scripts: &loaded.scripts,
+                signature_m1_types: Some(&loaded.signature_m1_types),
                 depth: 0,
                 // No trace: no tick is open yet, and record_channel appends
                 // blindly — a startup record would desync columns from the time
@@ -520,17 +525,17 @@ fn tick_loop(
         //    channel `.Set` applies — so script comparisons against member
         //    literals see a typed enum, not a bare number.
         for (path, series) in &inputs {
-            let value = crate::expr::coerce_for_channel(path, series.sample(t), &loaded.project);
+            let value = crate::expr::coerce_for_channel(path, series.sample(t), &loaded.project)?;
             env.set(path.clone(), value);
         }
         for (path, series) in &overrides {
-            let value = crate::expr::coerce_for_channel(path, series.sample(t), &loaded.project);
+            let value = crate::expr::coerce_for_channel(path, series.sample(t), &loaded.project)?;
             env.set(path.clone(), value);
         }
         // IO-call overrides are resampled on the same grid. The key is a call
-        // spelling (`"Object.Method"`), not a symbol path — no canonicalisation,
-        // no channel-type coercion; the evaluator's IO dispatch reads it back
-        // verbatim (`Env::io_override`) before any documented or typed stub.
+        // spelling (`"Object.Method"`), not a symbol path, so it is not
+        // canonicalised here. IO dispatch restores the sampled value to the
+        // method's declared M1 return family before script execution.
         for io in &scenario.io {
             env.set_io_override(io.call.clone(), io.sample(t));
         }
@@ -557,6 +562,7 @@ fn tick_loop(
                 script_name: &sched.script.name,
                 dt: plan.dt,
                 scripts: &loaded.scripts,
+                signature_m1_types: Some(&loaded.signature_m1_types),
                 depth: 0,
                 trace: Some(&mut trace),
             };
@@ -1100,7 +1106,7 @@ pub fn run_counterfactual(
         //    one landing on an enum-typed channel is coerced to the member with
         //    that declared value, exactly as scenario inputs and `.Set` are.
         for (path, series) in &log_inputs {
-            let value = crate::expr::coerce_for_channel(path, series.sample(t), &loaded.project);
+            let value = crate::expr::coerce_for_channel(path, series.sample(t), &loaded.project)?;
             env.set(path.clone(), value);
         }
 
@@ -1140,6 +1146,7 @@ pub fn run_counterfactual(
                         script_name: CF_OVERRIDE_SCRIPT,
                         dt: 1.0 / base_rate_hz,
                         scripts: &loaded.scripts,
+                        signature_m1_types: Some(&loaded.signature_m1_types),
                         depth: 0,
                         trace: None,
                     };
@@ -1149,6 +1156,7 @@ pub fn run_counterfactual(
             pending.push((ov.channel().to_string(), value));
         }
         for (path, value) in pending {
+            let value = crate::expr::coerce_for_channel(&path, value, &loaded.project)?;
             env.set(path, value);
         }
 
@@ -1175,6 +1183,7 @@ pub fn run_counterfactual(
                 script_name: &sched.script.name,
                 dt: plan.dt,
                 scripts: &loaded.scripts,
+                signature_m1_types: Some(&loaded.signature_m1_types),
                 depth: 0,
                 trace: Some(&mut trace),
             };
@@ -1390,7 +1399,7 @@ mod tests {
             base_rate_hz: 100.0,
             inputs: vec![InputSeries {
                 channel: "Root.Demo.Mode".to_string(),
-                kind: InputKind::Const(Value::Int(2)),
+                kind: InputKind::Const(Value::m1_integer(2)),
             }],
             overrides: vec![],
             io: vec![],
@@ -1402,11 +1411,10 @@ mod tests {
     }
 
     #[test]
-    fn eval_error_names_failing_script_and_tick_time() {
-        // A fail-loud abort must say WHERE it happened: the script and the tick
-        // instant. Drive Speed with a series that turns non-numeric at t = 0.5 s
-        // — the first three ticks evaluate, then `Speed * Gain` is arithmetic
-        // on a string, and the error names Demo.Update at that tick (not tick 0).
+    fn incompatible_scenario_input_names_the_declared_channel_family() {
+        // A scenario value cannot change a channel's declared M1 storage family.
+        // The first incompatible sample fails at the seeding boundary before it
+        // can enter the evaluator as a falsely typed f32 channel.
         let loaded = mini();
         let scenario = Scenario {
             mode: RunMode::Function("Demo.Update".to_string()),
@@ -1415,7 +1423,7 @@ mod tests {
             inputs: vec![InputSeries {
                 channel: "Root.Demo.Speed".to_string(),
                 kind: InputKind::Series(vec![
-                    (0.0, Value::Float(1.0)),
+                    (0.0, Value::m1_float(1.0)),
                     (0.5, Value::Str("oops".to_string())),
                 ]),
             }],
@@ -1423,20 +1431,13 @@ mod tests {
             io: vec![],
             allow_default_inputs: false,
         };
-        let err = run(&loaded, &scenario).expect_err("string arithmetic fails loud");
+        let err = run(&loaded, &scenario).expect_err("string input fails loud");
         let msg = err.to_string();
         assert!(
-            msg.contains("Demo.Update.m1scr"),
-            "error names the failing script: {msg}"
-        );
-        assert!(
-            msg.contains("t = 0.500 s"),
-            "error names the failing tick instant: {msg}"
+            msg.contains("Root.Demo.Speed") && msg.contains("FloatingPoint"),
+            "error names the channel and required family: {msg}"
         );
         assert!(msg.contains("type error"), "inner error preserved: {msg}");
-        // The inner error stays reachable for callers that match on it.
-        let source = std::error::Error::source(&err).expect("wrapped error has a source");
-        assert!(source.to_string().contains("type error"));
     }
 
     #[test]
@@ -1466,10 +1467,10 @@ mod tests {
     }
 
     #[test]
-    fn eval_error_names_nested_failing_script() {
-        // Caller.Update invokes Helper.Compute inline. Passing a string reaches
-        // the helper and fails in its arithmetic, so the context must name the
-        // helper script where the error actually arose, not the outer caller.
+    fn incompatible_nested_call_input_fails_at_scenario_boundary() {
+        // The caller channel is f32, so an incompatible scenario string is
+        // rejected before it can be forwarded through a nested call as a value
+        // with the wrong storage family.
         let dir = Path::new(env!("CARGO_MANIFEST_DIR")).join("tests/fixtures/userfn");
         let loaded = load(&dir.join("Project.m1prj"), None).expect("userfn fixture loads");
         let scenario = Scenario::from_toml_str(
@@ -1486,15 +1487,11 @@ const = "oops"
         )
         .expect("scenario parses");
 
-        let err = run(&loaded, &scenario).expect_err("helper arithmetic fails loud");
+        let err = run(&loaded, &scenario).expect_err("string input fails loud");
         let msg = err.to_string();
         assert!(
-            msg.contains("Helper.Compute.m1scr") && msg.contains("t = 0.000 s"),
-            "error names the nested script and current tick: {msg}"
-        );
-        assert!(
-            !msg.contains("Caller.Update.m1scr"),
-            "outer runner context must not replace or wrap the callee: {msg}"
+            msg.contains("Root.Caller.Input") && msg.contains("FloatingPoint"),
+            "error names the channel and required family: {msg}"
         );
         assert!(msg.contains("type error"), "inner error preserved: {msg}");
     }
@@ -1565,7 +1562,7 @@ const = 3.0
 
         let last_f64 = |name: &str| -> f64 {
             match trace.channels.get(name).expect(name).last().expect(name) {
-                Value::Float(x) => *x,
+                Value::M1(M1Scalar::FloatingPoint(x)) => f64::from(*x),
                 other => panic!("expected float for {name}, got {other:?}"),
             }
         };
@@ -1573,7 +1570,7 @@ const = 3.0
         assert_eq!(last_f64("Root.RX.Mid Count"), 200.0, "200 Hz runs/second");
         let total = last_f64("Root.RX.Mid Total");
         assert!(
-            (total - 2.985).abs() < 1e-9,
+            (total - 2.985).abs() < 1e-6,
             "exact dt=5 ms trapezoidal accumulation, got {total}"
         );
     }
@@ -1622,7 +1619,7 @@ const = 3.0
             .defaulted
             .get("Root.RX.Fast Count")
             .expect("Fast Count substitution reported");
-        assert_eq!(fast.value, Value::Float(0.0));
+        assert_eq!(fast.value, Value::m1_float(0.0));
         assert_eq!(fast.first_reader, "RX.Fast Counter.m1scr");
         assert!(
             trace.defaulted.contains_key("Root.RX.Mid Count"),
@@ -1661,7 +1658,7 @@ const = 6.0
             .expect("startup-written channel appears in the trace");
         assert_eq!(started.len(), 5, "held across every tick");
         assert!(
-            started.iter().all(|v| *v == Value::Float(1.0)),
+            started.iter().all(|v| *v == Value::m1_float(1.0)),
             "startup ran once and its output holds: {started:?}"
         );
     }
@@ -1818,15 +1815,18 @@ const = 6.0
             .get("Root.MR.Fast Shared")
             .expect("Fast Shared");
         let fast = trace.channels.get("Root.MR.Fast Out").expect("Fast Out");
-        assert!(slow.iter().all(|v| *v == Value::Float(6.0)), "{slow:?}");
-        assert!(shared.iter().all(|v| *v == Value::Float(7.0)), "{shared:?}");
-        assert!(fast.iter().all(|v| *v == Value::Float(70.0)), "{fast:?}");
+        assert!(slow.iter().all(|v| *v == Value::m1_float(6.0)), "{slow:?}");
+        assert!(
+            shared.iter().all(|v| *v == Value::m1_float(7.0)),
+            "{shared:?}"
+        );
+        assert!(fast.iter().all(|v| *v == Value::m1_float(70.0)), "{fast:?}");
 
         // The startup function runs exactly once before the periodic loop, so
         // its marker channel is present and holds its startup value.
         let started = trace.channels.get("Root.MR.Started").expect("Started");
         assert!(
-            started.iter().all(|v| *v == Value::Float(1.0)),
+            started.iter().all(|v| *v == Value::m1_float(1.0)),
             "startup marker holds: {started:?}"
         );
     }
@@ -1900,7 +1900,7 @@ const = 2.0
         let got: Vec<f64> = slow
             .iter()
             .map(|v| match v {
-                Value::Float(x) => *x,
+                Value::M1(M1Scalar::FloatingPoint(x)) => f64::from(*x),
                 other => panic!("expected float, got {other:?}"),
             })
             .collect();
@@ -1959,7 +1959,7 @@ const = 4.0
         let got: Vec<f64> = total
             .iter()
             .map(|v| match v {
-                Value::Float(x) => *x,
+                Value::M1(M1Scalar::FloatingPoint(x)) => f64::from(*x),
                 other => panic!("expected float, got {other:?}"),
             })
             .collect();
@@ -1968,7 +1968,7 @@ const = 4.0
         ];
         for (g, e) in got.iter().zip(expected.iter()) {
             assert!(
-                (g - e).abs() < 1e-9,
+                (g - e).abs() < 1e-6,
                 "rate-correct dt=0.02 accumulation: got {got:?}, expected {expected:?}"
             );
         }
@@ -2043,7 +2043,7 @@ const = 2.5
             .get("Root.Demo.Output")
             .expect("Output recorded");
         assert_eq!(out.len(), 5);
-        assert!(out.iter().all(|v| *v == Value::Float(50.0)), "{out:?}");
+        assert!(out.iter().all(|v| *v == Value::m1_float(50.0)), "{out:?}");
     }
 
     #[test]
@@ -2075,13 +2075,13 @@ const = 2.0
         let got: Vec<f64> = total
             .iter()
             .map(|v| match v {
-                Value::Float(x) => *x,
+                Value::M1(M1Scalar::FloatingPoint(x)) => f64::from(*x),
                 other => panic!("expected float, got {other:?}"),
             })
             .collect();
         let expected = [0.0, 0.2, 0.4, 0.6, 0.8];
         for (g, e) in got.iter().zip(expected.iter()) {
-            assert!((g - e).abs() < 1e-9, "got {got:?}, expected {expected:?}");
+            assert!((g - e).abs() < 1e-6, "got {got:?}, expected {expected:?}");
         }
     }
 
@@ -2112,7 +2112,7 @@ const = 4.0
             .channels
             .get("Root.Caller.Output")
             .expect("Output recorded");
-        assert!(out.iter().all(|v| *v == Value::Float(8.0)), "{out:?}");
+        assert!(out.iter().all(|v| *v == Value::m1_float(8.0)), "{out:?}");
     }
 
     #[test]
@@ -2143,12 +2143,12 @@ const = 4.0
             .get("Root.Chain.Final")
             .expect("Final recorded");
         assert!(
-            final_col.iter().all(|v| *v == Value::Float(50.0)),
+            final_col.iter().all(|v| *v == Value::m1_float(50.0)),
             "{final_col:?}"
         );
         // The intermediate channel is computed and recorded too.
         let mid = trace.channels.get("Root.Chain.Mid").expect("Mid recorded");
-        assert!(mid.iter().all(|v| *v == Value::Float(5.0)), "{mid:?}");
+        assert!(mid.iter().all(|v| *v == Value::m1_float(5.0)), "{mid:?}");
     }
 
     #[test]
@@ -2309,7 +2309,7 @@ base_rate_hz = 100.0
             kind: InputKind::Series(
                 vals.iter()
                     .enumerate()
-                    .map(|(i, v)| (i as f64 * 0.01, Value::Float(*v)))
+                    .map(|(i, v)| (i as f64 * 0.01, Value::m1_float(*v as f32)))
                     .collect(),
             ),
         };
@@ -2341,7 +2341,7 @@ base_rate_hz = 100.0
             .unwrap_or_else(|| panic!("channel {channel:?} present"))
             .iter()
             .map(|v| match v {
-                Value::Float(x) => *x,
+                Value::M1(M1Scalar::FloatingPoint(x)) => f64::from(*x),
                 other => panic!("expected float in {channel:?}, got {other:?}"),
             })
             .collect()
@@ -2396,7 +2396,7 @@ base_rate_hz = 100.0
             channel: "Root.CR.Sensor".to_string(),
             kind: InputKind::Series(
                 (0..n)
-                    .map(|i| (i as f64 * 0.01, Value::Float(5.0)))
+                    .map(|i| (i as f64 * 0.01, Value::m1_float(5.0)))
                     .collect(),
             ),
         };
@@ -2425,7 +2425,7 @@ base_rate_hz = 100.0
         );
         let last = *ramp.last().unwrap();
         assert!(
-            (last - 0.9).abs() < 1e-9,
+            (last - 0.9).abs() < 1e-6,
             "dt = 0.1 s per run: final ramp 0.9, got {last}"
         );
         // The cone recompute itself still applies every run: Slow Echo reflects
@@ -2446,7 +2446,7 @@ base_rate_hz = 100.0
         let loaded = load(&dir.join("Project.m1prj"), None).expect("cfrate fixture loads");
         let sensor = InputSeries {
             channel: "Root.CR.Sensor".to_string(),
-            kind: InputKind::Series(vec![(0.0, Value::Float(5.0))]),
+            kind: InputKind::Series(vec![(0.0, Value::m1_float(5.0))]),
         };
         let log = Log {
             channels: vec![sensor],
@@ -2563,7 +2563,7 @@ base_rate_hz = 100.0
             for (i, value) in cf.iter().enumerate() {
                 let t = i as f64 / cfg.base_rate_hz;
                 let logged = match series.sample(t) {
-                    Value::Float(x) => x,
+                    Value::M1(M1Scalar::FloatingPoint(x)) => f64::from(x),
                     other => panic!("expected float in log {path:?}, got {other:?}"),
                 };
                 assert_eq!(*value, logged, "channel {path:?} unchanged at tick {i}");
