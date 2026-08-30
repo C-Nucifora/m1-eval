@@ -201,7 +201,7 @@ impl Engine {
     /// periodic call rate, or 100 Hz when no function schedules periodically (so a
     /// project of purely event/startup functions still grids at a sane rate). A
     /// counterfactual recomputes only the override cone, but the grid rate governs
-    /// stateful-operator `dt`, so a project-derived default is the faithful choice.
+    /// stateful-operator `dt`, so the project-derived rate is the documented model.
     fn default_counterfactual_rate(&self) -> f64 {
         // The lcm of the declared rates — the smallest grid every cone function
         // divides exactly, mirroring the whole-project auto base. The fastest

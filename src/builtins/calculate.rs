@@ -149,8 +149,8 @@ fn abs(args: &[Value]) -> Result<Value, EvalError> {
 
 /// `Average(a, b)` — the arithmetic mean `(a + b) / 2`. Always a [`Value::Float`]:
 /// the mean of two integers is generally fractional, so we never round it back to
-/// an integer (the intrinsic return tag is `Integer|FloatingPoint`, but a faithful
-/// mean keeps the fractional part — a documented divergence from the raw tag).
+/// an integer (the intrinsic return tag is `Integer|FloatingPoint`, but retaining
+/// the fractional part is this evaluator's documented assumption).
 fn average(args: &[Value]) -> Result<Value, EvalError> {
     let a = args[0].as_f64()?;
     let b = args[1].as_f64()?;

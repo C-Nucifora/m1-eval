@@ -1,16 +1,46 @@
 <!-- SPDX-License-Identifier: GPL-3.0-or-later -->
 # m1-eval
 
-A stepped, deterministic **evaluator/interpreter for the MoTeC M1 scripting
+A stepped, deterministic offline **evaluator/interpreter for the MoTeC M1 scripting
 language** (`.m1scr`). The rest of the toolchain can parse (`m1-core`) and
 type-check (`m1-typecheck`) M1; `m1-eval` adds the missing layer — it actually
 *runs* the scripts. Given a *scenario* (input channel/parameter values over
 time) it evaluates a project's expressions, table lookups, and stateful
-time-domain operators to produce **real numeric channel values over time**.
+time-domain operators to produce numeric channel values over time.
 
 It is built primarily as a **Rust library** (consumed by `m1-visualiser`, and
 later `m1-lsp`), with a thin CLI on top. The same engine drives a per-channel and
 per-expression value `Trace` that the visualiser overlays on a dependency graph.
+
+## Maturity contract
+
+These states describe evidence for compatibility with M1, not how much Rust test
+coverage a module has.
+
+| State | Meaning |
+| --- | --- |
+| **Verified** | A committed test compares the result with captured output from M1, M1 Sim, or an ECU. |
+| **Assumed** | The behavior is implemented and tested with synthetic fixtures or hand-derived values, but has not been compared with captured M1 output. |
+| **Stubbed** | Hardware behavior is not evaluated. An explicit scenario input may supply the value; otherwise the engine returns a documented offline value or a generic type-correct default and marks it externally driven. |
+| **Unsupported** | The engine does not implement the behavior. It reports the item through `--coverage` when possible and fails the run if execution reaches it. |
+
+No advertised evaluator area currently meets the **Verified** definition. The
+real-project and real-`.ld` tests are completion and structural smoke tests; they
+do not compare computed channel values with captured M1 results.
+
+| Advertised area | State | Current contract |
+| --- | --- | --- |
+| Expressions, statements, enums, and inline user functions | **Assumed** | Covered by unit and synthetic-project tests. M1 evaluation results have not been captured for comparison. |
+| `.m1cfg` parameters and 1/2/3-D table lookup | **Assumed** | Parsing, interpolation, and edge clamping use synthetic fixtures. Use the matching calibration file for actual parameter and table values. |
+| `Calculate.*`, `Limit.*`, `Convert.*`, enum conversions, and table methods | **Assumed** | Implemented methods have hand-derived tests. `--coverage` remains authoritative for the methods a project uses. |
+| Filters, integrals, derivatives, debounce, delay, change detection, timers, and `static local` state | **Assumed** | Update laws and startup behavior are explicit implementation assumptions with hand-derived tests, not M1 value comparisons. |
+| `CanComms.*`, `Serial.*`, `System.*`, `Logging.*`, DBC objects, and other hardware-backed calls | **Stubbed** | Scenario `[[io]]` values take precedence. Otherwise calls use documented or generic typed stubs; writes are offline no-ops. |
+| Scenario parsing, tick grids, trace output, and `--coverage` | **Assumed** | These are deterministic m1-eval contracts tested with synthetic data. A `Supported` coverage entry means implemented, not M1-verified. |
+| Single-function and upstream dependency-cone runners | **Assumed** | Selection, ordering, and zero-order hold are tested on synthetic projects. |
+| Whole-project multi-rate scheduling | **Assumed** | Trigger rates come from `Project.m1prj`; same-rate dependency order, fastest-first rate groups, startup order, and cross-rate stale reads are the evaluator's model. |
+| CSV log replay, overrides, downstream-cone recomputation, and diffs | **Assumed** | Synthetic tests cover import, resampling, source precedence, recomputation, and the no-op invariant. They do not establish M1 execution fidelity. |
+| Binary `.ld` import | **Assumed** | Synthetic decode tests run in CI. An optional real-log test checks structure and numeric plausibility only, not values against an independent oracle. |
+| Real-time/HIL execution, ECU budgets or preemption, watchdog behavior, live CAN/serial I/O, `.m1dbc` decoding, unlisted constructs or builtins, and LSP integration | **Unsupported** | These are outside the current evaluator. Unknown executable behavior fails loud rather than being inferred. |
 
 ## What it does (Phase 1)
 
@@ -70,7 +100,7 @@ The multi-rate model:
 - **Rate-correct `dt`.** A function's stateful operators (`Integral.Normal`,
   filters, derivatives, timers) are stepped by *its own* period
   (`1 / rate_hz`) — a 50 Hz integrator accumulates with `dt = 0.02`, not the
-  base `dt` — so time-domain results are faithful to the real schedule.
+  base `dt`, so time-domain operators use the configured function period.
 - **Zero-order hold between ticks.** A channel a function did not write this
   tick keeps its last value (the shared value store carries it forward), so a
   slow channel holds steady between its updates while fast channels move every
@@ -78,9 +108,9 @@ The multi-rate model:
 - **Same-rate dependency ordering, cross-rate stale-tolerance.** Within one
   rate group, a writer runs before any reader of its output (topological order).
   Across rates, no ordering edge is added: a faster reader of a slower writer
-  sees the slower function's *previous* value (stale between writer ticks),
-  matching how the real ECU schedule interleaves rate groups. Rate groups are
-  run fastest-first within a base tick.
+  sees the slower function's *previous* value (stale between writer ticks).
+  This ordering is an explicit evaluator assumption. Rate groups run
+  fastest-first within a base tick.
 - **Externally-driven IO still stubbed, still fail-loud.** CAN/sensor reads
   fall back to their documented stubs (flagged externally driven in the trace);
   any genuinely unsupported construct still aborts the run rather than guessing.
@@ -89,26 +119,24 @@ The multi-rate model:
 
 - **Deterministic.** A fixed tick grid and explicit `dt`, no wall-clock and no
   RNG: the same scenario always produces the same `Trace`.
-- **Fail-loud.** By default the evaluator never substitutes a guessed number. An
-  unimplemented builtin, an unsupported construct, an unresolved symbol, or a
-  missing scenario input all surface as an error and abort the run — never a
-  silently-wrong value. Whole-project mode may opt in to
+- **Strict channel inputs.** An unimplemented builtin, an unsupported construct,
+  an unresolved symbol, or an unseeded ordinary channel aborts the run by
+  default. Hardware-backed calls follow the **Stubbed** contract above, and an
+  unseeded parameter uses its type-correct calibration default. Whole-project
+  mode may also opt in to
   **`allow_default_inputs`** (scenario field or `--allow-default-inputs`):
   unseeded channel reads then fall back to their type-correct startup defaults,
-  and **every substitution is reported** (channel, substituted value, first
-  reading script) — visible guessing, never silent. Arithmetic errors are not
-  inputs: integer division/modulo by zero always fails loud, opt-in or not.
-  (An unseeded *parameter* still reads as its type-correct tunable default —
-  parameters are calibration values with real defaults in M1 Tune, not runtime
-  inputs.)
+  and every ordinary-channel substitution is reported (channel, substituted
+  value, first reading script). Missing table calibration follows a separate
+  fallback described in Quickstart. Arithmetic errors are not inputs: integer
+  division/modulo by zero always fails loud, opt-in or not.
 
 ### `--coverage`
 
 Before running, `m1-eval --coverage` reports, per project, which builtins and
-constructs each script uses and whether the engine **supports** them faithfully,
-**stubs** them (Tier-3 IO, externally driven), or does **not support** them
-(would fail loud at runtime). This tells you up front what is trustworthy versus
-externally driven.
+constructs each script uses and whether the engine **implements**, **stubs**, or
+does **not support** them. `Supported` is an implementation label, not a
+**Verified** maturity claim.
 
 The report also prints a **`Schedule:`** section: every script-backed function
 with its execution rate (`@ 500 Hz`, `@ 50 Hz`, …), or *unscheduled* for a
@@ -116,7 +144,34 @@ function with no periodic trigger. This makes a `whole-project` run transparent 
 you see exactly which functions the scheduler will run, at what rate, and which
 are excluded — before you run it.
 
-## Usage
+## Quickstart
+
+`m1-eval` runs offline. It does not connect to an ECU, sample sensors, emulate a
+CAN or serial bus, or reproduce firmware timing. A `Project.m1prj` is always
+required because it supplies symbols, types, and trigger rates. Pass the matching
+`.m1cfg` when a run needs real parameter values or table cells. Table lookup
+without its calibration fails in strict mode; an unseeded parameter instead uses
+a type-correct externally-driven default. The evaluator does not load `.m1dbc`
+files.
+
+Seed an ordinary hardware channel with scenario `[[inputs]]`. Seed a
+hardware-backed builtin call with `[[io]]`, using its exact `Object.Method` name.
+Without those seeds, function and cone runs fail on an ordinary missing channel,
+while Tier-3 calls use the **Stubbed** contract. Run `--coverage` first to see the
+implemented, stubbed, and unsupported calls in a project.
+
+Whole-project mode is strict about ordinary missing channels unless
+`allow_default_inputs = true` or `--allow-default-inputs` is set. The CLI then
+prints every substituted channel, value, and first-reading script to stderr.
+Library callers receive the same records in `Trace::defaulted`; the trace also
+marks those channels externally driven. Tier-3 stubs and absent-calibration
+parameter defaults are marked externally driven, but they are not part of that
+`allow_default_inputs` stderr summary. Missing table calibration is also handled
+separately: with the whole-project opt-in, `.Lookup()` and `.Get()` return the
+externally-driven float value `0.0` and add the table path to `Trace::external`.
+That table fallback is not added to `Trace::defaulted` and does not appear in the
+CLI substitution summary. Without the opt-in, missing table calibration remains
+a fail-loud `MissingCalibration` error.
 
 ```sh
 # Evaluate a scenario and write the trace as JSON (or .csv — format follows the
@@ -173,7 +228,7 @@ override, leave everything else at its logged value, and emit both the new
 - **Cone functions keep their declared rates.** Each cone function runs at its
   project rate (its trigger's Hz) on the replay grid, with its own period as
   `dt` — a 10 Hz state machine in the cone of a 100 Hz replay still runs every
-  10th tick with `dt = 0.1 s`, exactly as scheduled on the ECU. The default
+  10th tick with `dt = 0.1 s` under the evaluator's scheduling model. The default
   replay base is the lcm of the project's rates (the smallest grid every rate
   divides exactly); a pinned base that cannot represent a cone rate exactly is
   rejected loudly.
@@ -182,7 +237,7 @@ override, leave everything else at its logged value, and emit both the new
 - **Source precedence.** calibration < scenario < **log** < **override**.
 - **The no-op invariant.** A no-op override (or `--log` with no `--override`)
   reproduces the logged series within tolerance, and the changed-channel set is
-  empty — the load-bearing correctness guarantee of the whole pipeline.
+  empty. Synthetic regression tests enforce this evaluator invariant.
 
 ### The `ld` feature (clean-room `.ld` import)
 

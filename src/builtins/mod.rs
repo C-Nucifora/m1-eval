@@ -115,8 +115,8 @@ pub fn dispatch(
         //     flagged `calibrationOnly` in the intrinsics) and is not, strictly,
         //     valid in ECU `.m1scr` scripts — yet real EV-M1 control scripts
         //     reference `Math.atan2`. We route that one function to the same
-        //     `y.atan2(x)` as `Calculate.InverseTan2` (a pragmatic, faithful
-        //     evaluation) and flag it `Stubbed` in coverage so the user sees it is
+        //     `y.atan2(x)` as `Calculate.InverseTan2` (a pragmatic implementation)
+        //     and flag it `Stubbed` in coverage so the user sees it is
         //     a calibration-only object surfaced in an ECU script. Every other
         //     `Math.*` method is left to fail loud (we do not implement the
         //     calibration maths library wholesale).
@@ -518,7 +518,7 @@ fn unsupported(object: &str, method: &str) -> EvalError {
 /// (it would fail loud at runtime).
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum BuiltinSupport {
-    /// Evaluated faithfully by the dispatch table.
+    /// Implemented by the dispatch table under the documented maturity contract.
     Supported,
     /// A Tier-3 IO object handled as a documented/scenario-fed stub.
     Stubbed,
@@ -526,7 +526,7 @@ pub enum BuiltinSupport {
     Unsupported,
 }
 
-/// Library/object methods implemented faithfully (Tier-1 + Tier-2). Kept in sync
+/// Library/object methods implemented by the evaluator (Tier-1 + Tier-2). Kept in sync
 /// with the dispatch arms above; this is the single source of truth the coverage
 /// report consults so it never disagrees with what `dispatch` actually evaluates.
 const SUPPORTED_METHODS: &[(&str, &str)] = &[
@@ -608,7 +608,7 @@ const SUPPORTED_OBJECT_METHODS: &[&str] =
     &["AsInteger", "Set", "Start", "Stop", "Reset", "Remaining"];
 
 /// The Tier-3 IO library objects: their methods are handled as documented/
-/// scenario-fed stubs (flagged externally driven), not faithfully evaluated.
+/// scenario-fed stubs (flagged externally driven), not evaluated as hardware.
 const STUB_OBJECTS: &[&str] = &["CanComms", "Serial", "System", "Logging"];
 
 /// Individual `(object, method)` pairs handled as documented stubs even though

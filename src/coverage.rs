@@ -3,7 +3,7 @@
 //! engine *supports*.
 //!
 //! Before a run, a user wants to know which parts of their project the evaluator
-//! will compute faithfully, which it will only stub (Tier-3 IO, externally
+//! implements, which it will only stub (Tier-3 IO, externally
 //! driven), and which it cannot handle at all (and would fail loud on). This
 //! module walks every script's CST and answers that, statically:
 //!
@@ -48,7 +48,7 @@ pub enum ItemKind {
 /// unsupported. Each list is de-duplicated and sorted for a deterministic report.
 #[derive(Debug, Clone, Default, PartialEq)]
 pub struct CoverageReport {
-    /// Items the engine evaluates faithfully.
+    /// Items the engine implements under its documented maturity contract.
     pub supported: Vec<CoverageItem>,
     /// Items handled as documented/scenario-fed stubs (Tier-3 IO).
     pub stubbed: Vec<CoverageItem>,
