@@ -640,6 +640,7 @@ Output = i;
             "Library.Calculate.Max(1, 2);\n\
              Library.Debounce.Filter(true, 0.1);\n\
              Library.Math.fabs(-1.0);\n\
+             Library.UnixTime.ToUtcYear(0);\n\
              Library.CanComms.GetFloat(1, 2);\n",
         ));
 
@@ -648,6 +649,13 @@ Output = i;
                 .supported
                 .iter()
                 .any(|item| item.name == "Library.Calculate.Max"),
+            "{report:?}"
+        );
+        assert!(
+            report
+                .supported
+                .iter()
+                .any(|item| item.name == "Library.UnixTime.ToUtcYear"),
             "{report:?}"
         );
         for name in ["Library.Debounce.Filter", "Library.Math.fabs"] {

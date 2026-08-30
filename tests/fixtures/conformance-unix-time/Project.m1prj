@@ -1,0 +1,31 @@
+<?xml version="1.0"?>
+<!-- Synthetic UnixTime conformance project. No proprietary content. -->
+<MoTeCM1BuildSession>
+ <Project Name="ConformanceUnixTime" TargetHardware="ecu120">
+  <ComponentStream><List>
+   <Component Classname="BuiltIn.GroupCompound" Name="Root.Unix"/>
+   <Component Classname="BuiltIn.Channel" Name="Root.Unix.From GPS"><Props Type="s32"/></Component>
+   <Component Classname="BuiltIn.Channel" Name="Root.Unix.From UTC"><Props Type="s32"/></Component>
+   <Component Classname="BuiltIn.Channel" Name="Root.Unix.From Local"><Props Type="s32"/></Component>
+   <Component Classname="BuiltIn.Channel" Name="Root.Unix.Arithmetic"><Props Type="s32"/></Component>
+   <Component Classname="BuiltIn.Channel" Name="Root.Unix.Comparison"><Props Type="bool"/></Component>
+   <Component Classname="BuiltIn.Channel" Name="Root.Unix.UTC Day"><Props Type="s32"/></Component>
+   <Component Classname="BuiltIn.Channel" Name="Root.Unix.UTC Hour"><Props Type="s32"/></Component>
+   <Component Classname="BuiltIn.Channel" Name="Root.Unix.UTC Minute"><Props Type="s32"/></Component>
+   <Component Classname="BuiltIn.Channel" Name="Root.Unix.UTC Month"><Props Type="s32"/></Component>
+   <Component Classname="BuiltIn.Channel" Name="Root.Unix.UTC Second"><Props Type="s32"/></Component>
+   <Component Classname="BuiltIn.Channel" Name="Root.Unix.UTC Week Day"><Props Type="s32"/></Component>
+   <Component Classname="BuiltIn.Channel" Name="Root.Unix.UTC Year"><Props Type="s32"/></Component>
+   <Component Classname="BuiltIn.Channel" Name="Root.Unix.UTC Year Day"><Props Type="s32"/></Component>
+   <Component Classname="BuiltIn.Channel" Name="Root.Unix.Local Day"><Props Type="s32"/></Component>
+   <Component Classname="BuiltIn.Channel" Name="Root.Unix.Local Hour"><Props Type="s32"/></Component>
+   <Component Classname="BuiltIn.Channel" Name="Root.Unix.Local Minute"><Props Type="s32"/></Component>
+   <Component Classname="BuiltIn.Channel" Name="Root.Unix.Local Month"><Props Type="s32"/></Component>
+   <Component Classname="BuiltIn.Channel" Name="Root.Unix.Local Second"><Props Type="s32"/></Component>
+   <Component Classname="BuiltIn.Channel" Name="Root.Unix.Local Week Day"><Props Type="s32"/></Component>
+   <Component Classname="BuiltIn.Channel" Name="Root.Unix.Local Year"><Props Type="s32"/></Component>
+   <Component Classname="BuiltIn.Channel" Name="Root.Unix.Local Year Day"><Props Type="s32"/></Component>
+   <Component Classname="BuiltIn.FuncUser" Filename="Unix.Update.m1scr" Name="Root.Unix.Update"/>
+  </List></ComponentStream>
+ </Project>
+</MoTeCM1BuildSession>

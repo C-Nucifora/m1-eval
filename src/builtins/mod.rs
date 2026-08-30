@@ -24,6 +24,7 @@ pub mod io_stub;
 pub mod limit;
 pub mod object;
 pub mod stateful;
+pub mod unix_time;
 pub mod userfn;
 
 use crate::env::CallSite;
@@ -138,6 +139,10 @@ pub(crate) fn dispatch_with_runtime(
                 "fabs" => Ok(Value::m1_float(args[0].m1_scalar()?.as_f32().abs())),
                 _ => Err(unsupported(object, method)),
             }
+        }
+        CallRoute::UnixTime => {
+            validate_arity("UnixTime", object, method, args.len())?;
+            unix_time::call(method, args, ctx.env)
         }
         CallRoute::EnumAsInteger => {
             validate_object_arity(object, method, args.len())?;
@@ -514,6 +519,7 @@ enum CallRoute {
     StatefulLibrary(String),
     IoLibrary(String),
     MathAssumption(String),
+    UnixTime,
     TableLookup,
     TableGet,
     EnumAsInteger,
@@ -752,6 +758,9 @@ fn classify_library(object: &str, method: &str) -> CallCapability {
             BuiltinSupport::Modeled,
             CallRoute::MathAssumption(object.to_string()),
         );
+    }
+    if object == "UnixTime" && unix_time::METHODS.contains(&method) {
+        return capability(BuiltinSupport::Direct, CallRoute::UnixTime);
     }
     if STUB_OBJECTS.contains(&object) {
         let known = !intrinsics::get()
@@ -1088,6 +1097,53 @@ mod tests {
             )
             .unwrap(),
             Value::m1_float(0.0)
+        );
+        assert_eq!(
+            h.call(
+                "Library.UnixTime",
+                "FromUtc",
+                &[
+                    Value::m1_integer(1970),
+                    Value::m1_integer(0),
+                    Value::m1_integer(1),
+                    Value::m1_integer(0),
+                    Value::m1_integer(0),
+                    Value::m1_integer(0),
+                ],
+            )
+            .unwrap(),
+            Value::m1_integer(0)
+        );
+    }
+
+    #[test]
+    fn every_catalogued_unix_time_method_is_direct_and_dispatches() {
+        let mut h = Harness::new();
+        for method in unix_time::METHODS {
+            assert_eq!(
+                classify_builtin("UnixTime", method),
+                BuiltinSupport::Direct,
+                "UnixTime.{method} classification"
+            );
+            let args = match *method {
+                "FromGPS" => vec![Value::m1_unsigned(1_0170), Value::m1_float(0.0)],
+                "FromLocal" | "FromUtc" => vec![
+                    Value::m1_integer(1970),
+                    Value::m1_integer(0),
+                    Value::m1_integer(1),
+                    Value::m1_integer(0),
+                    Value::m1_integer(0),
+                    Value::m1_integer(0),
+                ],
+                "Timezone" => vec![Value::m1_integer(0)],
+                _ => vec![Value::m1_integer(0)],
+            };
+            h.call("UnixTime", method, &args)
+                .unwrap_or_else(|error| panic!("UnixTime.{method} failed: {error}"));
+        }
+        assert_eq!(
+            classify_builtin("UnixTime", "NoSuchMethod"),
+            BuiltinSupport::Unsupported
         );
     }
 

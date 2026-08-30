@@ -211,3 +211,13 @@ test. It catches state leakage and accidental per-tick reseeding.
 
 These files use `kind = "synthetic"` and cannot satisfy
 `--require-m1-sim-capture`.
+
+## Independent-reference fixtures
+
+`kind = "independent"` records expected values checked against a named public
+standard or separate implementation. This is stronger evidence than a
+hand-derived runner fixture, but it is not M1 output and cannot satisfy
+`--require-m1-sim-capture`. The committed UnixTime fixture uses POSIX epoch and
+Gregorian calendar rules and is differentially checked against the Rust `time`
+crate; its M1-specific GPS pivot, leap-second normalization, and timezone
+encoding remain documented assumptions pending a genuine M1 Sim capture.

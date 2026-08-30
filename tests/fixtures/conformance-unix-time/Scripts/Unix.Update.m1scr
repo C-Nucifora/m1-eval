@@ -1,0 +1,29 @@
+// Independent UnixTime vectors. No proprietary content.
+UnixTime.Timezone(530);
+local gps = UnixTime.FromGPS(290204u, 45296.75);
+local utc = UnixTime.FromUtc(2004, 1, 29, 12, 34, 56);
+local localTimestamp = UnixTime.FromLocal(2004, 1, 29, 18, 4, 56);
+
+From GPS = gps;
+From UTC = utc;
+From Local = localTimestamp;
+Arithmetic = utc + 60;
+Comparison = gps == utc;
+
+UTC Day = UnixTime.ToUtcDay(utc);
+UTC Hour = UnixTime.ToUtcHour(utc);
+UTC Minute = UnixTime.ToUtcMinute(utc);
+UTC Month = UnixTime.ToUtcMonth(utc);
+UTC Second = UnixTime.ToUtcSecond(utc);
+UTC Week Day = UnixTime.ToUtcWeekDay(utc);
+UTC Year = UnixTime.ToUtcYear(utc);
+UTC Year Day = UnixTime.ToUtcYearDay(utc);
+
+Local Day = UnixTime.ToLocalDay(utc);
+Local Hour = UnixTime.ToLocalHour(utc);
+Local Minute = UnixTime.ToLocalMinute(utc);
+Local Month = UnixTime.ToLocalMonth(utc);
+Local Second = UnixTime.ToLocalSecond(utc);
+Local Week Day = UnixTime.ToLocalWeekDay(utc);
+Local Year = UnixTime.ToLocalYear(utc);
+Local Year Day = UnixTime.ToLocalYearDay(utc);

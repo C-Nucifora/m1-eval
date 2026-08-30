@@ -95,6 +95,27 @@ fn committed_synthetic_fixtures_pass_without_claiming_capture_evidence() {
 }
 
 #[test]
+fn independent_unix_time_fixture_covers_the_catalogue_without_claiming_m1_capture() {
+    let reports = run_conformance_suite(
+        &[fixture("independent-unix-time.toml")],
+        ConformanceOptions::default(),
+    )
+    .expect("independent UnixTime fixture passes");
+    assert_eq!(reports.len(), 1);
+    assert_eq!(reports[0].provenance, ProvenanceKind::Independent);
+    assert_eq!(reports[0].assertions_checked, 21);
+
+    let error = run_conformance_suite(
+        &[fixture("independent-unix-time.toml")],
+        ConformanceOptions {
+            require_m1_sim_capture: true,
+        },
+    )
+    .expect_err("independent evidence must not satisfy the M1 Sim gate");
+    assert!(matches!(error, ConformanceError::MissingM1SimCapture));
+}
+
+#[test]
 fn json_fixture_uses_the_same_schema_and_runner() {
     let template = fixture("synthetic-mini.toml");
     let body = std::fs::read_to_string(template).expect("read template fixture");
