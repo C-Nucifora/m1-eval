@@ -95,7 +95,8 @@ used verbatim and never split on whitespace, only on `.` for path segments.
 - **JSON** (`--out trace.json`, or no `--out`):
   `{ "time": [...], "channels": { path: [...] }, "external": [...] }`. The
   `external` list names channels whose values were externally driven (scenario-fed
-  or a Tier-3 stub) rather than computed.
+  or a Tier-3 stub) rather than computed. JSON has no non-finite numeric values,
+  so NaN and positive or negative infinity are written as `null`.
 - **CSV** (`--out trace.csv`): a `time` header column followed by one column per
   channel in sorted-name order, one row per tick.
 
