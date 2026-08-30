@@ -99,6 +99,44 @@ fn evm1_phase15_categories_are_closed() {
     }
 }
 
+/// Issue #41 corpus gate: the four suspension update functions inherit their
+/// trigger from each sensor's `Absolute Travel.Calculation` component. All four
+/// must resolve to the effective 200 Hz rate instead of appearing unresolved or
+/// unscheduled.
+#[test]
+#[ignore = "requires M1_EVAL_EVM1_DIR pointing at the proprietary EV-M1 project"]
+fn evm1_parameterized_suspension_triggers_resolve_to_200_hz() {
+    let Some(dir) = evm1_dir() else {
+        eprintln!("M1_EVAL_EVM1_DIR unset; skipping EV-M1 trigger-resolution gate");
+        return;
+    };
+    let report = load_evm1(&dir).coverage();
+    let by_function: std::collections::HashMap<&str, Option<f64>> = report
+        .schedule
+        .iter()
+        .map(|(function, rate)| (function.as_str(), *rate))
+        .collect();
+    for function in [
+        "Root.Vehicle.Suspension.Front.Left.Linpot.Update",
+        "Root.Vehicle.Suspension.Front.Right.Linpot.Update",
+        "Root.Vehicle.Suspension.Rear.Left.Linpot.Update",
+        "Root.Vehicle.Suspension.Rear.Right.Linpot.Update",
+    ] {
+        assert_eq!(
+            by_function.get(function),
+            Some(&Some(200.0)),
+            "{function} must inherit its 200 Hz Calculation trigger"
+        );
+        assert!(
+            report
+                .unresolved
+                .iter()
+                .all(|entry| entry.function != function),
+            "{function} must not remain unresolved"
+        );
+    }
+}
+
 /// Phase-2 acceptance gate ([`evm1_whole_project_runs_end_to_end`]).
 ///
 /// Loads the real EV-M1 project and runs the **whole-project multi-rate
