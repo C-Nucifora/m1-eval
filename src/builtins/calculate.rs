@@ -131,16 +131,32 @@ fn bias(args: &[Value]) -> Result<Value, EvalError> {
     let left = args[0].m1_scalar()?.as_f32();
     let right = args[1].m1_scalar()?.as_f32();
     let bias = args[2].m1_scalar()?.as_f32();
-    let average = left * 0.5 + right * 0.5;
-    let half_separation = (left - right).abs() * 0.5;
-    Ok(Value::m1_float(average + bias * half_separation))
+    let average = left.midpoint(right);
+    let half_separation = left.midpoint(-right).abs();
+    let result = if bias == -1.0 {
+        left.min(right)
+    } else if bias == 0.0 {
+        average
+    } else if bias == 1.0 {
+        left.max(right)
+    } else {
+        average + bias * half_separation
+    };
+    Ok(Value::m1_float(result))
 }
 
 /// Return the magnitude of one numeric value, preserving its documented
 /// integer or floating overload family.
 fn absolute(args: &[Value]) -> Result<Value, EvalError> {
     match args[0].m1_scalar()? {
-        M1Scalar::Integer(value) => Ok(Value::m1_integer(value.wrapping_abs())),
+        M1Scalar::Integer(value) => {
+            value
+                .checked_abs()
+                .map(Value::m1_integer)
+                .ok_or_else(|| EvalError::TypeError {
+                    detail: format!("Calculate.Absolute({value}) is outside the M1 Integer range"),
+                })
+        }
         M1Scalar::UnsignedInteger(value) => Ok(Value::m1_unsigned(value)),
         M1Scalar::FloatingPoint(value) => Ok(Value::m1_float(value.abs())),
         M1Scalar::FixedPoint7dps(value) => Ok(Value::m1_float(value.as_f64().abs() as f32)),
@@ -158,7 +174,7 @@ fn average(args: &[Value]) -> Result<Value, EvalError> {
         ValueType::Float => {
             let left = left.m1_scalar()?.as_f32();
             let right = right.m1_scalar()?.as_f32();
-            Ok(Value::m1_float(left * 0.5 + right * 0.5))
+            Ok(Value::m1_float(left.midpoint(right)))
         }
         ValueType::Unsigned => {
             let sum = u64::from(as_u32_bits(left)?) + u64::from(as_u32_bits(right)?);
@@ -339,6 +355,23 @@ mod tests {
             ),
             Value::m1_float(12.5)
         );
+
+        for (left, right) in [(f32::MAX, -f32::MAX), (-f32::MAX, f32::MAX)] {
+            for (bias, expected) in [(-1.0, -f32::MAX), (0.0, 0.0), (1.0, f32::MAX)] {
+                assert_eq!(
+                    ok(
+                        "Bias",
+                        &[
+                            Value::m1_float(left),
+                            Value::m1_float(right),
+                            Value::m1_float(bias),
+                        ],
+                    ),
+                    Value::m1_float(expected),
+                    "failed finite Bias anchor {bias} for {left}, {right}",
+                );
+            }
+        }
     }
 
     #[test]
@@ -381,6 +414,26 @@ mod tests {
             ),
             Value::m1_unsigned(u32::MAX)
         );
+
+        for value in [f32::from_bits(1), -f32::from_bits(1)] {
+            assert_eq!(
+                ok("Average", &[Value::m1_float(value), Value::m1_float(value)]),
+                Value::m1_float(value),
+                "the average of two identical subnormals must preserve the input",
+            );
+            assert_eq!(
+                ok(
+                    "Bias",
+                    &[
+                        Value::m1_float(value),
+                        Value::m1_float(value),
+                        Value::m1_float(0.0),
+                    ],
+                ),
+                Value::m1_float(value),
+                "zero Bias of identical subnormals must preserve their average",
+            );
+        }
     }
 
     #[test]
@@ -462,6 +515,12 @@ mod tests {
             ),
             Value::m1_float(1.25)
         );
+        match call("Absolute", &[Value::m1_integer(i32::MIN)]) {
+            Err(EvalError::TypeError { detail }) => {
+                assert!(detail.contains("outside the M1 Integer range"), "{detail}");
+            }
+            other => panic!("minimum M1 Integer magnitude must fail loud, got {other:?}"),
+        }
     }
 
     #[test]
