@@ -172,7 +172,7 @@ pub(crate) fn dispatch_with_runtime(
         CallRoute::Timer => {
             validate_object_arity(object, method, args.len())?;
             let object_key = timer_object_key(object, ctx);
-            match stateful::timer(method, args, object_key, ctx)? {
+            match stateful::timer(method, args, object_key, runtime.time, ctx)? {
                 Some(value) => Ok(value),
                 None => Err(unsupported(object, method)),
             }
@@ -2218,7 +2218,7 @@ mod tests {
             .m1_scalar()
             .unwrap()
             .as_f64();
-        assert!((remaining - 0.02).abs() < 1e-7);
+        assert!((remaining - 0.03).abs() < 1e-7);
         match h.call("Precharge State", "Start", &[Value::m1_float(0.03)]) {
             Err(EvalError::UnsupportedBuiltin { .. }) => {}
             other => panic!("expected channel.Start to be unsupported, got {other:?}"),

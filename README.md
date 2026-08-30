@@ -33,7 +33,7 @@ do not compare computed channel values with captured M1 results.
 | Expressions, statements, enums, and inline user functions | **Assumed** | Covered by unit and synthetic-project tests. M1 evaluation results have not been captured for comparison. |
 | `.m1cfg` parameters and 1/2/3-D table lookup | **Assumed** | Parsing, interpolation, and edge clamping use synthetic fixtures. Use the matching calibration file for actual values. Without it, parameters use typed external defaults. Table `.Lookup()` and `.Get()` fail in strict modes; whole-project mode may opt in to an external `0.0` fallback. |
 | `Calculate.*`, `Limit.*`, `Convert.*`, enum conversions, core value-object methods, and table methods | **Assumed** | Implemented methods have hand-derived tests. `AsString`, `Validate`, `Constrain`, `GetUnscheduled`, and `Set` resolve against eligible receiver classes; channel `Set` applies its project validation range before writing. `--coverage` remains authoritative for the methods a project uses. |
-| Filters, integrals, derivatives, debounce, delay, change detection, timers, and `static local` state | **Assumed** | Update laws and startup behavior are explicit implementation assumptions with hand-derived tests, not M1 value comparisons. |
+| Filters, integrals, derivatives, debounce, delay, change detection, timers, and `static local` state | **Assumed** | Update laws and startup behavior are explicit implementation assumptions with hand-derived tests, not M1 value comparisons. Timer countdowns use absolute evaluator time: `Remaining` is a read-only observation, while `Start`, `Stop`, and `Reset` are the only state transitions. |
 | `CanComms.*`, `Serial.*`, `System.*`, `Logging.*`, DBC objects, and other hardware-backed calls | **Assumed / Stubbed** | Each call crosses a typed adapter boundary with its resolved receiver, source call site, arguments, and evaluator time. Exact-site scenario values take precedence over wildcard values and an attached adapter. `System.ElapsedTime` reports the interval since that call site last ran. Its first tick-zero call returns zero, while a site first reached later uses its function step. Tick calls use the deterministic base timeline. `System.FlashSize` and `System.FlashFree` require scenario or adapter data; they never become a dangerous zero. Remaining unhandled calls use documented typed stubs or fail loud. |
 | Scenario parsing, tick grids, trace output, and `--coverage` | **Assumed** | These are deterministic m1-eval contracts tested with synthetic data. A `Supported` coverage entry means implemented, not M1-verified. |
 | Typed conformance fixture parser and runner | **Assumed** | Synthetic fixtures cover typed values, project hashes, initial-state reset, tolerances, and mismatch reporting. No genuine M1 Sim capture is committed yet, so this runner does not make another area Verified by itself. |
@@ -127,10 +127,12 @@ The multi-rate model:
   the fastest rate) is **rejected loudly** rather than rounded. Each function
   then runs every `base_rate_hz / rate_hz` ticks: a 100 Hz function on a 100 Hz
   base runs every tick, a 50 Hz function every other tick.
-- **Rate-correct `dt`.** A function's stateful operators (`Integral.Normal`,
-  filters, derivatives, timers) are stepped by *its own* period
+- **Rate-correct `dt`.** A function's sampled stateful operators
+  (`Integral.Normal`, filters, derivatives) are stepped by *its own* period
   (`1 / rate_hz`) — a 50 Hz integrator accumulates with `dt = 0.02`, not the
-  base `dt`, so time-domain operators use the configured function period.
+  base `dt`. Timer objects instead retain an absolute deadline on the same
+  evaluator timeline, so `Remaining` observes elapsed time without advancing
+  the timer merely because it was read.
 - **Zero-order hold between ticks.** A channel a function did not write this
   tick keeps its last value (the shared value store carries it forward), so a
   slow channel holds steady between its updates while fast channels move every
