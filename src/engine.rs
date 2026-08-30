@@ -232,10 +232,11 @@ impl Engine {
     }
 
     /// Report which builtins/constructs every loaded script uses and whether the
-    /// engine supports, stubs, or cannot handle each. Pure static analysis — no
-    /// scenario needed; safe to call before [`Engine::run`].
+    /// engine supports, assumes, stubs, or cannot handle each, along with the
+    /// whole-project execution schedule. Pure static analysis — no scenario
+    /// needed; safe to call before [`Engine::run`].
     pub fn coverage(&self) -> CoverageReport {
-        CoverageReport::analyse_in(&self.loaded.scripts, Some(&self.loaded.project))
+        CoverageReport::analyse_loaded(&self.loaded)
     }
 }
 

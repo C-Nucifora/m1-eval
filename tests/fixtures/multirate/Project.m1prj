@@ -17,7 +17,7 @@
 <!--       (its own period), NOT the 0.01 base dt                          -->
 <!--                                                                       -->
 <!--   Startup (no rate):                                                  -->
-<!--     Root.MR.Init          On Startup -> call_rate_hz = None, excluded -->
+<!--     Root.MR.Init          On Startup -> runs once before tick zero    -->
 <MoTeCM1BuildSession>
  <Project Name="MultiRate" TargetHardware="ecu120">
   <ComponentStream><List>

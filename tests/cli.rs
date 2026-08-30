@@ -199,6 +199,7 @@ fn coverage_prints_report() {
     let stdout = String::from_utf8_lossy(&assert.get_output().stdout).into_owned();
     // The report labels every bucket deterministically.
     assert!(stdout.contains("Supported:"), "coverage stdout: {stdout}");
+    assert!(stdout.contains("Assumed:"), "coverage stdout: {stdout}");
     assert!(stdout.contains("Stubbed:"), "coverage stdout: {stdout}");
     assert!(stdout.contains("Unsupported:"), "coverage stdout: {stdout}");
 }

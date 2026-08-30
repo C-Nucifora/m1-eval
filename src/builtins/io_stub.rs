@@ -35,14 +35,18 @@ use crate::expr::EvalCtx;
 use crate::value::Value;
 use m1_typecheck::intrinsics;
 
-/// Evaluate one Tier-3 IO call. See the module docs for the resolution order.
+/// Evaluate one Tier-3 IO call. `library_object` is the canonical intrinsic
+/// catalog object. `source_object` keeps the exact spelling used for scenario
+/// overrides, trace keys, and errors. See the module docs for the resolution
+/// order.
 pub fn call(
-    object: &str,
+    library_object: &str,
+    source_object: &str,
     method: &str,
     args: &[Value],
     ctx: &mut EvalCtx,
 ) -> Result<Value, EvalError> {
-    let key = format!("{object}.{method}");
+    let key = format!("{source_object}.{method}");
 
     // 1. Scenario override wins.
     if let Some(v) = ctx.env.io_override(&key).cloned() {
@@ -51,7 +55,7 @@ pub fn call(
     }
 
     // 2. Specific documented offline stubs (a *meaningful* offline value).
-    if let Some(v) = documented_stub(object, method, args, ctx)? {
+    if let Some(v) = documented_stub(library_object, method, args, ctx)? {
         mark_external(ctx, &key);
         return Ok(v);
     }
@@ -61,7 +65,7 @@ pub fn call(
     //    value, but a determinate return *type* — so return the type-correct
     //    default rather than abort the run on the first CAN read. The default is
     //    the externally-driven value a scenario / log replay would override.
-    if let Some(v) = typed_io_default(object, method) {
+    if let Some(v) = typed_io_default(library_object, method) {
         mark_external(ctx, &key);
         return Ok(v);
     }
@@ -69,7 +73,7 @@ pub fn call(
     // 4. Fail loud — the method is not in the registry for this object, so it is
     //    genuinely unknown. We never fabricate a value for an unknown method.
     Err(EvalError::UnsupportedBuiltin {
-        object: object.to_string(),
+        object: source_object.to_string(),
         method: method.to_string(),
     })
 }
@@ -369,6 +373,25 @@ mod tests {
             Value::Float(12.5)
         );
         assert!(h.trace.is_external("CanComms.GetFloat"));
+    }
+
+    #[test]
+    fn library_anchor_keeps_source_spelling_for_io_override_and_trace() {
+        let mut h = Harness::new();
+        h.env
+            .set_io_override("Library.CanComms.GetFloat", Value::Float(12.5));
+
+        assert_eq!(
+            h.io(
+                "Library.CanComms",
+                "GetFloat",
+                &[Value::Uint(0), Value::Int(0)]
+            )
+            .unwrap(),
+            Value::Float(12.5)
+        );
+        assert!(h.trace.is_external("Library.CanComms.GetFloat"));
+        assert!(!h.trace.is_external("CanComms.GetFloat"));
     }
 
     #[test]

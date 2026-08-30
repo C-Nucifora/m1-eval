@@ -134,15 +134,17 @@ The multi-rate model:
 ### `--coverage`
 
 Before running, `m1-eval --coverage` reports, per project, which builtins and
-constructs each script uses and whether the engine **implements**, **stubs**, or
-does **not support** them. `Supported` is an implementation label, not a
+constructs each script uses and whether the engine **implements** them directly,
+evaluates them under a documented **assumption** that still needs M1 conformance
+evidence, **stubs** them (Tier-3 IO, externally driven), or does **not support**
+them (would fail loud at runtime). `Supported` is an implementation label, not a
 **Verified** maturity claim.
 
 The report also prints a **`Schedule:`** section: every script-backed function
-with its execution rate (`@ 500 Hz`, `@ 50 Hz`, …), or *unscheduled* for a
-function with no periodic trigger. This makes a `whole-project` run transparent —
-you see exactly which functions the scheduler will run, at what rate, and which
-are excluded — before you run it.
+with its execution rate (`@ 500 Hz`, `@ 50 Hz`, …), `startup, runs once`, or
+*unscheduled*. This makes a `whole-project` run transparent — you see exactly
+which functions the scheduler will run, at what rate, and which are excluded —
+before you run it.
 
 ## Quickstart
 
@@ -159,7 +161,7 @@ Seed an ordinary hardware channel with scenario `[[inputs]]`. Seed a
 hardware-backed builtin call with `[[io]]`, using its exact `Object.Method` name.
 Without those seeds, function and cone runs fail on an ordinary missing channel,
 while Tier-3 calls use the **Stubbed** contract. Run `--coverage` first to see the
-implemented, stubbed, and unsupported calls in a project.
+implemented, assumed, stubbed, and unsupported calls in a project.
 
 Whole-project mode is strict about ordinary missing channels unless
 `allow_default_inputs = true` or `--allow-default-inputs` is set. The CLI then

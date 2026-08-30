@@ -49,6 +49,12 @@ fn root_segment(path: &str) -> &str {
     }
 }
 
+/// The intrinsic object segment of a resolved builtin callee. `Library.` is an
+/// explicit scope anchor and is not part of the catalog object name.
+fn builtin_object_segment(path: &str) -> &str {
+    root_segment(path.strip_prefix("Library.").unwrap_or(path))
+}
+
 /// Classify an identifier/path against the project, the enclosing group, the
 /// backing function symbol, and the current function locals.
 ///
@@ -81,10 +87,11 @@ pub fn classify(
         Resolution::BuiltinObject(obj) => Target::Builtin {
             object: obj.to_string(),
         },
-        // A builtin function/method call (`Calculate.Max`). Its object is the
-        // leading segment; the call path validates and dispatches the method.
+        // A builtin function/method call (`Calculate.Max` or the explicitly
+        // anchored `Library.Calculate.Max`). Carry the intrinsic object name;
+        // the call path validates and dispatches the method.
         Resolution::BuiltinFn(_) => Target::Builtin {
-            object: root_segment(name).to_string(),
+            object: builtin_object_segment(name).to_string(),
         },
         // `Opaque` covers `In`/`Out`/`Parent`/`This`/`Library`/`Root` anchors and
         // accessor calls on existing symbols — not a project miss, but also not a
@@ -162,6 +169,39 @@ mod tests {
         let project = mini_project();
         let locals = HashMap::new();
         let t = classify("Calculate.Max", Some("Root.Demo"), None, &project, &locals);
+        assert_eq!(
+            t,
+            Target::Builtin {
+                object: "Calculate".to_string()
+            }
+        );
+    }
+
+    #[test]
+    fn local_only_shadows_a_single_segment_not_a_builtin_callee() {
+        let project = mini_project();
+        let mut locals = HashMap::new();
+        locals.insert("Calculate".to_string(), Value::Int(0));
+
+        assert_eq!(
+            classify("Calculate.Max", Some("Root.Demo"), None, &project, &locals,),
+            Target::Builtin {
+                object: "Calculate".to_string()
+            }
+        );
+    }
+
+    #[test]
+    fn library_anchored_builtin_function_carries_canonical_object() {
+        let project = mini_project();
+        let locals = HashMap::new();
+        let t = classify(
+            "Library.Calculate.Max",
+            Some("Root.Demo"),
+            None,
+            &project,
+            &locals,
+        );
         assert_eq!(
             t,
             Target::Builtin {

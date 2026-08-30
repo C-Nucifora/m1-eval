@@ -1,4 +1,4 @@
 // Synthetic m1-eval multirate fixture. No proprietary content.
-// On Startup (call_rate_hz = None): NOT periodically scheduled, so the
-// whole-project schedule excludes it. Writes a marker channel.
+// On Startup (call_rate_hz = None): runs once before the periodic schedule.
+// Writes a marker channel.
 Started = 1.0;

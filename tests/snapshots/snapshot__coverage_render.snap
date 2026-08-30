@@ -5,6 +5,8 @@ expression: report.render()
 Supported:
   construct assignment_statement
   construct local_declaration
+Assumed:
+  (none)
 Stubbed:
   (none)
 Unsupported:

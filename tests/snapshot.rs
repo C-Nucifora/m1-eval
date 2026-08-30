@@ -129,8 +129,9 @@ fn coverage_render_snapshot() {
 }
 
 /// The multirate fixture's coverage report renders a `Schedule:` section listing
-/// every scheduled function fastest-first with its rate, and flags the On-Startup
-/// function unscheduled — pinned so a regression in the schedule report shows.
+/// every scheduled function fastest-first with its rate, and identifies the
+/// On-Startup function as running once — pinned so a regression in the schedule
+/// report shows.
 #[test]
 fn coverage_schedule_render_snapshot() {
     let dir = Path::new(env!("CARGO_MANIFEST_DIR")).join("tests/fixtures/multirate");
