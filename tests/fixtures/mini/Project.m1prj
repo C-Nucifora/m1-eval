@@ -6,7 +6,16 @@
    <Component Classname="BuiltIn.GroupCompound" Name="Root.Demo"/>
    <Component Classname="BuiltIn.Channel" Name="Root.Demo.Speed"><Props Type="f32"><Locale><Default Unit="rpm"/></Locale></Props></Component>
    <Component Classname="BuiltIn.Channel" Name="Root.Demo.Output"><Props Type="f32"/></Component>
+   <Component Classname="BuiltIn.Channel" Name="Root.Demo.FloatTarget"><Props Type="f32"/></Component>
+   <Component Classname="BuiltIn.Channel" Name="Root.Demo.FixedTarget"><Props Type="FixedPoint7dps"/></Component>
    <Component Classname="BuiltIn.Parameter" Name="Root.Demo.Gain"><Props Type="f32"/></Component>
+   <Component Classname="BuiltIn.Parameter" Name="Root.Demo.FixedGain"><Props Type="FixedPoint7dps"/></Component>
+   <Component Classname="BuiltIn.Constant" Name="Root.Demo.SignedConstant"><Props Type="s32" Value="-2147483648"/></Component>
+   <Component Classname="BuiltIn.Constant" Name="Root.Demo.UnsignedConstant"><Props Type="u32" Value="4294967295"/></Component>
+   <Component Classname="BuiltIn.Constant" Name="Root.Demo.FloatConstant"><Props Type="f32" Value="16777217"/></Component>
+   <Component Classname="BuiltIn.Constant" Name="Root.Demo.FixedConstant"><Props Type="FixedPoint7dps" Value="1.2345678"/></Component>
+   <Component Classname="BuiltIn.Constant" Name="Root.Demo.LegacyConstant"><Props Value="100"/></Component>
+   <Component Classname="BuiltIn.Constant" Name="Root.Demo.BooleanConstant"><Props Value="true"/></Component>
    <Component Classname="BuiltIn.Table" Name="Root.Demo.Map"><Props Type="f32"/></Component>
    <Component Classname="BuiltIn.GroupCompound" Name="Root.Demo.Sensor Compound"><Props UseDefValue="true" DefValue="This.Sensor"/></Component>
    <Component Classname="BuiltIn.Channel" Name="Root.Demo.Sensor Compound.Sensor"><Props Type="f32"/></Component>

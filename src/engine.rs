@@ -302,7 +302,7 @@ const = 2.5
             .channels
             .get("Root.Demo.Output")
             .expect("Output column present");
-        assert_eq!(out, &vec![Value::Float(50.0); 3]);
+        assert_eq!(out, &vec![Value::m1_float(50.0); 3]);
     }
 
     #[test]
@@ -346,11 +346,11 @@ const = 6.0
             .channels
             .get("Root.MR.Slow Echo")
             .expect("Slow Echo column");
-        assert_eq!(echo, &vec![Value::Float(6.0); 4]);
+        assert_eq!(echo, &vec![Value::m1_float(6.0); 4]);
         // The On-Startup function ran exactly once before the periodic loop;
         // its marker holds across every tick.
         let started = trace.channels.get("Root.MR.Started").expect("Started");
-        assert_eq!(started, &vec![Value::Float(1.0); 4]);
+        assert_eq!(started, &vec![Value::m1_float(1.0); 4]);
     }
 
     #[test]
@@ -558,9 +558,9 @@ const = 6.0
         assert_eq!(names, vec!["Sensor"]);
         let sensor = log.series_for("Sensor").expect("Sensor present");
         // Engineering-unit scaling applied: raw 100 -> 10.0 at t=0.0.
-        assert_eq!(sensor.sample(0.0), Value::Float(10.0));
+        assert_eq!(sensor.sample(0.0), Value::m1_float(10.0));
         // Time grid derived from the 10 Hz rate: second sample at t=0.1 -> 20.0.
-        assert_eq!(sensor.sample(0.1), Value::Float(20.0));
+        assert_eq!(sensor.sample(0.1), Value::m1_float(20.0));
         // Units rode along into provenance metadata.
         assert_eq!(log.meta.units.get("Sensor").map(String::as_str), Some("V"));
     }
@@ -600,13 +600,16 @@ const = 6.0
         let mid = trace.channels.get("Root.CF.Mid").expect("Mid column");
         let result = trace.channels.get("Root.CF.Result").expect("Result column");
         let other = trace.channels.get("Root.CF.Other").expect("Other column");
-        assert!(mid.iter().all(|v| *v == Value::Float(200.0)), "{mid:?}");
+        assert!(mid.iter().all(|v| *v == Value::m1_float(200.0)), "{mid:?}");
         assert!(
-            result.iter().all(|v| *v == Value::Float(201.0)),
+            result.iter().all(|v| *v == Value::m1_float(201.0)),
             "{result:?}"
         );
         // Other is unrelated to the override: it passes through at its logged value.
-        assert!(other.iter().all(|v| *v == Value::Float(42.0)), "{other:?}");
+        assert!(
+            other.iter().all(|v| *v == Value::m1_float(42.0)),
+            "{other:?}"
+        );
     }
 
     #[test]

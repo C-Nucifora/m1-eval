@@ -13,6 +13,21 @@
    <Component Classname="BuiltIn.FuncUserParam" Filename="Helper.Compute.m1scr" Name="Root.Helper.Compute">
     <Signature ReturnType="f32"><Params><Param Name="x" Type="f32"/></Params></Signature>
    </Component>
+   <Component Classname="BuiltIn.FuncUserParam" Filename="Helper.Echo.m1scr" Name="Root.Helper.Echo">
+    <Signature ReturnType="f32"><Params><Param Name="x" Type="f32"/></Params></Signature>
+   </Component>
+   <Component Classname="BuiltIn.FuncUserParam" Filename="Helper.ReturnInt.m1scr" Name="Root.Helper.ReturnInt">
+    <Signature ReturnType="f32"><Params/></Signature>
+   </Component>
+   <Component Classname="BuiltIn.FuncUserParam" Filename="Helper.FixedEcho.m1scr" Name="Root.Helper.FixedEcho">
+    <Signature ReturnType="FixedPoint7dps"><Params><Param Name="x" Type="FixedPoint7dps"/></Params></Signature>
+   </Component>
+   <Component Classname="BuiltIn.FuncUserParam" Filename="Helper.FixedToFloat.m1scr" Name="Root.Helper.FixedToFloat">
+    <Signature ReturnType="f32"><Params><Param Name="dummy" Type="f32"/></Params></Signature>
+   </Component>
+   <Component Classname="BuiltIn.FuncUserParam" Filename="Helper.InferredFixed.m1scr" Name="Root.Helper.InferredFixed">
+    <Signature><Params><Param Name="dummy" Type="f32"/></Params></Signature>
+   </Component>
    <Component Classname="BuiltIn.GroupCompound" Name="Root.Recur"/>
    <Component Classname="BuiltIn.FuncUserParam" Filename="Recur.Loop.m1scr" Name="Root.Recur.Loop">
     <Signature ReturnType="f32"><Params><Param Name="n" Type="f32"/></Params></Signature>

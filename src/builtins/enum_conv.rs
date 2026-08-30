@@ -32,7 +32,7 @@ use m1_typecheck::symbols::SymbolKind;
 /// Convert `<object>.AsInteger()` to its declared enum integer.
 ///
 /// Returns:
-/// - `Ok(Some(Value::Int(n)))` when `object` is a recognised enum source (either
+/// - `Ok(Some(Value::M1(Integer(n))))` when `object` is a recognised enum source (either
 ///   form) and the conversion succeeds;
 /// - `Ok(None)` when `object` is neither an enum-type-qualified member literal
 ///   nor a value-holding enum source — so the caller can fall through to other
@@ -52,7 +52,11 @@ pub fn as_integer(object: &str, ctx: &mut EvalCtx) -> Result<Option<Value>, Eval
                 id,
                 member: leaf.to_string(),
             };
-            return Ok(Some(Value::Int(v.as_enum_int(ctx.project)?)));
+            let integer =
+                i32::try_from(v.as_enum_int(ctx.project)?).map_err(|_| EvalError::TypeError {
+                    detail: format!("enum member {leaf:?} is outside the M1 Integer range"),
+                })?;
+            return Ok(Some(Value::m1_integer(integer)));
         }
         // The prefix *is* an enum type but the leaf is not one of its members:
         // a fail-loud error rather than a silent miss — the author wrote an
@@ -104,7 +108,11 @@ pub fn as_integer(object: &str, ctx: &mut EvalCtx) -> Result<Option<Value>, Eval
 /// non-enum value is a `TypeError` (never a guessed integer).
 fn convert_value_at(canon: &str, ctx: &mut EvalCtx) -> Result<Value, EvalError> {
     let value = crate::expr::read_symbol(canon, ctx)?;
-    Ok(Value::Int(value.as_enum_int(ctx.project)?))
+    let integer =
+        i32::try_from(value.as_enum_int(ctx.project)?).map_err(|_| EvalError::TypeError {
+            detail: format!("enum value at {canon:?} is outside the M1 Integer range"),
+        })?;
+    Ok(Value::m1_integer(integer))
 }
 
 #[cfg(test)]
@@ -156,6 +164,7 @@ mod tests {
                 script_name: "Demo.Update.m1scr",
                 dt: 0.01,
                 scripts: &[],
+                signature_m1_types: None,
                 depth: 0,
                 trace: None,
             }
@@ -173,12 +182,15 @@ mod tests {
     fn literal_form_returns_member_container_order() {
         let mut h = Harness::new();
         // Idle has ContainerOrder 0.
-        assert_eq!(h.as_int("Drive State.Idle").unwrap(), Some(Value::Int(0)));
+        assert_eq!(
+            h.as_int("Drive State.Idle").unwrap(),
+            Some(Value::m1_integer(0))
+        );
         // Precharging has ContainerOrder 2 (NOT ordinal index 1) — proves the
         // declared value is used, not the position in the member list.
         assert_eq!(
             h.as_int("Drive State.Precharging").unwrap(),
-            Some(Value::Int(2))
+            Some(Value::m1_integer(2))
         );
     }
 
@@ -207,9 +219,12 @@ mod tests {
             },
         );
         // `Mode` resolves (group-relative) to Root.Demo.Mode, an enum channel.
-        assert_eq!(h.as_int("Mode").unwrap(), Some(Value::Int(2)));
+        assert_eq!(h.as_int("Mode").unwrap(), Some(Value::m1_integer(2)));
         // And the absolute path works too.
-        assert_eq!(h.as_int("Root.Demo.Mode").unwrap(), Some(Value::Int(2)));
+        assert_eq!(
+            h.as_int("Root.Demo.Mode").unwrap(),
+            Some(Value::m1_integer(2))
+        );
     }
 
     #[test]
@@ -225,7 +240,10 @@ mod tests {
             },
         );
         // Addressing the compound itself reads through to its `.Value` child.
-        assert_eq!(h.as_int("Root.Demo.Compound").unwrap(), Some(Value::Int(0)));
+        assert_eq!(
+            h.as_int("Root.Demo.Compound").unwrap(),
+            Some(Value::m1_integer(0))
+        );
     }
 
     #[test]

@@ -1012,6 +1012,7 @@ mod tests {
                 script_name: "Demo.Update.m1scr",
                 dt: self.dt,
                 scripts: &[],
+                signature_m1_types: None,
                 depth: 0,
                 trace: None,
             };
@@ -1169,6 +1170,7 @@ mod tests {
                 script_name: "Demo.Update.m1scr",
                 dt: h.dt,
                 scripts: &[],
+                signature_m1_types: None,
                 depth: 0,
                 trace: None,
             };
@@ -1201,6 +1203,7 @@ mod tests {
             script_name: "Demo.Update.m1scr",
             dt: h.dt,
             scripts: &[],
+            signature_m1_types: None,
             depth: 0,
             trace: None,
         };
@@ -1508,6 +1511,7 @@ mod tests {
                 script_name: "Demo.Update.m1scr",
                 dt: h.dt,
                 scripts: &[],
+                signature_m1_types: None,
                 depth: 0,
                 trace: None,
             };
@@ -1536,6 +1540,7 @@ mod tests {
                 script_name: "Demo.Update.m1scr",
                 dt: h.dt,
                 scripts: &[],
+                signature_m1_types: None,
                 depth: 0,
                 trace: None,
             };

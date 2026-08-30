@@ -283,7 +283,7 @@ fn match_log_series<'a>(log: &'a Log, path: &str) -> Option<(&'a InputSeries, bo
 fn column_as_f64(col: &[Value]) -> Option<Vec<f64>> {
     let mut out = Vec::with_capacity(col.len());
     for v in col {
-        out.push(v.as_f64().ok()?);
+        out.push(v.m1_scalar().ok()?.as_f64());
     }
     Some(out)
 }
@@ -291,7 +291,11 @@ fn column_as_f64(col: &[Value]) -> Option<Vec<f64>> {
 /// Sample a log series at `t` as `f64`; a non-numeric sample becomes `NaN` (it is
 /// filtered out of `max_abs_delta` so it never spuriously flags a change).
 fn sample_f64(series: &InputSeries, t: f64) -> f64 {
-    series.sample(t).as_f64().unwrap_or(f64::NAN)
+    series
+        .sample(t)
+        .m1_scalar()
+        .map(|value| value.as_f64())
+        .unwrap_or(f64::NAN)
 }
 
 /// Format an `f64` for JSON: a finite number, or `null` for NaN/±inf (JSON has no
@@ -369,15 +373,15 @@ mod tests {
                 InputSeries {
                     channel: "Root.CF.Sensor".to_string(),
                     kind: InputKind::Series(vec![
-                        (0.0, Value::Float(10.0)),
-                        (1.0, Value::Float(10.0)),
+                        (0.0, Value::m1_float(10.0)),
+                        (1.0, Value::m1_float(10.0)),
                     ]),
                 },
                 InputSeries {
                     channel: "Root.CF.Mid".to_string(),
                     kind: InputKind::Series(vec![
-                        (0.0, Value::Float(25.0)),
-                        (1.0, Value::Float(25.0)),
+                        (0.0, Value::m1_float(25.0)),
+                        (1.0, Value::m1_float(25.0)),
                     ]),
                 },
             ],
@@ -393,7 +397,7 @@ mod tests {
         for (path, vals) in cols {
             t.channels.insert(
                 (*path).to_string(),
-                vals.iter().map(|v| Value::Float(*v)).collect(),
+                vals.iter().map(|v| Value::m1_float(*v as f32)).collect(),
             );
         }
         t
@@ -447,7 +451,7 @@ mod tests {
         let log = Log {
             channels: vec![InputSeries {
                 channel: "Sensor".to_string(),
-                kind: InputKind::Series(vec![(0.0, Value::Float(1.0))]),
+                kind: InputKind::Series(vec![(0.0, Value::m1_float(1.0))]),
             }],
             meta: crate::log::LogMeta::default(),
         };
@@ -494,7 +498,7 @@ mod tests {
         let log = Log {
             channels: vec![InputSeries {
                 channel: "Value".to_string(),
-                kind: InputKind::Series(vec![(0.0, Value::Float(1.0))]),
+                kind: InputKind::Series(vec![(0.0, Value::m1_float(1.0))]),
             }],
             meta: crate::log::LogMeta::default(),
         };
@@ -523,7 +527,7 @@ mod tests {
         let log = Log {
             channels: vec![InputSeries {
                 channel: "Value".to_string(),
-                kind: InputKind::Series(vec![(0.0, Value::Float(1.0))]),
+                kind: InputKind::Series(vec![(0.0, Value::m1_float(1.0))]),
             }],
             meta: crate::log::LogMeta::default(),
         };
@@ -543,7 +547,7 @@ mod tests {
         let log = Log {
             channels: vec![InputSeries {
                 channel: "Sensor".to_string(),
-                kind: InputKind::Series(vec![(0.0, Value::Float(1.0))]),
+                kind: InputKind::Series(vec![(0.0, Value::m1_float(1.0))]),
             }],
             meta: crate::log::LogMeta::default(),
         };

@@ -43,7 +43,7 @@ pub fn call(method: &str, args: &[Value]) -> Result<Option<Value>, EvalError> {
         "Infinity" => Value::Float(f64::INFINITY),
         // The largest representable finite float (paraphrased: the maximum finite
         // floating-point magnitude the firmware can hold).
-        "MaximumFloat" => Value::Float(f64::MAX),
+        "MaximumFloat" => Value::Float(f32::MAX as f64),
         "Floor" => Value::Float(unary_f64(args)?.floor()),
         "Ceiling" => Value::Float(unary_f64(args)?.ceil()),
         "Power" => {
@@ -390,7 +390,7 @@ mod tests {
 
     #[test]
     fn maximum_float_is_the_largest_finite() {
-        assert_eq!(ok("MaximumFloat", &[]), Value::Float(f64::MAX));
+        assert_eq!(ok("MaximumFloat", &[]), Value::Float(f32::MAX as f64));
     }
 
     #[test]

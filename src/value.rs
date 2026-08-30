@@ -107,6 +107,20 @@ impl M1Scalar {
         }
     }
 
+    /// Convert to the binary32 value used by M1 floating-point expressions.
+    ///
+    /// Integer and fixed-point inputs are rounded to binary32 here, before an
+    /// operation is performed. This prevents an expression from accidentally
+    /// gaining host `f64` precision between M1 operations.
+    pub fn as_f32(self) -> f32 {
+        match self {
+            Self::FloatingPoint(value) => value,
+            Self::Integer(value) => value as f32,
+            Self::UnsignedInteger(value) => value as f32,
+            Self::FixedPoint7dps(value) => value.as_f64() as f32,
+        }
+    }
+
     /// Convert to one of the legacy numeric [`Value`] variants.
     ///
     /// This is an explicit compatibility boundary scheduled for removal with
@@ -155,6 +169,71 @@ pub enum Value {
 }
 
 impl Value {
+    /// Construct an M1 binary32 value.
+    pub const fn m1_float(value: f32) -> Self {
+        Self::M1(M1Scalar::FloatingPoint(value))
+    }
+
+    /// Construct an M1 signed 32-bit integer value.
+    pub const fn m1_integer(value: i32) -> Self {
+        Self::M1(M1Scalar::Integer(value))
+    }
+
+    /// Construct an M1 unsigned 32-bit integer value.
+    pub const fn m1_unsigned(value: u32) -> Self {
+        Self::M1(M1Scalar::UnsignedInteger(value))
+    }
+
+    /// Return the M1 scalar held by this value.
+    ///
+    /// Unlike [`Value::try_as_m1_scalar`], this rejects every legacy numeric
+    /// variant. Core evaluator paths use this accessor so a host-width value
+    /// cannot silently re-enter script execution outside a named boundary.
+    pub fn m1_scalar(&self) -> Result<M1Scalar, EvalError> {
+        match self {
+            Self::M1(value) => Ok(*value),
+            Self::Int(_) | Self::Uint(_) | Self::Float(_) => Err(EvalError::TypeError {
+                detail: format!("legacy numeric value {self:?} reached an M1-only evaluator path"),
+            }),
+            other => Err(EvalError::TypeError {
+                detail: format!("{other:?} is not numeric"),
+            }),
+        }
+    }
+
+    /// Narrow a legacy builtin result to its corresponding M1 scalar family.
+    ///
+    /// This is the named output boundary for builtin implementations that are
+    /// migrated by issue #38. Signed and unsigned results are range checked;
+    /// legacy floats round to binary32 and reject finite overflow. Non-numeric
+    /// results already use their final representation and pass through.
+    pub(crate) fn restore_legacy_builtin_result(self) -> Result<Self, EvalError> {
+        match self {
+            Self::Int(value) => i32::try_from(value)
+                .map(Self::m1_integer)
+                .map_err(|_| numeric_width_error(&Self::Int(value), "Integer (i32)")),
+            Self::Uint(value) => u32::try_from(value)
+                .map(Self::m1_unsigned)
+                .map_err(|_| numeric_width_error(&Self::Uint(value), "UnsignedInteger (u32)")),
+            Self::Float(value) => Self::Float(value)
+                .try_as_m1_scalar_for(M1ScalarKind::FloatingPoint)
+                .map(Self::M1),
+            value => Ok(value),
+        }
+    }
+
+    /// Widen an M1 scalar for a legacy builtin implementation.
+    ///
+    /// This is the named input boundary paired with
+    /// [`Value::restore_legacy_builtin_result`]. It is deliberately unavailable as
+    /// a general evaluator coercion.
+    pub(crate) fn into_legacy_builtin_argument(self) -> Self {
+        match self {
+            Self::M1(value) => value.into_legacy_value(),
+            value => value,
+        }
+    }
+
     /// Coerce a numeric value to `f64`. Non-numeric values are a `TypeError`;
     /// we never invent a default number.
     pub fn as_f64(&self) -> Result<f64, EvalError> {

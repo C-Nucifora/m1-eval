@@ -22,9 +22,11 @@
 //! in [`Trace::external`] so a consumer knows which columns are simulated input
 //! rather than evaluated output.
 //!
-//! Serialisation is deterministic: JSON via `serde_json`, and a CSV with a
-//! `time` column followed by one column per channel in sorted-name order so the
-//! output is reproducible across runs.
+//! Internal channel and expression columns retain their M1 scalar family. The
+//! established JSON and CSV formats are untyped compatibility outputs, so they
+//! preserve numeric values but do not encode signedness metadata. Serialisation
+//! is deterministic, with a `time` column followed by channels in sorted-name
+//! order.
 
 use crate::value::{M1Scalar, Value};
 use std::collections::{BTreeMap, BTreeSet};
@@ -110,7 +112,8 @@ impl Trace {
 
     /// Serialise the channel columns + time axis to JSON. The shape is
     /// `{ "time": [...], "channels": { path: [...] }, "external": [...] }`,
-    /// values rendered by `value_json`. JSON has no non-finite number syntax, so
+    /// values rendered by `value_json`. This historical untyped shape cannot
+    /// expose M1 scalar-family metadata. JSON has no non-finite number syntax, so
     /// NaN and positive or negative infinity are written as `null`. Deterministic
     /// ordering comes from the `BTreeMap` and `BTreeSet` fields.
     pub fn to_json(&self) -> String {
@@ -136,7 +139,8 @@ impl Trace {
     }
 
     /// Serialise to CSV: a `time` header column followed by one column per
-    /// channel in sorted-name order. Rows are ticks; a channel with no value at a
+    /// channel in sorted-name order. This historical untyped shape cannot expose
+    /// M1 scalar-family metadata. Rows are ticks; a channel with no value at a
     /// given tick leaves an empty cell so columns stay aligned to the time axis.
     pub fn to_csv(&self) -> String {
         let paths: Vec<&String> = self.channels.keys().collect();

@@ -121,7 +121,7 @@ fn exec_assignment(node: &Node, ctx: &mut EvalCtx) -> Result<(), EvalError> {
         rhs
     };
 
-    write_dest(&dest, final_value, ctx);
+    write_dest(&dest, final_value, ctx)?;
     Ok(())
 }
 
@@ -249,22 +249,104 @@ fn read_dest(dest: &Dest, ctx: &mut EvalCtx) -> Result<Value, EvalError> {
 }
 
 /// Write a value to a destination, recording channel writes into the trace.
-fn write_dest(dest: &Dest, value: Value, ctx: &mut EvalCtx) {
+fn write_dest(dest: &Dest, value: Value, ctx: &mut EvalCtx) -> Result<(), EvalError> {
     match dest {
-        Dest::Local(name) => ctx.env.set_local(name.clone(), value),
-        Dest::Static { fn_symbol, var } => ctx.env.set_static(fn_symbol, var, value),
+        Dest::Local(name) => {
+            let kind = existing_scalar_kind(ctx.env.get_local(name));
+            let value = coerce_to_existing_kind(name, value, kind)?;
+            ctx.env.set_local(name.clone(), value);
+        }
+        Dest::Static { fn_symbol, var } => {
+            let kind = existing_scalar_kind(ctx.env.get_static(fn_symbol, var));
+            let value = coerce_to_existing_kind(var, value, kind)?;
+            ctx.env.set_static(fn_symbol, var, value);
+        }
         Dest::Channel(canon) => {
-            // Coerce a numeric write to an enum-typed channel to its enum member,
-            // so an enum channel assigned an integer holds a typed enum value (the
-            // same implicit int→enum conversion M1 applies on assignment).
-            let value = expr::coerce_for_channel(canon, value, ctx.project);
+            let value = expr::coerce_for_channel(canon, value, ctx.project)?;
+            // A known project declaration is authoritative even if an old or
+            // manually seeded environment slot has the wrong family. Retain an
+            // existing exact kind only when the upstream type model cannot
+            // identify the target family.
+            let statically_directed = ctx.project.symbols().get(canon).is_some_and(|symbol| {
+                symbol.value_type != ValueType::Unknown
+                    || symbol.declared_type.as_deref().is_some_and(|declared| {
+                        declared.eq_ignore_ascii_case("FixedPoint7dps")
+                            || declared.eq_ignore_ascii_case("fixed7dps")
+                    })
+            });
+            let kind = if statically_directed {
+                None
+            } else {
+                existing_scalar_kind(ctx.env.get(canon))
+            };
+            let value = coerce_to_existing_kind(canon, value, kind)?;
             ctx.env.set(canon.clone(), value.clone());
             if let Some(trace) = ctx.trace.as_deref_mut() {
                 trace.record_channel(canon.clone(), value);
             }
         }
-        // The return slot is function-local: write it, do not record a channel.
-        Dest::Out => ctx.env.set_out(value),
+        Dest::Out => {
+            let return_symbol = ctx
+                .fn_symbol
+                .and_then(|path| ctx.project.symbols().get(path));
+            let exact_return_kind = ctx.signature_m1_types.and_then(|types| {
+                ctx.fn_symbol
+                    .and_then(|function| types.return_kind(function))
+            });
+            let declared_return = return_symbol.and_then(|symbol| symbol.return_type);
+            // With loader metadata present, no exact declared return means the
+            // typechecker's Float was inferred. It may have come from a fixed
+            // intrinsic, so retain the exact runtime family. Direct EvalCtx
+            // users without that metadata retain the older unsigned-function
+            // fallback, where `in_params = None` means no declared signature.
+            let inferred_fixed = return_symbol.is_some_and(|symbol| {
+                exact_return_kind.is_none()
+                    && symbol.return_type == Some(ValueType::Float)
+                    && matches!(&value, Value::M1(crate::value::M1Scalar::FixedPoint7dps(_)))
+                    && (ctx.signature_m1_types.is_some() || symbol.in_params.is_none())
+            });
+            let value = match (exact_return_kind, declared_return) {
+                (Some(kind), _) => {
+                    expr::coerce_for_scalar_kind(ctx.fn_symbol.unwrap_or("Out"), value, kind)?
+                }
+                (None, Some(declared)) if !inferred_fixed => expr::coerce_for_declared_type(
+                    ctx.fn_symbol.unwrap_or("Out"),
+                    value,
+                    declared,
+                    ctx.project,
+                )?,
+                _ => value,
+            };
+            let statically_directed =
+                exact_return_kind.is_some() || (declared_return.is_some() && !inferred_fixed);
+            let kind = if statically_directed {
+                None
+            } else {
+                existing_scalar_kind(ctx.env.get_out())
+            };
+            let value = coerce_to_existing_kind("Out", value, kind)?;
+            // The return slot is function-local: write it, do not record a channel.
+            ctx.env.set_out(value);
+        }
+    }
+    Ok(())
+}
+
+fn existing_scalar_kind(value: Option<&Value>) -> Option<crate::value::M1ScalarKind> {
+    match value {
+        Some(Value::M1(scalar)) => Some(scalar.kind()),
+        _ => None,
+    }
+}
+
+fn coerce_to_existing_kind(
+    target: &str,
+    value: Value,
+    kind: Option<crate::value::M1ScalarKind>,
+) -> Result<Value, EvalError> {
+    match kind {
+        Some(kind) => expr::coerce_for_scalar_kind(target, value, kind),
+        None => Ok(value),
     }
 }
 
@@ -434,10 +516,10 @@ fn values_equal_loose(a: &Value, b: &Value) -> Result<bool, EvalError> {
         (Value::Enum { id: i1, member: m1 }, Value::Enum { id: i2, member: m2 }) => {
             Ok(i1 == i2 && m1 == m2)
         }
-        (
-            Value::Int(_) | Value::Uint(_) | Value::Float(_),
-            Value::Int(_) | Value::Uint(_) | Value::Float(_),
-        ) => Ok(a.as_f64()? == b.as_f64()?),
+        (Value::M1(_), Value::M1(_)) => Ok(matches!(
+            expr::apply_binary_values(Kind::Eq, a, b)?,
+            Value::Bool(true)
+        )),
         _ => Ok(false),
     }
 }
@@ -464,15 +546,15 @@ fn exec_expand(node: &Node, ctx: &mut EvalCtx) -> Result<(), EvalError> {
         .ok_or_else(|| shape_err(node, "expand body"))?;
 
     let var_name = var.text().trim().to_string();
-    let start = eval(&start_node, ctx)?.as_f64()? as i64;
-    let end = eval(&end_node, ctx)?.as_f64()? as i64;
+    let start = expand_bound(&eval(&start_node, ctx)?)?;
+    let end = expand_bound(&eval(&end_node, ctx)?)?;
 
     // The body source, with `$(VAR)` placeholders, taken verbatim from the CST.
     let body_src = body.text().to_string();
 
     // The expand range is inclusive of both ends (the manual's `Start to End`).
     // Walk it in whichever direction the bounds imply so descending loops work.
-    let range: Vec<i64> = if start <= end {
+    let range: Vec<i32> = if start <= end {
         (start..=end).collect()
     } else {
         (end..=start).rev().collect()
@@ -486,7 +568,7 @@ fn exec_expand(node: &Node, ctx: &mut EvalCtx) -> Result<(), EvalError> {
         // The loop variable is an integer local for the body: a bare `i` reads it,
         // while `$(i)` splices its value textually into identifiers/paths
         // (`Out$(i)` → `Out1`). Bind the local, then substitute the placeholders.
-        ctx.env.set_local(var_name.clone(), Value::Int(i));
+        ctx.env.set_local(var_name.clone(), Value::m1_integer(i));
         let substituted = substitute_interpolation(&body_src, &var_name, i);
         // Re-parse the substituted block and execute its statements. The block is
         // a `{ … }`; parsing it as a standalone source yields a `Block` (or a
@@ -525,9 +607,23 @@ fn exec_expanded_root(root: &Node, ctx: &mut EvalCtx) -> Result<(), EvalError> {
 /// M1's expand interpolation splices the loop value into identifiers/paths
 /// (`Output$(i)` → `Output1`), so we replace the exact `$(VAR)` token text. Only
 /// the named loop variable is substituted; other `$(...)` are left untouched.
-fn substitute_interpolation(src: &str, var: &str, value: i64) -> String {
+fn substitute_interpolation(src: &str, var: &str, value: i32) -> String {
     let needle = format!("$({var})");
     src.replace(&needle, &value.to_string())
+}
+
+fn expand_bound(value: &Value) -> Result<i32, EvalError> {
+    match value.m1_scalar()? {
+        crate::value::M1Scalar::Integer(value) => Ok(value),
+        crate::value::M1Scalar::UnsignedInteger(value) => {
+            i32::try_from(value).map_err(|_| EvalError::TypeError {
+                detail: format!("expand bound {value} is outside the M1 Integer range"),
+            })
+        }
+        other => Err(EvalError::TypeError {
+            detail: format!("expand bound must be integral, got {other:?}"),
+        }),
+    }
 }
 
 /// Execute a `local` / `static local` declaration. The `name` field is the
@@ -564,7 +660,7 @@ fn exec_local_declaration(node: &Node, ctx: &mut EvalCtx) -> Result<(), EvalErro
             })?;
         if ctx.env.get_static(fn_symbol, &var).is_none() {
             let init = match node.child_by_field(Field::Value) {
-                Some(v) => coerce_to(eval(&v, ctx)?, declared)?,
+                Some(v) => coerce_to(eval(&v, ctx)?, declared, ctx, &var)?,
                 None => default_for(declared),
             };
             let fn_symbol = ctx.fn_symbol.unwrap().to_string();
@@ -575,7 +671,7 @@ fn exec_local_declaration(node: &Node, ctx: &mut EvalCtx) -> Result<(), EvalErro
 
     // A plain local is (re)initialised on every execution.
     let value = match node.child_by_field(Field::Value) {
-        Some(v) => coerce_to(eval(&v, ctx)?, declared)?,
+        Some(v) => coerce_to(eval(&v, ctx)?, declared, ctx, &var)?,
         None => default_for(declared),
     };
     ctx.env.set_local(var, value);
@@ -587,16 +683,16 @@ fn exec_local_declaration(node: &Node, ctx: &mut EvalCtx) -> Result<(), EvalErro
 /// `<Float>` local becomes a float); a genuinely incompatible value is left as-is
 /// rather than guessed — the type checker is the authority on validity, and the
 /// evaluator does not silently change a value's meaning.
-fn coerce_to(value: Value, declared: Option<ValueType>) -> Result<Value, EvalError> {
+fn coerce_to(
+    value: Value,
+    declared: Option<ValueType>,
+    ctx: &EvalCtx,
+    local: &str,
+) -> Result<Value, EvalError> {
     let Some(ty) = declared else {
         return Ok(value);
     };
-    Ok(match (ty, &value) {
-        (ValueType::Float, Value::Int(x)) => Value::Float(*x as f64),
-        (ValueType::Float, Value::Uint(x)) => Value::Float(*x as f64),
-        // Already the right family, or a coercion we do not force: keep the value.
-        _ => value,
-    })
+    expr::coerce_for_declared_type(local, value, ty, ctx.project)
 }
 
 /// The default value for an uninitialised typed local. M1 requires initialisers
@@ -605,11 +701,11 @@ fn coerce_to(value: Value, declared: Option<ValueType>) -> Result<Value, EvalErr
 /// to integer zero.
 fn default_for(declared: Option<ValueType>) -> Value {
     match declared {
-        Some(ValueType::Float) => Value::Float(0.0),
-        Some(ValueType::Unsigned) => Value::Uint(0),
+        Some(ValueType::Float) => Value::m1_float(0.0),
+        Some(ValueType::Unsigned) => Value::m1_unsigned(0),
         Some(ValueType::Boolean) => Value::Bool(false),
         Some(ValueType::String) => Value::Str(String::new()),
-        _ => Value::Int(0),
+        _ => Value::m1_integer(0),
     }
 }
 
@@ -668,6 +764,7 @@ mod tests {
                 script_name: "Demo.Update.m1scr",
                 dt: 0.01,
                 scripts: &[],
+                signature_m1_types: None,
                 depth: 0,
                 trace: Some(&mut self.trace),
             }
@@ -693,28 +790,31 @@ mod tests {
     fn plain_assignment_writes_channel() {
         let mut h = Harness::new();
         h.run("Output = 42.0;\n").unwrap();
-        assert_eq!(h.env.get("Root.Demo.Output"), Some(&Value::Float(42.0)));
+        assert_eq!(h.env.get("Root.Demo.Output"), Some(&Value::m1_float(42.0)));
         // The channel write is also recorded in the trace.
         assert_eq!(
             h.trace.channels.get("Root.Demo.Output"),
-            Some(&vec![Value::Float(42.0)])
+            Some(&vec![Value::m1_float(42.0)])
         );
     }
 
     #[test]
     fn assignment_evaluates_rhs_expression() {
         let mut h = Harness::new();
-        h.env.set("Root.Demo.Speed", Value::Float(10.0));
-        h.calib.params.insert("Demo.Gain".to_string(), 2.5);
+        h.env.set("Root.Demo.Speed", Value::m1_float(10.0));
+        h.calib.params.insert(
+            "Demo.Gain".to_string(),
+            crate::value::M1Scalar::FloatingPoint(2.5),
+        );
         h.run("Output = Speed * Gain;\n").unwrap();
-        assert_eq!(h.env.get("Root.Demo.Output"), Some(&Value::Float(25.0)));
+        assert_eq!(h.env.get("Root.Demo.Output"), Some(&Value::m1_float(25.0)));
     }
 
     #[test]
     fn this_target_writes_group_channel() {
         let mut h = Harness::new();
         h.run("This.Output = 7.0;\n").unwrap();
-        assert_eq!(h.env.get("Root.Demo.Output"), Some(&Value::Float(7.0)));
+        assert_eq!(h.env.get("Root.Demo.Output"), Some(&Value::m1_float(7.0)));
     }
 
     #[test]
@@ -722,7 +822,7 @@ mod tests {
         let mut h = Harness::new();
         // A local must be declared first to be a known local name.
         h.run("local acc = 1;\nacc = 5;\n").unwrap();
-        assert_eq!(h.env.get_local("acc"), Some(&Value::Int(5)));
+        assert_eq!(h.env.get_local("acc"), Some(&Value::m1_integer(5)));
         // It is NOT mistaken for a project channel write.
         assert!(!h.trace.channels.contains_key("Root.Demo.acc"));
     }
@@ -730,16 +830,16 @@ mod tests {
     #[test]
     fn compound_add_reads_then_writes() {
         let mut h = Harness::new();
-        h.env.set("Root.Demo.Output", Value::Int(10));
+        h.env.set("Root.Demo.Output", Value::m1_integer(10));
         h.run("Output += 5;\n").unwrap();
-        assert_eq!(h.env.get("Root.Demo.Output"), Some(&Value::Int(15)));
+        assert_eq!(h.env.get("Root.Demo.Output"), Some(&Value::m1_float(15.0)));
     }
 
     #[test]
     fn compound_on_local() {
         let mut h = Harness::new();
         h.run("local n = 3;\nn *= 4;\n").unwrap();
-        assert_eq!(h.env.get_local("n"), Some(&Value::Int(12)));
+        assert_eq!(h.env.get_local("n"), Some(&Value::m1_integer(12)));
     }
 
     #[test]
@@ -759,7 +859,7 @@ mod tests {
         // env out-slot, not a project channel (and does not fail loud as an
         // unresolved target the way it did before P15-D).
         h.run("Out = 3 * 2;\n").unwrap();
-        assert_eq!(h.env.get_out(), Some(&Value::Int(6)));
+        assert_eq!(h.env.get_out(), Some(&Value::m1_integer(6)));
         // It is NOT recorded as a project channel write.
         assert!(!h.trace.channels.contains_key("Out"));
         assert!(!h.trace.channels.contains_key("Root.Demo.Out"));
@@ -770,7 +870,7 @@ mod tests {
         let mut h = Harness::new();
         // A compound `Out +=` reads the current out-slot first, then writes back.
         h.run("Out = 1;\nOut += 4;\n").unwrap();
-        assert_eq!(h.env.get_out(), Some(&Value::Int(5)));
+        assert_eq!(h.env.get_out(), Some(&Value::m1_integer(5)));
     }
 
     #[test]
@@ -800,7 +900,7 @@ mod tests {
         h.run("local Calculate = 0;\nOutput = Calculate.Max(1, 2);\n")
             .expect("the complete builtin callee resolves before its receiver");
 
-        assert_eq!(h.env.get("Root.Demo.Output"), Some(&Value::Int(2)));
+        assert_eq!(h.env.get("Root.Demo.Output"), Some(&Value::m1_float(2.0)));
     }
 
     // ---- Task 21: if/else ----
@@ -809,7 +909,7 @@ mod tests {
     fn if_true_runs_consequence() {
         let mut h = Harness::new();
         h.run("if (true)\n{\n\tOutput = 1.0;\n}\n").unwrap();
-        assert_eq!(h.env.get("Root.Demo.Output"), Some(&Value::Float(1.0)));
+        assert_eq!(h.env.get("Root.Demo.Output"), Some(&Value::m1_float(1.0)));
     }
 
     #[test]
@@ -824,18 +924,18 @@ mod tests {
         let mut h = Harness::new();
         h.run("if (false)\n{\n\tOutput = 1.0;\n}\nelse\n{\n\tOutput = 2.0;\n}\n")
             .unwrap();
-        assert_eq!(h.env.get("Root.Demo.Output"), Some(&Value::Float(2.0)));
+        assert_eq!(h.env.get("Root.Demo.Output"), Some(&Value::m1_float(2.0)));
     }
 
     #[test]
     fn else_if_chain_picks_middle() {
         let mut h = Harness::new();
-        h.env.set("Root.Demo.Speed", Value::Float(5.0));
+        h.env.set("Root.Demo.Speed", Value::m1_float(5.0));
         h.run(
             "if (Speed > 10.0)\n{\n\tOutput = 1.0;\n}\nelse if (Speed > 3.0)\n{\n\tOutput = 2.0;\n}\nelse\n{\n\tOutput = 3.0;\n}\n",
         )
         .unwrap();
-        assert_eq!(h.env.get("Root.Demo.Output"), Some(&Value::Float(2.0)));
+        assert_eq!(h.env.get("Root.Demo.Output"), Some(&Value::m1_float(2.0)));
     }
 
     #[test]
@@ -862,7 +962,7 @@ mod tests {
         );
         h.run("when (Speed)\n{\n\tis (On)\n\t{\n\t\tOutput = 1.0;\n\t}\n\tis (Off)\n\t{\n\t\tOutput = 2.0;\n\t}\n}\n")
             .unwrap();
-        assert_eq!(h.env.get("Root.Demo.Output"), Some(&Value::Float(1.0)));
+        assert_eq!(h.env.get("Root.Demo.Output"), Some(&Value::m1_float(1.0)));
     }
 
     #[test]
@@ -878,7 +978,7 @@ mod tests {
         // `is (State.Off)` matches by the trailing member segment.
         h.run("when (Speed)\n{\n\tis (State.On)\n\t{\n\t\tOutput = 1.0;\n\t}\n\tis (State.Off)\n\t{\n\t\tOutput = 2.0;\n\t}\n}\n")
             .unwrap();
-        assert_eq!(h.env.get("Root.Demo.Output"), Some(&Value::Float(2.0)));
+        assert_eq!(h.env.get("Root.Demo.Output"), Some(&Value::m1_float(2.0)));
     }
 
     #[test]
@@ -893,7 +993,7 @@ mod tests {
         );
         h.run("when (Speed)\n{\n\tis (A or B)\n\t{\n\t\tOutput = 9.0;\n\t}\n\tis (C)\n\t{\n\t\tOutput = 1.0;\n\t}\n}\n")
             .unwrap();
-        assert_eq!(h.env.get("Root.Demo.Output"), Some(&Value::Float(9.0)));
+        assert_eq!(h.env.get("Root.Demo.Output"), Some(&Value::m1_float(9.0)));
     }
 
     #[test]
@@ -919,9 +1019,9 @@ mod tests {
         // Expand writes to locals named Out1..Out3, each set to its index.
         h.run("expand (i = 1 to 3)\n{\n\tlocal Out$(i) = i;\n}\n")
             .unwrap();
-        assert_eq!(h.env.get_local("Out1"), Some(&Value::Int(1)));
-        assert_eq!(h.env.get_local("Out2"), Some(&Value::Int(2)));
-        assert_eq!(h.env.get_local("Out3"), Some(&Value::Int(3)));
+        assert_eq!(h.env.get_local("Out1"), Some(&Value::m1_integer(1)));
+        assert_eq!(h.env.get_local("Out2"), Some(&Value::m1_integer(2)));
+        assert_eq!(h.env.get_local("Out3"), Some(&Value::m1_integer(3)));
     }
 
     #[test]
@@ -932,7 +1032,7 @@ mod tests {
             .unwrap();
         assert_eq!(
             h.env.get_static("Root.Demo.Update", "total"),
-            Some(&Value::Int(6))
+            Some(&Value::m1_integer(6))
         );
     }
 
@@ -942,15 +1042,32 @@ mod tests {
     fn local_declaration_initialises() {
         let mut h = Harness::new();
         h.run("local scaled = 3 * 4;\n").unwrap();
-        assert_eq!(h.env.get_local("scaled"), Some(&Value::Int(12)));
+        assert_eq!(h.env.get_local("scaled"), Some(&Value::m1_integer(12)));
     }
 
     #[test]
     fn typed_local_coerces_initialiser() {
         let mut h = Harness::new();
-        // `local <Float> x = 1;` stores a Float, not an Integer (annotation wins).
-        h.run("local <Float> x = 1;\n").unwrap();
-        assert_eq!(h.env.get_local("x"), Some(&Value::Float(1.0)));
+        h.run(
+            "local <Float> x = 1;\n\
+             local <Integer> signed = 4294967295u;\n\
+             local <Unsigned Integer> unsigned = -1;\n",
+        )
+        .unwrap();
+        assert_eq!(h.env.get_local("x"), Some(&Value::m1_float(1.0)));
+        assert_eq!(h.env.get_local("signed"), Some(&Value::m1_integer(-1)));
+        assert_eq!(
+            h.env.get_local("unsigned"),
+            Some(&Value::m1_unsigned(u32::MAX))
+        );
+
+        h.run("x = 2;\nsigned = 1u;\nunsigned = -2;\n").unwrap();
+        assert_eq!(h.env.get_local("x"), Some(&Value::m1_float(2.0)));
+        assert_eq!(h.env.get_local("signed"), Some(&Value::m1_integer(1)));
+        assert_eq!(
+            h.env.get_local("unsigned"),
+            Some(&Value::m1_unsigned(u32::MAX - 1))
+        );
     }
 
     #[test]
@@ -963,9 +1080,9 @@ mod tests {
             .unwrap();
         assert_eq!(
             h.env.get_static("Root.Demo.Update", "accum"),
-            Some(&Value::Float(2.5))
+            Some(&Value::m1_float(2.5))
         );
-        assert_eq!(h.env.get("Root.Demo.Output"), Some(&Value::Float(2.5)));
+        assert_eq!(h.env.get("Root.Demo.Output"), Some(&Value::m1_float(2.5)));
     }
 
     #[test]
@@ -976,13 +1093,13 @@ mod tests {
         h.run("static local accum = 0.0;\naccum = 10.0;\n").unwrap();
         assert_eq!(
             h.env.get_static("Root.Demo.Update", "accum"),
-            Some(&Value::Float(10.0))
+            Some(&Value::m1_float(10.0))
         );
         // Re-running the declaration keeps the persisted value.
         h.run("static local accum = 0.0;\n").unwrap();
         assert_eq!(
             h.env.get_static("Root.Demo.Update", "accum"),
-            Some(&Value::Float(10.0))
+            Some(&Value::m1_float(10.0))
         );
     }
 
@@ -993,9 +1110,9 @@ mod tests {
         let mut h = Harness::new();
         h.run("{\n\tlocal a = 1;\n\tlocal b = 2;\n\tOutput = 3.0;\n}\n")
             .unwrap();
-        assert_eq!(h.env.get_local("a"), Some(&Value::Int(1)));
-        assert_eq!(h.env.get_local("b"), Some(&Value::Int(2)));
-        assert_eq!(h.env.get("Root.Demo.Output"), Some(&Value::Float(3.0)));
+        assert_eq!(h.env.get_local("a"), Some(&Value::m1_integer(1)));
+        assert_eq!(h.env.get_local("b"), Some(&Value::m1_integer(2)));
+        assert_eq!(h.env.get("Root.Demo.Output"), Some(&Value::m1_float(3.0)));
     }
 
     #[test]
@@ -1020,7 +1137,7 @@ mod tests {
         .expect("mini fixture loads");
 
         let mut env = Env::new();
-        env.set("Root.Demo.Speed", Value::Float(20.0));
+        env.set("Root.Demo.Speed", Value::m1_float(20.0));
         let mut state = StateStore::new();
         let mut trace = Trace::new();
         trace.push_tick(0.0);
@@ -1037,6 +1154,7 @@ mod tests {
             script_name: &script.name,
             dt: 0.01,
             scripts: &[],
+            signature_m1_types: Some(&loaded.signature_m1_types),
             depth: 0,
             trace: Some(&mut trace),
         };
@@ -1045,11 +1163,11 @@ mod tests {
 
         // Gain is 2.5 (from parameters.m1cfg, written as Demo.Gain); Speed is 20,
         // so Output = 20 * 2.5 = 50.
-        assert_eq!(env.get("Root.Demo.Output"), Some(&Value::Float(50.0)));
+        assert_eq!(env.get("Root.Demo.Output"), Some(&Value::m1_float(50.0)));
         // And the output write landed in the trace's channel column.
         assert_eq!(
             trace.channels.get("Root.Demo.Output"),
-            Some(&vec![Value::Float(50.0)])
+            Some(&vec![Value::m1_float(50.0)])
         );
     }
 }

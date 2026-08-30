@@ -8,9 +8,9 @@
 //!
 //! Truncation (toward zero), not rounding, is the documented choice for Phase 1;
 //! MoTeC's exact rounding mode is to be confirmed against M1 Sim during fidelity
-//! work. `Convert.ToFixed7DP` (a fixed-point type with no runtime [`Value`]
-//! representation in Phase 1) is intentionally left unimplemented and falls
-//! through to a fail-loud `UnsupportedBuiltin`.
+//! work. Runtime values can represent `FixedPoint7dps`, but migrating the
+//! builtin engine itself is tracked separately in issue #38;
+//! `Convert.ToFixed7DP` therefore remains fail-loud here.
 
 use crate::error::EvalError;
 use crate::value::Value;
@@ -67,7 +67,7 @@ mod tests {
 
     #[test]
     fn unimplemented_method_returns_none() {
-        // ToFixed7DP has no runtime Value representation; not implemented here.
+        // The compatibility builtin engine has not migrated ToFixed7DP yet.
         assert!(call("ToFixed7DP", &[Value::Int(1)]).unwrap().is_none());
     }
 }

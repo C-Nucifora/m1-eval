@@ -25,9 +25,9 @@
 //!
 //! The trimmed RHS is classified by the same scalar rules the scenario loader
 //! uses ([`crate::scenario`]'s `RawValue`): it is a [`Override::Const`] when it
-//! parses as a `bool` (`true`/`false`), an `i64`, or an `f64`; otherwise it is an
+//! parses as a `bool`, an M1 `i32`, or an M1 binary32; otherwise it is an
 //! [`Override::Expr`] carrying the verbatim source. A bare numeric literal becomes
-//! a [`Value::Int`] when it parses as an integer, else a [`Value::Float`] — the
+//! an M1 `Integer` when it parses as an integer, else M1 `FloatingPoint`, the
 //! same precedence the scenario `const` inputs follow.
 
 use crate::error::EvalError;
@@ -65,8 +65,9 @@ impl Override {
     /// after, trimmed). A spec with no `=` fails loud with
     /// [`EvalError::UnsupportedConstruct`]; an empty channel name (e.g. `=5`) also
     /// fails loud. The trimmed RHS classifies as a [`Override::Const`] when it
-    /// parses as `bool`/`i64`/`f64`, otherwise an [`Override::Expr`] holding the
-    /// verbatim source.
+    /// parses as `bool`, M1 `i32`, or M1 binary32, otherwise an
+    /// [`Override::Expr`] holding the verbatim source. A syntactically numeric
+    /// value outside its M1 range returns a clear [`EvalError::TypeError`].
     pub fn parse(spec: &str) -> Result<Override, EvalError> {
         let Some(eq) = spec.find('=') else {
             return Err(EvalError::UnsupportedConstruct {
@@ -94,7 +95,7 @@ impl Override {
         // Classify the RHS as a literal (-> Const) or verbatim source (-> Expr),
         // following the scenario loader's scalar precedence: bool, then integer,
         // then float; anything else is an expression source held verbatim.
-        if let Some(value) = parse_const_rhs(rhs) {
+        if let Some(value) = parse_const_rhs(rhs)? {
             Ok(Override::Const { channel, value })
         } else {
             Ok(Override::Expr {
@@ -114,20 +115,27 @@ impl Override {
 
 /// Classify a trimmed override RHS as a constant literal, returning its [`Value`].
 ///
-/// Returns `Some` for `true`/`false` ([`Value::Bool`]), an integer literal
-/// ([`Value::Int`]), or a float literal ([`Value::Float`]); `None` when the RHS is
-/// not a bare literal (so the caller treats it as an expression source). Integer
-/// is tried before float so `5` is an `Int` and `5.0` is a `Float`, matching the
-/// scenario `const` rules.
-fn parse_const_rhs(rhs: &str) -> Option<Value> {
+/// Returns `Some` for `true`/`false` ([`Value::Bool`]), an M1 `Integer`, or an M1
+/// `FloatingPoint`; `None` when the RHS is not a bare literal (so the caller
+/// treats it as an expression source). Integer is tried before float so `5` is
+/// an `Integer` and `5.0` is `FloatingPoint`, matching scenario `const` rules.
+fn parse_const_rhs(rhs: &str) -> Result<Option<Value>, EvalError> {
     if rhs == "true" {
-        return Some(Value::Bool(true));
+        return Ok(Some(Value::Bool(true)));
     }
     if rhs == "false" {
-        return Some(Value::Bool(false));
+        return Ok(Some(Value::Bool(false)));
     }
-    if let Ok(i) = rhs.parse::<i64>() {
-        return Some(Value::Int(i));
+    if is_decimal_integer_literal(rhs) {
+        let i = rhs.parse::<i64>().map_err(|_| EvalError::TypeError {
+            detail: format!("override integer {rhs:?} is outside the M1 i32 range"),
+        })?;
+        return i32::try_from(i)
+            .map(Value::m1_integer)
+            .map(Some)
+            .map_err(|_| EvalError::TypeError {
+                detail: format!("override integer {rhs:?} is outside the M1 i32 range"),
+            });
     }
     if let Ok(f) = rhs.parse::<f64>() {
         // Reject non-finite "numbers" (`inf`, `nan`) as constants: a logged
@@ -135,10 +143,36 @@ fn parse_const_rhs(rhs: &str) -> Option<Value> {
         // numeric would silently swallow what was almost certainly a typo'd
         // expression. They fall through to the Expr arm, which fails loud later.
         if f.is_finite() {
-            return Some(Value::Float(f));
+            let narrowed = f as f32;
+            if narrowed.is_infinite() {
+                return Err(EvalError::TypeError {
+                    detail: format!("override float {rhs:?} is outside the M1 binary32 range"),
+                });
+            }
+            return Ok(Some(Value::m1_float(narrowed)));
+        }
+        if is_decimal_numeric_literal(rhs) {
+            return Err(EvalError::TypeError {
+                detail: format!("override float {rhs:?} is outside the M1 binary32 range"),
+            });
         }
     }
-    None
+    Ok(None)
+}
+
+fn is_decimal_integer_literal(text: &str) -> bool {
+    let digits = text
+        .strip_prefix('+')
+        .or_else(|| text.strip_prefix('-'))
+        .unwrap_or(text);
+    !digits.is_empty() && digits.bytes().all(|byte| byte.is_ascii_digit())
+}
+
+fn is_decimal_numeric_literal(text: &str) -> bool {
+    text.bytes().any(|byte| byte.is_ascii_digit())
+        && text
+            .bytes()
+            .all(|byte| byte.is_ascii_digit() || matches!(byte, b'+' | b'-' | b'.' | b'e' | b'E'))
 }
 
 #[cfg(test)]
@@ -153,7 +187,7 @@ mod tests {
             ov,
             Override::Const {
                 channel: "Root.CF.Sensor".to_string(),
-                value: Value::Int(5),
+                value: Value::m1_integer(5),
             }
         );
         assert_eq!(ov.channel(), "Root.CF.Sensor");
@@ -167,7 +201,7 @@ mod tests {
             ov,
             Override::Const {
                 channel: "Root.CF.Sensor".to_string(),
-                value: Value::Float(5.0),
+                value: Value::m1_float(5.0),
             }
         );
     }
@@ -178,14 +212,14 @@ mod tests {
             Override::parse("X=-3").unwrap(),
             Override::Const {
                 channel: "X".to_string(),
-                value: Value::Int(-3),
+                value: Value::m1_integer(-3),
             }
         );
         assert_eq!(
             Override::parse("X=1.5e3").unwrap(),
             Override::Const {
                 channel: "X".to_string(),
-                value: Value::Float(1500.0),
+                value: Value::m1_float(1500.0),
             }
         );
     }
@@ -217,7 +251,7 @@ mod tests {
             ov,
             Override::Const {
                 channel: "Engine Speed".to_string(),
-                value: Value::Int(1000),
+                value: Value::m1_integer(1000),
             }
         );
     }
@@ -293,5 +327,20 @@ mod tests {
         assert!(matches!(ov, Override::Expr { .. }));
         let ov = Override::parse("X=NaN").expect("parses");
         assert!(matches!(ov, Override::Expr { .. }));
+    }
+
+    #[test]
+    fn numeric_literals_outside_m1_width_fail_loud() {
+        for spec in [
+            "X=2147483648",
+            "X=-2147483649",
+            "X=99999999999999999999",
+            "X=1e39",
+            "X=1e9999",
+        ] {
+            let error = Override::parse(spec).expect_err("out-of-range literal must fail");
+            assert!(matches!(error, EvalError::TypeError { .. }), "{error}");
+            assert!(format!("{error}").contains("M1"), "{error}");
+        }
     }
 }

@@ -43,14 +43,18 @@
 //! engine samples the series by *holding* the most recent keyframe at or before
 //! `t` (zero-order hold / step), which is deterministic and avoids inventing
 //! values between samples. Before the first keyframe the first value is held.
-//! Numeric keyframes are stored as [`Value::Float`]; an [`InputSeries`] of kind
+//! Numeric keyframes are stored as M1-width [`Value::M1`] scalars. Existing bare
+//! numbers remain compatible and narrow to `Integer` or binary32. Callers that
+//! need an exact family can use a typed object such as
+//! `const = { unsigned = 4294967295 }` or
+//! `series = [[0.0, { fixed_raw = 12345678 }]]`. An [`InputSeries`] of kind
 //! [`InputKind::Const`] holds a single value for every tick.
 //!
 //! Identifiers may contain spaces (`Cooling Fan.Output`); channel names are used
 //! verbatim as canonical-ish paths and never split on whitespace.
 
 use crate::error::EvalError;
-use crate::value::Value;
+use crate::value::{FixedPoint7dps, M1Scalar, Value};
 use serde::Deserialize;
 
 /// Which runner a scenario drives, and the thing it targets.
@@ -136,9 +140,8 @@ impl IoSeries {
 
 /// Zero-order-hold sample of an ascending `(t, value)` keyframe series at `t`.
 /// Holds the first value before the series starts and the last value after it
-/// ends. An empty series is a programming error upstream; we return `Float(0.0)`
-/// only as a last resort, but the parser rejects empty series so this is unreached
-/// in practice.
+/// ends. An empty series is a programming error upstream; the M1 binary32 zero
+/// fallback is unreachable because the parser rejects empty series.
 fn sample_series(points: &[(f64, Value)], t: f64) -> Value {
     let mut held: Option<&Value> = None;
     for (kt, v) in points {
@@ -154,7 +157,7 @@ fn sample_series(points: &[(f64, Value)], t: f64) -> Value {
         None => points
             .first()
             .map(|(_, v)| v.clone())
-            .unwrap_or(Value::Float(0.0)),
+            .unwrap_or(Value::m1_float(0.0)),
     }
 }
 
@@ -256,7 +259,7 @@ pub(crate) struct ParsedTimeSeriesCsv {
 /// The first column header must be `time` (case-insensitive); every other column
 /// header is a channel name (verbatim, spaces allowed). Each data row is
 /// `t_seconds, value, value, …`: `t` parses to `f64`, numeric cells to
-/// [`Value::Float`], empty cells add no keyframe (zero-order hold keeps the prior
+/// M1 binary32 values, empty cells add no keyframe (zero-order hold keeps the prior
 /// value), and a non-numeric value cell fails loud as an [`EvalError::TypeError`].
 ///
 /// When `detect_units` is set, a *first data row whose first cell is non-numeric*
@@ -376,21 +379,46 @@ pub(crate) fn parse_time_series_csv(
             if trimmed.is_empty() {
                 continue;
             }
-            let v = trimmed
-                .parse::<f64>()
-                .map(Value::Float)
-                .map_err(|_| EvalError::TypeError {
+            let explicit_non_finite = explicit_non_finite_float(trimmed);
+            let host = match explicit_non_finite {
+                Some(value) => value,
+                None => trimmed.parse::<f64>().map_err(|_| EvalError::TypeError {
                     detail: format!(
                         "CSV row {} column {:?} value {trimmed:?} is not numeric",
                         row_idx + 2,
                         acc.0
                     ),
-                })?;
+                })?,
+            };
+            let narrowed = host as f32;
+            if explicit_non_finite.is_none() && (!host.is_finite() || narrowed.is_infinite()) {
+                return Err(EvalError::TypeError {
+                    detail: format!(
+                        "CSV row {} column {:?} value {trimmed:?} is outside M1 binary32 range",
+                        row_idx + 2,
+                        acc.0
+                    ),
+                });
+            }
+            let v = Value::m1_float(narrowed);
             acc.1.push((t, v));
         }
     }
 
     Ok(ParsedTimeSeriesCsv { columns, units })
+}
+
+/// Parse the non-finite spellings emitted by [`crate::trace::Trace::to_csv`].
+/// Keeping this lexical check separate lets CSV preserve real binary32
+/// sentinels while still rejecting a finite decimal such as `1e9999` that
+/// overflowed during host parsing.
+fn explicit_non_finite_float(text: &str) -> Option<f64> {
+    match text.to_ascii_lowercase().as_str() {
+        "nan" | "+nan" | "-nan" => Some(f64::NAN),
+        "inf" | "+inf" | "infinity" | "+infinity" => Some(f64::INFINITY),
+        "-inf" | "-infinity" => Some(f64::NEG_INFINITY),
+        _ => None,
+    }
 }
 
 /// Split a CSV row into unquoted fields. Handles the minimal RFC-4180 quoting
@@ -478,25 +506,98 @@ struct RawIo {
     series: Option<Vec<(f64, RawValue)>>,
 }
 
-/// A raw scalar value from the wire: a number, boolean, or string. TOML/JSON
-/// numbers come through as either integer or float; we normalise to a [`Value`].
+/// A raw scalar value from the wire: a typed M1 object, number, boolean, or
+/// string. TOML/JSON numbers come through as either integer or float and use the
+/// legacy-compatible M1 narrowing rule.
 #[derive(Debug, Deserialize)]
 #[serde(untagged)]
 enum RawValue {
+    Typed(RawM1Value),
     Bool(bool),
     Int(i64),
+    Uint(u64),
     Float(f64),
     Str(String),
 }
 
+/// Explicit typed scenario syntax for callers that must distinguish all four
+/// M1 numeric families. Existing bare numbers remain the legacy-compatible
+/// syntax and narrow according to their JSON/TOML number family.
+#[derive(Debug, Deserialize)]
+#[serde(deny_unknown_fields)]
+struct RawM1Value {
+    #[serde(default)]
+    integer: Option<i64>,
+    #[serde(default)]
+    unsigned: Option<u64>,
+    #[serde(default)]
+    floating_point: Option<f64>,
+    #[serde(default)]
+    fixed_raw: Option<i64>,
+}
+
 impl RawValue {
-    fn into_value(self) -> Value {
+    fn into_value(self) -> Result<Value, EvalError> {
         match self {
-            RawValue::Bool(b) => Value::Bool(b),
-            RawValue::Int(i) => Value::Int(i),
-            RawValue::Float(f) => Value::Float(f),
-            RawValue::Str(s) => Value::Str(s),
+            RawValue::Typed(value) => value.into_value(),
+            RawValue::Bool(b) => Ok(Value::Bool(b)),
+            RawValue::Int(i) => i32::try_from(i)
+                .map(Value::m1_integer)
+                .map_err(|_| scenario_width_error("integer", i)),
+            RawValue::Uint(i) => i32::try_from(i)
+                .map(Value::m1_integer)
+                .map_err(|_| scenario_width_error("integer", i)),
+            RawValue::Float(f) => scenario_float(f),
+            RawValue::Str(s) => Ok(Value::Str(s)),
         }
+    }
+}
+
+impl RawM1Value {
+    fn into_value(self) -> Result<Value, EvalError> {
+        let present = [
+            self.integer.is_some(),
+            self.unsigned.is_some(),
+            self.floating_point.is_some(),
+            self.fixed_raw.is_some(),
+        ];
+        if present.into_iter().filter(|field| *field).count() != 1 {
+            return Err(EvalError::TypeError {
+                detail: "typed scenario value must set exactly one of `integer`, `unsigned`, `floating_point`, or `fixed_raw`".to_string(),
+            });
+        }
+        if let Some(value) = self.integer {
+            return i32::try_from(value)
+                .map(Value::m1_integer)
+                .map_err(|_| scenario_width_error("integer", value));
+        }
+        if let Some(value) = self.unsigned {
+            return u32::try_from(value)
+                .map(Value::m1_unsigned)
+                .map_err(|_| scenario_width_error("unsigned", value));
+        }
+        if let Some(value) = self.floating_point {
+            return scenario_float(value);
+        }
+        let raw = self.fixed_raw.expect("exactly one typed field is present");
+        i32::try_from(raw)
+            .map(|raw| Value::M1(M1Scalar::FixedPoint7dps(FixedPoint7dps::from_raw(raw))))
+            .map_err(|_| scenario_width_error("fixed-point raw", raw))
+    }
+}
+
+fn scenario_float(value: f64) -> Result<Value, EvalError> {
+    let narrowed = value as f32;
+    if value.is_finite() && narrowed.is_infinite() {
+        Err(scenario_width_error("floating-point", value))
+    } else {
+        Ok(Value::m1_float(narrowed))
+    }
+}
+
+fn scenario_width_error(kind: &str, value: impl std::fmt::Display) -> EvalError {
+    EvalError::TypeError {
+        detail: format!("scenario {kind} value {value} is outside its M1-width representation"),
     }
 }
 
@@ -592,7 +693,7 @@ fn raw_kind(
     series: Option<Vec<(f64, RawValue)>>,
 ) -> Result<InputKind, EvalError> {
     match (constant, series) {
-        (Some(c), None) => Ok(InputKind::Const(c.into_value())),
+        (Some(c), None) => Ok(InputKind::Const(c.into_value()?)),
         (None, Some(points)) => {
             if points.is_empty() {
                 return Err(EvalError::UnsupportedConstruct {
@@ -603,8 +704,8 @@ fn raw_kind(
             Ok(InputKind::Series(
                 points
                     .into_iter()
-                    .map(|(t, v)| (t, v.into_value()))
-                    .collect(),
+                    .map(|(t, v)| v.into_value().map(|value| (t, value)))
+                    .collect::<Result<Vec<_>, _>>()?,
             ))
         }
         (Some(_), Some(_)) => Err(EvalError::UnsupportedConstruct {
@@ -671,7 +772,7 @@ series = [[0.0, 0.0], [0.5, 50.0]]
             .iter()
             .find(|i| i.channel == "Root.Demo.Gain")
             .unwrap();
-        assert_eq!(gain.kind, InputKind::Const(Value::Float(2.5)));
+        assert_eq!(gain.kind, InputKind::Const(Value::m1_float(2.5)));
 
         // The series input, sampled by zero-order hold.
         let speed = sc
@@ -680,21 +781,21 @@ series = [[0.0, 0.0], [0.5, 50.0]]
             .find(|i| i.channel == "Root.Demo.Speed")
             .unwrap();
         // Before/at first keyframe -> 0.0.
-        assert_eq!(speed.sample(0.0), Value::Float(0.0));
-        assert_eq!(speed.sample(0.4), Value::Float(0.0));
+        assert_eq!(speed.sample(0.0), Value::m1_float(0.0));
+        assert_eq!(speed.sample(0.4), Value::m1_float(0.0));
         // At/after the second keyframe -> 50.0.
-        assert_eq!(speed.sample(0.5), Value::Float(50.0));
-        assert_eq!(speed.sample(0.99), Value::Float(50.0));
+        assert_eq!(speed.sample(0.5), Value::m1_float(50.0));
+        assert_eq!(speed.sample(0.99), Value::m1_float(50.0));
     }
 
     #[test]
     fn const_samples_constant_at_every_tick() {
         let i = InputSeries {
             channel: "X".to_string(),
-            kind: InputKind::Const(Value::Int(7)),
+            kind: InputKind::Const(Value::m1_integer(7)),
         };
-        assert_eq!(i.sample(0.0), Value::Int(7));
-        assert_eq!(i.sample(123.4), Value::Int(7));
+        assert_eq!(i.sample(0.0), Value::m1_integer(7));
+        assert_eq!(i.sample(123.4), Value::m1_integer(7));
     }
 
     #[test]
@@ -709,7 +810,7 @@ series = [[0.0, 0.0], [0.5, 50.0]]
         let sc = Scenario::from_json_str(json).expect("valid JSON scenario");
         assert_eq!(sc.mode, RunMode::Cone("Root.Demo.Output".to_string()));
         assert_eq!(sc.base_rate_hz, 50.0);
-        assert_eq!(sc.inputs[0].kind, InputKind::Const(Value::Int(10)));
+        assert_eq!(sc.inputs[0].kind, InputKind::Const(Value::m1_integer(10)));
     }
 
     #[test]
@@ -725,7 +826,7 @@ series = [[0.0, 0.0], [0.5, 50.0]]
             .find(|i| i.channel == "Root.Demo.Speed")
             .unwrap();
         // The CSV series replaced the TOML one: at t=0.6 it holds 80.
-        assert_eq!(speed.sample(0.6), Value::Float(80.0));
+        assert_eq!(speed.sample(0.6), Value::m1_float(80.0));
 
         // The new channel was added.
         let brake = sc
@@ -733,8 +834,83 @@ series = [[0.0, 0.0], [0.5, 50.0]]
             .iter()
             .find(|i| i.channel == "Root.Demo.Brake")
             .expect("brake added from CSV");
-        assert_eq!(brake.sample(0.0), Value::Float(1.0));
-        assert_eq!(brake.sample(0.5), Value::Float(0.0));
+        assert_eq!(brake.sample(0.0), Value::m1_float(1.0));
+        assert_eq!(brake.sample(0.5), Value::m1_float(0.0));
+    }
+
+    #[test]
+    fn csv_rejects_decimal_overflow_before_binary32_narrowing() {
+        for value in ["1e39", "1e9999"] {
+            let mut scenario =
+                Scenario::from_toml_str("mode = \"whole-project\"\nduration_s = 0.1\n").unwrap();
+            let csv = format!("time,Value\n0,{value}\n");
+            let error = scenario.load_csv(&csv).unwrap_err();
+            assert!(
+                format!("{error}").contains("outside M1 binary32 range"),
+                "{value}: {error}"
+            );
+        }
+    }
+
+    #[test]
+    fn trace_csv_preserves_explicit_non_finite_binary32_values() {
+        let mut trace = crate::trace::Trace::new();
+        trace.push_tick(0.0);
+        trace.record_channel("NaN", Value::m1_float(f32::NAN));
+        trace.record_channel("Positive", Value::m1_float(f32::INFINITY));
+        trace.record_channel("Negative", Value::m1_float(f32::NEG_INFINITY));
+
+        let mut scenario =
+            Scenario::from_toml_str("mode = \"whole-project\"\nduration_s = 0.1\n").unwrap();
+        scenario.load_csv(&trace.to_csv()).unwrap();
+
+        let sample = |name: &str| {
+            scenario
+                .inputs
+                .iter()
+                .find(|input| input.channel == name)
+                .unwrap()
+                .sample(0.0)
+                .m1_scalar()
+                .unwrap()
+                .as_f32()
+        };
+        assert!(sample("NaN").is_nan());
+        assert_eq!(sample("Positive"), f32::INFINITY);
+        assert_eq!(sample("Negative"), f32::NEG_INFINITY);
+    }
+
+    #[test]
+    fn typed_scenario_accepts_explicit_non_finite_binary32_values() {
+        let scenario = Scenario::from_toml_str(
+            r#"
+mode = "whole-project"
+duration_s = 0.1
+
+[[inputs]]
+channel = "NaN"
+const = { floating_point = nan }
+
+[[inputs]]
+channel = "Positive"
+const = { floating_point = inf }
+
+[[inputs]]
+channel = "Negative"
+const = { floating_point = -inf }
+"#,
+        )
+        .unwrap();
+        let sample = |index: usize| {
+            scenario.inputs[index]
+                .sample(0.0)
+                .m1_scalar()
+                .unwrap()
+                .as_f32()
+        };
+        assert!(sample(0).is_nan());
+        assert_eq!(sample(1), f32::INFINITY);
+        assert_eq!(sample(2), f32::NEG_INFINITY);
     }
 
     #[test]
@@ -886,9 +1062,9 @@ series = [[0.0, 4194304], [0.5, 8388608]]
 
         // The series override steps by zero-order hold, like an input.
         let flash = sc.io.iter().find(|o| o.call == "System.FlashSize").unwrap();
-        assert_eq!(flash.sample(0.0), Value::Int(4_194_304));
-        assert_eq!(flash.sample(0.49), Value::Int(4_194_304));
-        assert_eq!(flash.sample(0.5), Value::Int(8_388_608));
+        assert_eq!(flash.sample(0.0), Value::m1_integer(4_194_304));
+        assert_eq!(flash.sample(0.49), Value::m1_integer(4_194_304));
+        assert_eq!(flash.sample(0.5), Value::m1_integer(8_388_608));
     }
 
     #[test]
@@ -927,6 +1103,60 @@ call = "CanComms.GetFloat"
         let sc = Scenario::from_json_str(json).expect("valid JSON scenario");
         assert_eq!(sc.io.len(), 1);
         assert_eq!(sc.io[0].call, "CanComms.GetFloat");
-        assert_eq!(sc.io[0].sample(0.0), Value::Float(12.5));
+        assert_eq!(sc.io[0].sample(0.0), Value::m1_float(12.5));
+    }
+
+    #[test]
+    fn typed_scenario_values_preserve_all_m1_scalar_kinds() {
+        let toml = r#"
+mode = "whole-project"
+duration_s = 0.1
+
+[[inputs]]
+channel = "Signed"
+const = { integer = -2147483648 }
+
+[[inputs]]
+channel = "Unsigned"
+const = { unsigned = 4294967295 }
+
+[[inputs]]
+channel = "Float"
+const = { floating_point = 0.1 }
+
+[[inputs]]
+channel = "Fixed"
+const = { fixed_raw = 12345678 }
+"#;
+        let scenario = Scenario::from_toml_str(toml).unwrap();
+        assert_eq!(scenario.inputs[0].sample(0.0), Value::m1_integer(i32::MIN));
+        assert_eq!(scenario.inputs[1].sample(0.0), Value::m1_unsigned(u32::MAX));
+        assert_eq!(scenario.inputs[2].sample(0.0), Value::m1_float(0.1));
+        assert_eq!(
+            scenario.inputs[3].sample(0.0),
+            Value::M1(M1Scalar::FixedPoint7dps(FixedPoint7dps::from_raw(
+                12_345_678
+            )))
+        );
+    }
+
+    #[test]
+    fn legacy_scenario_numbers_narrow_or_return_clear_width_errors() {
+        let underflow = r#"{
+            "mode": "whole-project",
+            "duration_s": 0.1,
+            "inputs": [{"channel": "Float", "const": 1e-50}]
+        }"#;
+        let scenario = Scenario::from_json_str(underflow).unwrap();
+        assert_eq!(scenario.inputs[0].sample(0.0), Value::m1_float(0.0));
+
+        for document in [
+            r#"{"mode":"whole-project","duration_s":0.1,"inputs":[{"channel":"Integer","const":2147483648}]}"#,
+            r#"{"mode":"whole-project","duration_s":0.1,"inputs":[{"channel":"Integer","const":9223372036854775808}]}"#,
+            r#"{"mode":"whole-project","duration_s":0.1,"inputs":[{"channel":"Float","const":1e39}]}"#,
+        ] {
+            let error = Scenario::from_json_str(document).unwrap_err();
+            assert!(format!("{error}").contains("M1-width"), "{error}");
+        }
     }
 }

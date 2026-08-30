@@ -16,9 +16,39 @@
 
 use crate::calib::Calibration;
 use crate::error::EvalError;
+use crate::value::M1ScalarKind;
 use m1_typecheck::Project;
 use m1_typecheck::parsed::{ParsedScript, parse_all};
+use std::collections::HashMap;
 use std::path::Path;
+
+/// Exact numeric storage families declared by project function signatures.
+///
+/// `m1-typecheck` intentionally exposes the language-level `ValueType` lattice,
+/// which currently collapses `FixedPoint7dps` into `Unknown` in signatures and
+/// does not retain whether a return type was declared or inferred. The evaluator
+/// keeps this narrow companion index so call and return boundaries can obey the
+/// raw project declaration without changing the upstream public model.
+#[derive(Debug, Clone, Default, PartialEq, Eq)]
+pub struct SignatureM1Types {
+    return_kinds: HashMap<String, M1ScalarKind>,
+    param_kinds: HashMap<(String, String), M1ScalarKind>,
+}
+
+impl SignatureM1Types {
+    /// Exact declared numeric return family for `function`, if the signature
+    /// declares one. Absence means the return is inferred or non-numeric.
+    pub fn return_kind(&self, function: &str) -> Option<M1ScalarKind> {
+        self.return_kinds.get(function).copied()
+    }
+
+    /// Exact declared numeric family for one named input parameter.
+    pub fn param_kind(&self, function: &str, param: &str) -> Option<M1ScalarKind> {
+        self.param_kinds
+            .get(&(function.to_string(), param.to_string()))
+            .copied()
+    }
+}
 
 /// The result of loading a project: the typed symbol model, the parsed scripts,
 /// and the numeric calibration read from the `.m1cfg` (empty when none given).
@@ -29,6 +59,9 @@ pub struct Loaded {
     pub scripts: Vec<ParsedScript>,
     /// Numeric calibration values (parameters + table cells).
     pub calib: Calibration,
+    /// Exact numeric families from raw function signatures. This complements
+    /// the typechecker's coarser `ValueType` model at evaluator boundaries.
+    pub signature_m1_types: SignatureM1Types,
     /// Function symbols whose `.m1prj` `SelectedTrigger` resolves to the
     /// `On Startup` event kernel (trigger leaf `"On Startup"`, the convention
     /// both real corpora follow). The whole-project runner executes these
@@ -80,14 +113,72 @@ pub fn load(project_path: &Path, cfg_path: Option<&Path>) -> Result<Loaded, Eval
         None => Calibration::default(),
     };
 
-    let startup_fn_symbols = startup_functions(&read_xml(project_path)?)?;
+    let project_xml = read_xml(project_path)?;
+    let startup_fn_symbols = startup_functions(&project_xml)?;
+    let signature_m1_types = signature_m1_types(&project_xml)?;
 
     Ok(Loaded {
         project,
         scripts,
         calib,
+        signature_m1_types,
         startup_fn_symbols,
     })
+}
+
+fn signature_m1_types(xml: &str) -> Result<SignatureM1Types, EvalError> {
+    let doc = roxmltree::Document::parse(xml).map_err(|e| EvalError::UnsupportedConstruct {
+        kind: format!("project XML re-parse for signature types failed: {e}"),
+        at: 0,
+    })?;
+    let mut types = SignatureM1Types::default();
+    for component in doc
+        .descendants()
+        .filter(|node| node.has_tag_name("Component"))
+    {
+        let Some(function) = component.attribute("Name") else {
+            continue;
+        };
+        let Some(signature) = component
+            .children()
+            .find(|node| node.has_tag_name("Signature"))
+        else {
+            continue;
+        };
+        if let Some(kind) = signature
+            .attribute("ReturnType")
+            .and_then(signature_scalar_kind)
+        {
+            types.return_kinds.insert(function.to_string(), kind);
+        }
+        if let Some(params) = signature
+            .children()
+            .find(|node| node.has_tag_name("Params"))
+        {
+            for param in params.children().filter(|node| node.has_tag_name("Param")) {
+                let (Some(name), Some(kind)) = (
+                    param.attribute("Name"),
+                    param.attribute("Type").and_then(signature_scalar_kind),
+                ) else {
+                    continue;
+                };
+                types
+                    .param_kinds
+                    .insert((function.to_string(), name.to_string()), kind);
+            }
+        }
+    }
+    Ok(types)
+}
+
+fn signature_scalar_kind(raw: &str) -> Option<M1ScalarKind> {
+    match raw.to_ascii_lowercase().replace([' ', '_'], "").as_str() {
+        "f32" | "f64" | "float" | "floatingpoint" => Some(M1ScalarKind::FloatingPoint),
+        "s8" | "s16" | "s32" | "s64" | "integer" => Some(M1ScalarKind::Integer),
+        "u8" | "u16" | "u32" | "u64" | "unsignedinteger" => Some(M1ScalarKind::UnsignedInteger),
+        "fixedpoint7dps" | "fixed7dps" => Some(M1ScalarKind::FixedPoint7dps),
+        _ => None,
+    }
 }
 
 /// The full component names (function symbols) whose `SelectedTrigger` points at
@@ -211,11 +302,20 @@ mod tests {
 
         // The calibration value reader read the gain parameter. The `.m1cfg`
         // writes the unprefixed name `Demo.Gain` (real exports omit `Root.`).
-        assert_eq!(loaded.calib.param("Demo.Gain"), Some(2.5));
+        assert_eq!(
+            loaded.calib.param("Demo.Gain"),
+            Some(crate::value::M1Scalar::FloatingPoint(2.5))
+        );
         // And the 2-D table cells.
         let map = loaded.calib.table("Demo.Map").expect("Demo.Map table");
         assert_eq!(map.axes.len(), 2);
-        assert_eq!(map.body, vec![10.0, 20.0, 30.0, 40.0]);
+        assert_eq!(
+            map.body,
+            vec![10.0, 20.0, 30.0, 40.0]
+                .into_iter()
+                .map(crate::value::M1Scalar::FloatingPoint)
+                .collect::<Vec<_>>()
+        );
     }
 
     #[test]

@@ -711,6 +711,7 @@ Output = i;
             script_name: "Caller.Update.m1scr",
             dt: 0.01,
             scripts: &scripts,
+            signature_m1_types: Some(&loaded.signature_m1_types),
             depth: 0,
             trace: None,
         };

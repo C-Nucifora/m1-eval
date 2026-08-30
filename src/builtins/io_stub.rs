@@ -31,9 +31,10 @@
 //! that column is simulated input, not evaluated output.
 
 use crate::error::EvalError;
-use crate::expr::EvalCtx;
-use crate::value::Value;
+use crate::expr::{EvalCtx, coerce_for_declared_type, coerce_for_scalar_kind};
+use crate::value::{FixedPoint7dps, M1Scalar, M1ScalarKind, Value};
 use m1_typecheck::intrinsics;
+use m1_typecheck::types::ValueType;
 
 /// Evaluate one Tier-3 IO call. `library_object` is the canonical intrinsic
 /// catalog object. `source_object` keeps the exact spelling used for scenario
@@ -50,6 +51,14 @@ pub fn call(
 
     // 1. Scenario override wins.
     if let Some(v) = ctx.env.io_override(&key).cloned() {
+        let returns = intrinsics::get()
+            .library_overloads(library_object, method)
+            .first()
+            .map(|overload| overload.returns.as_str());
+        let v = match returns {
+            Some(returns) => coerce_io_override(&key, v, returns, ctx)?,
+            None => v,
+        };
         mark_external(ctx, &key);
         return Ok(v);
     }
@@ -104,15 +113,37 @@ fn typed_io_default(object: &str, method: &str) -> Option<Value> {
     let returns = &overloads.first()?.returns;
     Some(match returns.as_str() {
         "Boolean" => Value::Bool(false),
-        "FloatingPoint" | "FixedPoint7dps" => Value::Float(0.0),
-        "Integer" => Value::Int(0),
-        "UnsignedInteger" => Value::Uint(0),
+        "FloatingPoint" => Value::m1_float(0.0),
+        "FixedPoint7dps" => Value::M1(M1Scalar::FixedPoint7dps(FixedPoint7dps::ZERO)),
+        "Integer" => Value::m1_integer(0),
+        "UnsignedInteger" => Value::m1_unsigned(0),
         "String" => Value::Str(String::new()),
         // `Void` writers and any unmappable return (`Handle`, `Bit`,
         // `Enumeration`, the `Integer|FloatingPoint` union) collapse to the benign
         // unit value, matching the void side-effect convention used elsewhere.
         _ => Value::Bool(true),
     })
+}
+
+/// Restore a scenario IO override to the method's declared return family. The
+/// scenario wire format permits untyped numbers for compatibility, but a call
+/// result must still enter script execution with its M1 signedness and width.
+fn coerce_io_override(
+    key: &str,
+    value: Value,
+    returns: &str,
+    ctx: &EvalCtx,
+) -> Result<Value, EvalError> {
+    match returns {
+        "Integer" => coerce_for_scalar_kind(key, value, M1ScalarKind::Integer),
+        "UnsignedInteger" => coerce_for_scalar_kind(key, value, M1ScalarKind::UnsignedInteger),
+        "FloatingPoint" => coerce_for_scalar_kind(key, value, M1ScalarKind::FloatingPoint),
+        "FixedPoint7dps" => coerce_for_scalar_kind(key, value, M1ScalarKind::FixedPoint7dps),
+        "Boolean" => coerce_for_declared_type(key, value, ValueType::Boolean, ctx.project),
+        "String" => coerce_for_declared_type(key, value, ValueType::String, ctx.project),
+        // Void and opaque handles do not have an M1 scalar family to restore.
+        _ => Ok(value),
+    }
 }
 
 /// Flag an IO call's channel as externally driven in the trace, if a sink is
@@ -160,6 +191,17 @@ pub fn project_object_call(
 
     // 1. Scenario override wins (e.g. a log replay driving a CAN read).
     if let Some(v) = ctx.env.io_override(&key).cloned() {
+        let returns = match method {
+            "TxOpen" | "GetUnsignedInteger" => Some("UnsignedInteger"),
+            "GetInteger" => Some("Integer"),
+            "GetScaled" | "GetFloat" => Some("FloatingPoint"),
+            "Receive" | "GetBit" => Some("Boolean"),
+            _ => None,
+        };
+        let v = match returns {
+            Some(returns) => coerce_io_override(&key, v, returns, ctx)?,
+            None => v,
+        };
         mark_external(ctx, &key);
         return Ok(v);
     }
@@ -310,6 +352,7 @@ mod tests {
                 script_name: "Demo.Update.m1scr",
                 dt: 0.02,
                 scripts: &[],
+                signature_m1_types: None,
                 depth: 0,
                 trace: Some(&mut self.trace),
             };
@@ -322,7 +365,7 @@ mod tests {
         let mut h = Harness::new();
         assert_eq!(
             h.io("System", "TickPeriod", &[]).unwrap(),
-            Value::Float(0.02)
+            Value::m1_float(0.02)
         );
         // The call is flagged externally driven.
         assert!(h.trace.is_external("System.TickPeriod"));
@@ -366,11 +409,15 @@ mod tests {
         let mut h = Harness::new();
         // Seed a scenario value for a CAN read that would otherwise fail loud.
         h.env
-            .set_io_override("CanComms.GetFloat", Value::Float(12.5));
+            .set_io_override("CanComms.GetFloat", Value::m1_float(12.5));
         assert_eq!(
-            h.io("CanComms", "GetFloat", &[Value::Uint(0), Value::Int(0)])
-                .unwrap(),
-            Value::Float(12.5)
+            h.io(
+                "CanComms",
+                "GetFloat",
+                &[Value::m1_unsigned(0), Value::m1_integer(0)]
+            )
+            .unwrap(),
+            Value::m1_float(12.5)
         );
         assert!(h.trace.is_external("CanComms.GetFloat"));
     }
@@ -379,19 +426,52 @@ mod tests {
     fn library_anchor_keeps_source_spelling_for_io_override_and_trace() {
         let mut h = Harness::new();
         h.env
-            .set_io_override("Library.CanComms.GetFloat", Value::Float(12.5));
+            .set_io_override("Library.CanComms.GetFloat", Value::m1_float(12.5));
 
         assert_eq!(
             h.io(
                 "Library.CanComms",
                 "GetFloat",
-                &[Value::Uint(0), Value::Int(0)]
+                &[Value::m1_unsigned(0), Value::m1_integer(0)]
             )
             .unwrap(),
-            Value::Float(12.5)
+            Value::m1_float(12.5)
         );
         assert!(h.trace.is_external("Library.CanComms.GetFloat"));
         assert!(!h.trace.is_external("CanComms.GetFloat"));
+    }
+
+    #[test]
+    fn scenario_overrides_restore_declared_io_return_families() {
+        let mut h = Harness::new();
+        h.env
+            .set_io_override("CanComms.GetFloat", Value::m1_integer(5));
+        assert_eq!(
+            h.io(
+                "CanComms",
+                "GetFloat",
+                &[Value::m1_unsigned(0), Value::m1_integer(0)]
+            )
+            .unwrap(),
+            Value::m1_float(5.0)
+        );
+
+        h.env
+            .set_io_override("System.FlashSize", Value::m1_integer(-1));
+        assert_eq!(
+            h.io("System", "FlashSize", &[]).unwrap(),
+            Value::m1_unsigned(u32::MAX)
+        );
+
+        h.env.set_io_override(
+            "DashVals.Aux Switch.GetUnsignedInteger",
+            Value::m1_integer(-2),
+        );
+        assert_eq!(
+            h.io("DashVals.Aux Switch", "GetUnsignedInteger", &[])
+                .unwrap(),
+            Value::m1_unsigned(u32::MAX - 1)
+        );
     }
 
     #[test]
@@ -401,12 +481,30 @@ mod tests {
         // type-correct externally-driven default (never a guessed reading).
         // `CanComms.GetFloat` declares a `FloatingPoint` return, so the stub is 0.0.
         assert_eq!(
-            h.io("CanComms", "GetFloat", &[Value::Uint(0), Value::Int(0)])
-                .unwrap(),
-            Value::Float(0.0)
+            h.io(
+                "CanComms",
+                "GetFloat",
+                &[Value::m1_unsigned(0), Value::m1_integer(0)]
+            )
+            .unwrap(),
+            Value::m1_float(0.0)
         );
         // The stub is flagged externally driven.
         assert!(h.trace.is_external("CanComms.GetFloat"));
+    }
+
+    #[test]
+    fn fixed_point_io_stub_preserves_its_declared_family() {
+        let mut h = Harness::new();
+        assert_eq!(
+            h.io(
+                "CanComms",
+                "GetFixed7DP",
+                &[Value::m1_unsigned(0), Value::m1_integer(0)]
+            )
+            .unwrap(),
+            Value::M1(M1Scalar::FixedPoint7dps(FixedPoint7dps::ZERO))
+        );
     }
 
     #[test]
@@ -420,10 +518,10 @@ mod tests {
                 "CanComms",
                 "RxOpenStandard",
                 &[
-                    Value::Uint(0),
-                    Value::Uint(0),
-                    Value::Uint(0),
-                    Value::Uint(0)
+                    Value::m1_unsigned(0),
+                    Value::m1_unsigned(0),
+                    Value::m1_unsigned(0),
+                    Value::m1_unsigned(0)
                 ],
             )
             .unwrap(),
@@ -441,7 +539,11 @@ mod tests {
             h.io(
                 "CanComms",
                 "SetFloat",
-                &[Value::Uint(0), Value::Int(0), Value::Float(1.0)],
+                &[
+                    Value::m1_unsigned(0),
+                    Value::m1_integer(0),
+                    Value::m1_float(1.0)
+                ],
             )
             .unwrap(),
             Value::Bool(true)
@@ -457,7 +559,7 @@ mod tests {
         // externally-driven default), not a fail-loud abort.
         assert_eq!(
             h.io("System", "ElapsedTime", &[]).unwrap(),
-            Value::Float(0.0)
+            Value::m1_float(0.0)
         );
         assert!(h.trace.is_external("System.ElapsedTime"));
     }
@@ -469,7 +571,7 @@ mod tests {
         // the zero-arg overload does), but it is a real `Boolean` IO method, so the
         // generic typed stub is false (externally driven), not a fail-loud abort.
         assert_eq!(
-            h.io("Logging", "Running", &[Value::Int(0)]).unwrap(),
+            h.io("Logging", "Running", &[Value::m1_integer(0)]).unwrap(),
             Value::Bool(false)
         );
         assert!(h.trace.is_external("Logging.Running"));
@@ -513,12 +615,19 @@ mod tests {
         // `RxOpenStandard` → Handle (unmappable → unit).
         assert_eq!(
             typed_io_default("CanComms", "GetFloat"),
-            Some(Value::Float(0.0))
+            Some(Value::m1_float(0.0))
         );
-        assert_eq!(typed_io_default("CanComms", "GetID"), Some(Value::Int(0)));
+        assert_eq!(
+            typed_io_default("CanComms", "GetFixed7DP"),
+            Some(Value::M1(M1Scalar::FixedPoint7dps(FixedPoint7dps::ZERO)))
+        );
+        assert_eq!(
+            typed_io_default("CanComms", "GetID"),
+            Some(Value::m1_integer(0))
+        );
         assert_eq!(
             typed_io_default("CanComms", "BusRxTotal"),
-            Some(Value::Uint(0))
+            Some(Value::m1_unsigned(0))
         );
         assert_eq!(
             typed_io_default("CanComms", "RxMessage"),
@@ -543,7 +652,7 @@ mod tests {
         // type-correct zero of its M1 return type, flagged externally driven.
         assert_eq!(
             h.io("DashVals.Aux Switch", "GetInteger", &[]).unwrap(),
-            Value::Int(0)
+            Value::m1_integer(0)
         );
         assert_eq!(
             h.io("DashVals.Aux Switch", "GetBit", &[]).unwrap(),
@@ -551,7 +660,7 @@ mod tests {
         );
         assert_eq!(
             h.io("DashVals.Aux Switch", "GetFloat", &[]).unwrap(),
-            Value::Float(0.0)
+            Value::m1_float(0.0)
         );
         assert!(h.trace.is_external("DashVals.Aux Switch.GetInteger"));
         assert!(h.trace.is_external("DashVals.Aux Switch.GetBit"));
@@ -568,7 +677,7 @@ mod tests {
                 h.io(
                     "DashVals.Aux Switch",
                     method,
-                    &[Value::Uint(0), Value::Int(1)],
+                    &[Value::m1_unsigned(0), Value::m1_integer(1)],
                 )
                 .unwrap(),
                 Value::Bool(true),
