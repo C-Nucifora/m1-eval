@@ -24,6 +24,7 @@ pub mod convert;
 pub mod enum_conv;
 pub mod io_stub;
 pub mod limit;
+pub mod object;
 pub mod stateful;
 pub mod userfn;
 
@@ -139,10 +140,29 @@ pub fn dispatch(
                 None => Err(unsupported(object, method)),
             }
         }
-        CallRoute::ChannelSet => match try_channel_set(object, args, ctx)? {
-            Some(value) => Ok(value),
-            None => Err(unsupported(object, method)),
-        },
+        CallRoute::EnumAsString => {
+            validate_object_arity(object, method, args.len())?;
+            match enum_conv::as_string(object, ctx)? {
+                Some(value) => Ok(value),
+                None => Err(unsupported(object, method)),
+            }
+        }
+        CallRoute::ObjectValidate => {
+            validate_object_arity(object, method, args.len())?;
+            object::validate(object, args, ctx)
+        }
+        CallRoute::ObjectConstrain => {
+            validate_object_arity(object, method, args.len())?;
+            object::constrain(object, args, ctx)
+        }
+        CallRoute::ObjectGetUnscheduled => {
+            validate_object_arity(object, method, args.len())?;
+            object::get_unscheduled(object, ctx)
+        }
+        CallRoute::ChannelSet => {
+            validate_object_arity(object, method, args.len())?;
+            object::set(object, args, ctx)
+        }
         CallRoute::Timer => {
             validate_object_arity(object, method, args.len())?;
             let object_key = timer_object_key(object, ctx);
@@ -199,57 +219,6 @@ pub(crate) fn dispatch_bare(
         kind: format!("call to non-function {callee:?}"),
         at: site.offset(),
     })
-}
-
-/// Attempt a channel `.Set(value)` imperative setter. Returns `Ok(Some(unit))`
-/// when `object` resolves to a `Channel`/`Parameter` symbol — writing the single
-/// evaluated argument to its canonical path and recording the write to the trace
-/// — and `Ok(None)` when `object` is not a channel (so dispatch falls through to
-/// IO/Timer routing). A wrong argument count is a fail-loud [`EvalError::BadCall`]
-/// (the setter takes exactly one value).
-fn try_channel_set(
-    object: &str,
-    args: &[Value],
-    ctx: &mut EvalCtx,
-) -> Result<Option<Value>, EvalError> {
-    // Only a project channel/parameter has an imperative `.Set`.
-    let Target::Symbol(canon) = classify(
-        object,
-        ctx.group,
-        ctx.fn_symbol,
-        ctx.project,
-        &ctx.env.locals,
-    ) else {
-        return Ok(None);
-    };
-    let is_writable = ctx
-        .project
-        .symbols()
-        .get(&canon)
-        .map(|s| matches!(s.kind, SymbolKind::Channel | SymbolKind::Parameter))
-        .unwrap_or(false);
-    if !is_writable {
-        return Ok(None);
-    }
-
-    // The setter takes exactly one value — fail loud on any other arity rather
-    // than guessing which argument to write.
-    if args.len() != 1 {
-        return Err(EvalError::BadCall {
-            detail: format!("{object}.Set expects 1 argument, got {}", args.len()),
-        });
-    }
-    // Apply the target channel's declared M1 family. Integer/unsigned writes use
-    // their shared 32-bit pattern, float promotion rounds to binary32, and an
-    // enum target resolves the exact member value.
-    let value = crate::expr::coerce_for_channel(&canon, args[0].clone(), ctx.project)?;
-    ctx.env.set(canon.clone(), value.clone());
-    if let Some(trace) = ctx.trace.as_deref_mut() {
-        trace.record_channel(canon, value.clone());
-    }
-    // The setter is a statement-level write; reuse the unit value the IO void
-    // writers return so an expression-statement call succeeds.
-    Ok(Some(Value::Bool(true)))
 }
 
 /// The state key for a Timer object: a [`CallSite`] whose script slot is the
@@ -541,6 +510,10 @@ enum CallRoute {
     TableLookup,
     TableGet,
     EnumAsInteger,
+    EnumAsString,
+    ObjectValidate,
+    ObjectConstrain,
+    ObjectGetUnscheduled,
     ChannelSet,
     Timer,
     ProjectIo,
@@ -684,8 +657,16 @@ pub(crate) fn classify_member_call(
         return classify_library(&library_object, method);
     }
 
-    if method == "AsInteger" && is_enum_literal(object, project) {
-        return capability(BuiltinSupport::Direct, CallRoute::EnumAsInteger);
+    // A resolved enum member is never a project IO object. Handle both
+    // supported conversions here and reject every other method before the
+    // unresolved-project fallback can mistake spellings such as `.Set()` for
+    // a hardware stub.
+    if is_enum_literal(object, project) {
+        return match method {
+            "AsInteger" => capability(BuiltinSupport::Direct, CallRoute::EnumAsInteger),
+            "AsString" => capability(BuiltinSupport::Direct, CallRoute::EnumAsString),
+            _ => unsupported_capability(),
+        };
     }
 
     // `Library.` explicitly selects the intrinsic namespace. An unknown object
@@ -771,17 +752,31 @@ fn classify_project_method(canon: &str, method: &str, project: &Project) -> Call
     };
 
     if symbol.kind == SymbolKind::Table {
-        return match method {
-            "Lookup" => capability(BuiltinSupport::Modeled, CallRoute::TableLookup),
-            "Get" => capability(BuiltinSupport::Direct, CallRoute::TableGet),
-            _ => unsupported_capability(),
-        };
+        match method {
+            "Lookup" => return capability(BuiltinSupport::Modeled, CallRoute::TableLookup),
+            "Get" => return capability(BuiltinSupport::Direct, CallRoute::TableGet),
+            // A table may also expose generic numeric accessors through its
+            // generated `.Value` channel. Continue to receiver-aware object
+            // method classification for every other method.
+            _ => {}
+        }
     }
     if method == "AsInteger" && is_enum_source(canon, project) {
         return capability(BuiltinSupport::Direct, CallRoute::EnumAsInteger);
     }
-    if method == "Set" && matches!(symbol.kind, SymbolKind::Channel | SymbolKind::Parameter) {
+    if method == "AsString" && is_enum_source(canon, project) {
+        return capability(BuiltinSupport::Direct, CallRoute::EnumAsString);
+    }
+    if method == "Set" && object::writable_value_path(canon, project).is_some() {
         return capability(BuiltinSupport::Direct, CallRoute::ChannelSet);
+    }
+    if object::is_numeric_source(canon, project) {
+        return match method {
+            "Validate" => capability(BuiltinSupport::Direct, CallRoute::ObjectValidate),
+            "Constrain" => capability(BuiltinSupport::Direct, CallRoute::ObjectConstrain),
+            "GetUnscheduled" => capability(BuiltinSupport::Direct, CallRoute::ObjectGetUnscheduled),
+            _ => unsupported_capability(),
+        };
     }
     if symbol.classname.as_deref() == Some("BuiltIn.Timer")
         && matches!(method, "Start" | "Stop" | "Reset" | "Remaining")
@@ -816,17 +811,7 @@ fn is_enum_literal(object: &str, project: &Project) -> bool {
 }
 
 fn is_enum_source(canon: &str, project: &Project) -> bool {
-    let Some(symbol) = project.symbols().get(canon) else {
-        return false;
-    };
-    match symbol.kind {
-        SymbolKind::Channel | SymbolKind::Parameter => symbol.value_type.is_enum(),
-        SymbolKind::Group => project
-            .symbols()
-            .get(&format!("{canon}.Value"))
-            .is_some_and(|value| value.value_type.is_enum()),
-        _ => false,
-    }
+    enum_conv::enum_value_path(canon, project).is_some()
 }
 
 fn script_backed_user_function(callee: &str, scope: &CapabilityScope<'_>) -> Option<String> {
@@ -938,6 +923,7 @@ mod tests {
                 dt: 0.01,
                 scripts: &[],
                 signature_m1_types: None,
+                object_rules: None,
                 depth: 0,
                 trace: None,
             }
@@ -1468,6 +1454,7 @@ mod tests {
                 dt: 0.01,
                 scripts: &[],
                 signature_m1_types: None,
+                object_rules: None,
                 depth: 0,
                 trace: None,
             }
@@ -1514,6 +1501,40 @@ mod tests {
     }
 
     #[test]
+    fn dispatch_as_string_preserves_enum_member_names() {
+        let mut h = EnumHarness::new();
+        assert_eq!(
+            h.call("Drive State.Precharging", "AsString", &[]).unwrap(),
+            Value::Str("Precharging".to_string())
+        );
+
+        let id = h.enum_id();
+        h.env.set(
+            "Root.Demo.Mode",
+            Value::Enum {
+                id,
+                member: "Idle".to_string(),
+            },
+        );
+        assert_eq!(
+            h.call("Mode", "AsString", &[]).unwrap(),
+            Value::Str("Idle".to_string())
+        );
+
+        h.env.set(
+            "Root.Demo.Compound.Value",
+            Value::Enum {
+                id,
+                member: "Precharging".to_string(),
+            },
+        );
+        assert_eq!(
+            h.call("Compound", "AsString", &[]).unwrap(),
+            Value::Str("Precharging".to_string())
+        );
+    }
+
+    #[test]
     fn dispatch_as_integer_on_non_enum_fails_loud() {
         let mut h = EnumHarness::new();
         // A name that is neither an enum literal nor an enum-typed project symbol:
@@ -1528,7 +1549,7 @@ mod tests {
     }
 
     #[test]
-    fn as_integer_is_classified_supported() {
+    fn enum_conversions_are_classified_by_receiver() {
         let dir = Path::new(env!("CARGO_MANIFEST_DIR")).join("tests/fixtures/enums");
         let loaded =
             crate::loader::load(&dir.join("Project.m1prj"), None).expect("enums fixture loads");
@@ -1539,6 +1560,26 @@ mod tests {
                 Some("Root.Demo.Update"),
                 "Drive State.Idle",
                 "AsInteger"
+            ),
+            BuiltinSupport::Direct
+        );
+        assert_eq!(
+            support_in(
+                &loaded,
+                Some("Root.Demo"),
+                Some("Root.Demo.Update"),
+                "Drive State.Idle",
+                "AsString"
+            ),
+            BuiltinSupport::Direct
+        );
+        assert_eq!(
+            support_in(
+                &loaded,
+                Some("Root.Demo"),
+                Some("Root.Demo.Update"),
+                "Mode",
+                "AsString"
             ),
             BuiltinSupport::Direct
         );
@@ -1562,6 +1603,17 @@ mod tests {
             ),
             BuiltinSupport::Unsupported,
             "a non-enum channel is not an AsInteger receiver"
+        );
+        assert_eq!(
+            support_in(
+                &loaded,
+                Some("Root.Demo"),
+                Some("Root.Demo.Update"),
+                "Precharge State",
+                "AsString"
+            ),
+            BuiltinSupport::Unsupported,
+            "a non-enum channel is not an AsString receiver"
         );
     }
 
@@ -1607,6 +1659,7 @@ mod tests {
     struct ProjectObjHarness {
         project: Project,
         calib: Calibration,
+        object_rules: object::ObjectRules,
         env: Env,
         state: StateStore,
         trace: crate::trace::Trace,
@@ -1620,6 +1673,7 @@ mod tests {
             ProjectObjHarness {
                 project: loaded.project,
                 calib: Calibration::default(),
+                object_rules: loaded.object_rules,
                 env: Env::new(),
                 state: StateStore::new(),
                 trace: crate::trace::Trace::new(),
@@ -1639,6 +1693,7 @@ mod tests {
                 dt: 0.01,
                 scripts: &[],
                 signature_m1_types: None,
+                object_rules: Some(&self.object_rules),
                 depth: 0,
                 trace: Some(&mut self.trace),
             };
@@ -1708,6 +1763,211 @@ mod tests {
     }
 
     #[test]
+    fn validate_uses_inclusive_project_ranges_and_positive_rules() {
+        let mut h = ProjectObjHarness::new();
+        for (value, expected) in [(-3, false), (-2, true), (3, true), (4, false)] {
+            assert_eq!(
+                h.call("Limited Signed", "Validate", &[Value::m1_integer(value)])
+                    .unwrap(),
+                Value::Bool(expected),
+                "value {value}"
+            );
+        }
+        assert_eq!(
+            h.call("Positive Float", "Validate", &[Value::m1_float(-0.5)])
+                .unwrap(),
+            Value::Bool(false)
+        );
+        assert_eq!(
+            h.call("Positive Float", "Validate", &[Value::m1_float(0.0)])
+                .unwrap(),
+            Value::Bool(true)
+        );
+        assert_eq!(
+            h.call("Free Unsigned", "Validate", &[Value::m1_unsigned(u32::MAX)])
+                .unwrap(),
+            Value::Bool(true),
+            "an object without validation accepts its numeric domain"
+        );
+    }
+
+    #[test]
+    fn constrain_clamps_and_preserves_each_m1_scalar_family() {
+        let mut h = ProjectObjHarness::new();
+        assert_eq!(
+            h.call("Limited Signed", "Constrain", &[Value::m1_integer(-10)])
+                .unwrap(),
+            Value::m1_integer(-2)
+        );
+        assert_eq!(
+            h.call("Limited Float", "Constrain", &[Value::m1_float(8.0)])
+                .unwrap(),
+            Value::m1_float(2.25)
+        );
+        assert_eq!(
+            h.call(
+                "Limited Fixed",
+                "Constrain",
+                &[Value::M1(M1Scalar::FixedPoint7dps(
+                    crate::value::FixedPoint7dps::from_raw(-20_000_000)
+                ))]
+            )
+            .unwrap(),
+            Value::M1(M1Scalar::FixedPoint7dps(
+                crate::value::FixedPoint7dps::from_raw(-12_345_678)
+            ))
+        );
+        assert_eq!(
+            h.call(
+                "Limited Unsigned",
+                "Constrain",
+                &[Value::m1_unsigned(u32::MAX)]
+            )
+            .unwrap(),
+            Value::m1_unsigned(10)
+        );
+    }
+
+    #[test]
+    fn set_coerces_then_clamps_to_the_target_rule() {
+        let mut h = ProjectObjHarness::new();
+        h.call("Limited Signed", "Set", &[Value::m1_unsigned(20)])
+            .unwrap();
+        assert_eq!(
+            h.env.get("Root.Demo.Limited Signed"),
+            Some(&Value::m1_integer(3))
+        );
+
+        h.call("Limited Float", "Set", &[Value::m1_integer(-10)])
+            .unwrap();
+        assert_eq!(
+            h.env.get("Root.Demo.Limited Float"),
+            Some(&Value::m1_float(-1.5))
+        );
+
+        h.call("Positive Float", "Set", &[Value::m1_float(-2.0)])
+            .unwrap();
+        assert_eq!(
+            h.env.get("Root.Demo.Positive Float"),
+            Some(&Value::m1_float(0.0))
+        );
+    }
+
+    #[test]
+    fn get_unscheduled_reads_the_exact_stored_scalar() {
+        let mut h = ProjectObjHarness::new();
+        h.env.set("Root.Demo.Limited Signed", Value::m1_integer(-1));
+        assert_eq!(
+            h.call("Limited Signed", "GetUnscheduled", &[]).unwrap(),
+            Value::m1_integer(-1)
+        );
+    }
+
+    #[test]
+    fn numeric_value_compounds_follow_their_declared_default() {
+        let mut h = ProjectObjHarness::new();
+        assert_eq!(
+            h.call("Limited Compound", "Validate", &[Value::m1_unsigned(5)])
+                .unwrap(),
+            Value::Bool(false)
+        );
+        assert_eq!(
+            h.call("Limited Compound", "Constrain", &[Value::m1_unsigned(5)])
+                .unwrap(),
+            Value::m1_unsigned(4)
+        );
+        h.env
+            .set("Root.Demo.Limited Compound.Value", Value::m1_unsigned(3));
+        assert_eq!(
+            h.call("Limited Compound", "GetUnscheduled", &[]).unwrap(),
+            Value::m1_unsigned(3)
+        );
+        h.call("Limited Compound", "Set", &[Value::m1_unsigned(9)])
+            .unwrap();
+        assert_eq!(
+            h.env.get("Root.Demo.Limited Compound.Value"),
+            Some(&Value::m1_unsigned(4)),
+            "Set writes the concrete value child after applying the compound's range"
+        );
+    }
+
+    #[test]
+    fn get_unscheduled_reads_a_tables_generated_value_channel() {
+        let mut h = Harness::new();
+        h.env.set("Root.Demo.Map.Value", Value::m1_float(12.5));
+        assert_eq!(
+            h.call("Map", "GetUnscheduled", &[]).unwrap(),
+            Value::m1_float(12.5)
+        );
+    }
+
+    #[test]
+    fn unsupported_object_method_pairs_name_the_exact_call() {
+        let mut h = ProjectObjHarness::new();
+        for (object, method, args) in [
+            ("Mode", "Validate", vec![Value::m1_integer(1)]),
+            ("Limited Signed", "AsString", vec![]),
+            ("Startup Delay", "GetUnscheduled", vec![]),
+            ("Drive State.Idle", "Set", vec![Value::m1_integer(1)]),
+        ] {
+            assert_eq!(
+                h.call(object, method, &args),
+                Err(EvalError::UnsupportedBuiltin {
+                    object: object.to_string(),
+                    method: method.to_string(),
+                })
+            );
+        }
+    }
+
+    #[test]
+    fn core_object_methods_have_capability_parity() {
+        let dir = Path::new(env!("CARGO_MANIFEST_DIR")).join("tests/fixtures/enums");
+        let loaded =
+            crate::loader::load(&dir.join("Project.m1prj"), None).expect("enums fixture loads");
+        for (object, method) in [
+            ("Mode", "AsString"),
+            ("Limited Signed", "Validate"),
+            ("Limited Signed", "Constrain"),
+            ("Limited Signed", "GetUnscheduled"),
+            ("Limited Compound", "Validate"),
+            ("Limited Compound", "Constrain"),
+            ("Limited Compound", "GetUnscheduled"),
+            ("Limited Compound", "Set"),
+            ("Limited Signed", "Set"),
+        ] {
+            assert_eq!(
+                support_in(
+                    &loaded,
+                    Some("Root.Demo"),
+                    Some("Root.Demo.Update"),
+                    object,
+                    method,
+                ),
+                BuiltinSupport::Direct,
+                "{object}.{method}"
+            );
+        }
+        for (object, method) in [
+            ("Mode", "Constrain"),
+            ("Limited Signed", "AsString"),
+            ("Startup Delay", "GetUnscheduled"),
+        ] {
+            assert_eq!(
+                support_in(
+                    &loaded,
+                    Some("Root.Demo"),
+                    Some("Root.Demo.Update"),
+                    object,
+                    method,
+                ),
+                BuiltinSupport::Unsupported,
+                "{object}.{method}"
+            );
+        }
+    }
+
+    #[test]
     fn timer_dispatch_requires_a_timer_receiver() {
         let mut h = ProjectObjHarness::new();
         assert_eq!(
@@ -1760,7 +2020,11 @@ mod tests {
         let scripts = parse_all(&[(
             "Demo.Update.m1scr".to_string(),
             "Mode.AsInteger();\n\
+             Mode.AsString();\n\
              Precharge State.Set(1);\n\
+             Limited Signed.Validate(1);\n\
+             Limited Signed.Constrain(1);\n\
+             Limited Signed.GetUnscheduled();\n\
              Startup Delay.Start(1.0);\n\
              Startup Delay.Stop();\n\
              Startup Delay.Reset();\n\
@@ -1774,7 +2038,14 @@ mod tests {
         )]);
         let report = crate::coverage::CoverageReport::analyse_in(&scripts, Some(&harness.project));
 
-        for name in ["Mode.AsInteger", "Precharge State.Set"] {
+        for name in [
+            "Mode.AsInteger",
+            "Mode.AsString",
+            "Precharge State.Set",
+            "Limited Signed.Validate",
+            "Limited Signed.Constrain",
+            "Limited Signed.GetUnscheduled",
+        ] {
             assert!(
                 report.supported.iter().any(|item| item.name == name),
                 "{name} should be supported: {report:?}"
@@ -1816,9 +2087,16 @@ mod tests {
                 member: "Idle".to_string(),
             },
         );
+        harness
+            .env
+            .set("Root.Demo.Limited Signed", Value::m1_integer(1));
         let calls = [
             ("Mode", "AsInteger", vec![]),
+            ("Mode", "AsString", vec![]),
             ("Precharge State", "Set", vec![Value::m1_integer(1)]),
+            ("Limited Signed", "Validate", vec![Value::m1_integer(1)]),
+            ("Limited Signed", "Constrain", vec![Value::m1_integer(1)]),
+            ("Limited Signed", "GetUnscheduled", vec![]),
             ("Startup Delay", "Start", vec![Value::m1_float(1.0)]),
             ("Startup Delay", "Stop", vec![]),
             ("Startup Delay", "Reset", vec![]),

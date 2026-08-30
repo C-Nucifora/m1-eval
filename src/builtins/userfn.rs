@@ -206,6 +206,7 @@ pub fn call(
             dt: ctx.dt,
             scripts: ctx.scripts,
             signature_m1_types: ctx.signature_m1_types,
+            object_rules: ctx.object_rules,
             depth: ctx.depth + 1,
             trace: ctx.trace.as_deref_mut(),
         };
@@ -291,6 +292,7 @@ mod tests {
                 dt: 0.01,
                 scripts,
                 signature_m1_types: Some(&self.loaded.signature_m1_types),
+                object_rules: Some(&self.loaded.object_rules),
                 depth: 0,
                 trace: None,
             };

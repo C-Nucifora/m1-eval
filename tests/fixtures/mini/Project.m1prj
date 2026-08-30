@@ -17,6 +17,7 @@
    <Component Classname="BuiltIn.Constant" Name="Root.Demo.LegacyConstant"><Props Value="100"/></Component>
    <Component Classname="BuiltIn.Constant" Name="Root.Demo.BooleanConstant"><Props Value="true"/></Component>
    <Component Classname="BuiltIn.Table" Name="Root.Demo.Map"><Props Type="f32"/></Component>
+   <Component Classname="BuiltIn.Channel" Caps="AutoCreated" Name="Root.Demo.Map.Value"><Props Type="f32"/></Component>
    <Component Classname="BuiltIn.GroupCompound" Name="Root.Demo.Sensor Compound"><Props UseDefValue="true" DefValue="This.Sensor"/></Component>
    <Component Classname="BuiltIn.Channel" Name="Root.Demo.Sensor Compound.Sensor"><Props Type="f32"/></Component>
    <Component Classname="BuiltIn.FuncUser" Filename="Demo.Update.m1scr" Name="Root.Demo.Update"/>

@@ -32,7 +32,7 @@ do not compare computed channel values with captured M1 results.
 | --- | --- | --- |
 | Expressions, statements, enums, and inline user functions | **Assumed** | Covered by unit and synthetic-project tests. M1 evaluation results have not been captured for comparison. |
 | `.m1cfg` parameters and 1/2/3-D table lookup | **Assumed** | Parsing, interpolation, and edge clamping use synthetic fixtures. Use the matching calibration file for actual values. Without it, parameters use typed external defaults. Table `.Lookup()` and `.Get()` fail in strict modes; whole-project mode may opt in to an external `0.0` fallback. |
-| `Calculate.*`, `Limit.*`, `Convert.*`, enum conversions, and table methods | **Assumed** | Implemented methods have hand-derived tests. `--coverage` remains authoritative for the methods a project uses. |
+| `Calculate.*`, `Limit.*`, `Convert.*`, enum conversions, core value-object methods, and table methods | **Assumed** | Implemented methods have hand-derived tests. `AsString`, `Validate`, `Constrain`, `GetUnscheduled`, and `Set` resolve against the receiver; `Set` applies its project validation range before writing. `--coverage` remains authoritative for the methods a project uses. |
 | Filters, integrals, derivatives, debounce, delay, change detection, timers, and `static local` state | **Assumed** | Update laws and startup behavior are explicit implementation assumptions with hand-derived tests, not M1 value comparisons. |
 | `CanComms.*`, `Serial.*`, `System.*`, `Logging.*`, DBC objects, and other hardware-backed calls | **Stubbed** | Scenario `[[io]]` values take precedence. Otherwise calls use documented or generic typed stubs; writes are offline no-ops. |
 | Scenario parsing, tick grids, trace output, and `--coverage` | **Assumed** | These are deterministic m1-eval contracts tested with synthetic data. A `Supported` coverage entry means implemented, not M1-verified. |
@@ -168,6 +168,16 @@ with its execution rate (`@ 500 Hz`, `@ 50 Hz`, …), `startup, runs once`, or
 an explicit `helper`, `unscheduled`, or `unresolved trigger` status. The last
 status includes the failed path or attribute, so a project author can repair the
 selection instead of treating every excluded function as the same case.
+
+Core value-object calls are receiver-aware. Enum values provide `AsInteger()`
+and `AsString()`. Numeric channels, parameters, tables, and value compounds
+provide `Validate(v)`, `Constrain(v)`, and `GetUnscheduled()`. `MinMax` project
+validation is inclusive; the legacy `Positive` rule is treated as a lower bound
+of zero. `Constrain` retains its argument's M1 scalar family. `Set(v)` first
+converts to the writable target's family, then applies the same range before it
+writes. `GetUnscheduled()` performs an ordinary runtime read but deliberately
+adds no scheduler dependency. Unknown validation kinds fail if execution reaches
+one, and unsupported receiver/method pairs name the exact call.
 
 ## Quickstart
 

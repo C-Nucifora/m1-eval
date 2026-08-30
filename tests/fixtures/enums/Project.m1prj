@@ -13,6 +13,14 @@
    <Component Classname="BuiltIn.GroupCompound" Name="Root.Demo.Compound"/>
    <Component Classname="BuiltIn.Channel" Name="Root.Demo.Compound.Value"><Props Type="::This.Drive State"/></Component>
    <Component Classname="BuiltIn.Channel" Name="Root.Demo.Precharge State"><Props Type="u8"/></Component>
+   <Component Classname="BuiltIn.Channel" Name="Root.Demo.Limited Signed"><Props Type="s32" Validation="MinMax" ValMin="-2" ValMax="3"/></Component>
+   <Component Classname="BuiltIn.Channel" Name="Root.Demo.Limited Float"><Props Type="f32" Validation="MinMax" ValMin="-1.5" ValMax="2.25"/></Component>
+   <Component Classname="BuiltIn.Channel" Name="Root.Demo.Limited Fixed"><Props Type="FixedPoint7dps" Validation="MinMax" ValMin="-1.2345678" ValMax="1.2345678"/></Component>
+   <Component Classname="BuiltIn.Channel" Name="Root.Demo.Limited Unsigned"><Props Type="u32" Validation="MinMax" ValMin="2" ValMax="10"/></Component>
+   <Component Classname="BuiltIn.Parameter" Name="Root.Demo.Positive Float"><Props Type="f32" Validation="Positive"/></Component>
+   <Component Classname="BuiltIn.Channel" Name="Root.Demo.Free Unsigned"><Props Type="u32"/></Component>
+   <Component Classname="BuiltIn.GroupCompound" Name="Root.Demo.Limited Compound"><Props UseDefValue="true" DefValue="This.Value" Validation="MinMax" ValMin="1" ValMax="4"/></Component>
+   <Component Classname="BuiltIn.Channel" Name="Root.Demo.Limited Compound.Value"><Props Type="u32"/></Component>
    <Component Classname="BuiltIn.Timer" Name="Root.Demo.Startup Delay"/>
    <Component Classname="BuiltIn.GroupCompound" Name="Root.Demo.Service Bits"/>
    <Component Classname="BuiltIn.CAN.Message" Name="Root.Demo.DashVals"/>

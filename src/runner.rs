@@ -498,6 +498,7 @@ fn tick_loop(
                 dt: 1.0 / base_rate_hz,
                 scripts: &loaded.scripts,
                 signature_m1_types: Some(&loaded.signature_m1_types),
+                object_rules: Some(&loaded.object_rules),
                 depth: 0,
                 // No trace: no tick is open yet, and record_channel appends
                 // blindly — a startup record would desync columns from the time
@@ -555,6 +556,7 @@ fn tick_loop(
                 dt: plan.dt,
                 scripts: &loaded.scripts,
                 signature_m1_types: Some(&loaded.signature_m1_types),
+                object_rules: Some(&loaded.object_rules),
                 depth: 0,
                 trace: Some(&mut trace),
             };
@@ -1141,6 +1143,7 @@ pub fn run_counterfactual(
                         dt: 1.0 / base_rate_hz,
                         scripts: &loaded.scripts,
                         signature_m1_types: Some(&loaded.signature_m1_types),
+                        object_rules: Some(&loaded.object_rules),
                         depth: 0,
                         trace: None,
                     };
@@ -1178,6 +1181,7 @@ pub fn run_counterfactual(
                 dt: plan.dt,
                 scripts: &loaded.scripts,
                 signature_m1_types: Some(&loaded.signature_m1_types),
+                object_rules: Some(&loaded.object_rules),
                 depth: 0,
                 trace: Some(&mut trace),
             };

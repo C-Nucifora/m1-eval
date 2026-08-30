@@ -29,7 +29,6 @@ use crate::value::Value;
 use m1_core::{Field, Kind, Node};
 use m1_typecheck::Project;
 use m1_typecheck::parsed::ParsedScript;
-use m1_typecheck::symbols::SymbolKind;
 use std::collections::{BTreeSet, HashMap};
 
 /// The canonical read/write sets of one function's body.
@@ -97,11 +96,12 @@ impl Walker<'_> {
     }
 
     /// Account the *receiver* of a method call's callee. Mirrors `m1-typecheck`
-    /// schedule.rs: when the receiver resolves to a project channel/parameter,
-    /// `Chan.Set*(…)` is the imperative setter — a **write** of that channel — and
-    /// any other method (`AsInteger`/`Lookup`/`Get…`/…) is a **read**. A
-    /// library/object callee (`Calculate.Max`) has no channel receiver and is
-    /// ignored. The arguments are handled by the caller, not here.
+    /// schedule.rs: when the receiver resolves to a writable project value,
+    /// `Value.Set*(…)` is an imperative **write** of its concrete channel, and
+    /// any other value method is a **read**, except `GetUnscheduled`, whose
+    /// contract explicitly omits the scheduling edge. A library/object callee
+    /// (`Calculate.Max`) has no channel receiver and is ignored. The arguments
+    /// are handled by the caller, not here.
     fn account_call_callee(&mut self, call_node: &Node) {
         let Some(callee) = call_node.child_by_field(Field::Function) else {
             return;
@@ -115,23 +115,22 @@ impl Walker<'_> {
         ) else {
             return;
         };
-        // The receiver must resolve to a project channel/parameter to count.
+        // Resolve the receiver to the concrete channel/parameter it stores.
+        // A value compound may write/read through its declared default child.
         let Some(path) = self.canonical_symbol(&receiver) else {
             return;
         };
-        let writable = self
-            .project
-            .symbols()
-            .get(&path)
-            .map(|s| matches!(s.kind, SymbolKind::Channel | SymbolKind::Parameter))
-            .unwrap_or(false);
-        if !writable {
+        let Some(value_path) = crate::builtins::object::writable_value_path(&path, self.project)
+        else {
+            return;
+        };
+        if method.text() == "GetUnscheduled" {
             return;
         }
         if method.text().starts_with("Set") {
-            self.sets.writes.insert(path);
+            self.sets.writes.insert(value_path);
         } else {
-            self.sets.reads.insert(path);
+            self.sets.reads.insert(value_path);
         }
     }
 
@@ -338,5 +337,39 @@ mod tests {
 
         assert!(sets.reads.contains("Root.Demo.Output"), "{sets:?}");
         assert!(!sets.writes.contains("Root.Demo.Output"), "{sets:?}");
+    }
+
+    #[test]
+    fn get_unscheduled_omits_only_its_receiver_dependency() {
+        let project = mini_project();
+        let script =
+            script_from("local x = Output.GetUnscheduled();\nlocal y = Speed.Validate(Gain);\n");
+        let sets = io_sets(&script, &project, Some("Root.Demo"));
+
+        assert!(
+            !sets.reads.contains("Root.Demo.Output"),
+            "GetUnscheduled must not create a scheduler edge: {sets:?}"
+        );
+        assert!(
+            sets.reads.contains("Root.Demo.Speed"),
+            "other object methods still read their receiver: {sets:?}"
+        );
+        assert!(
+            sets.reads.contains("Root.Demo.Gain"),
+            "call arguments remain ordinary reads: {sets:?}"
+        );
+    }
+
+    #[test]
+    fn value_compound_set_writes_its_declared_default_channel() {
+        let project = mini_project();
+        let script = script_from("Sensor Compound.Set(2.0);\n");
+        let sets = io_sets(&script, &project, Some("Root.Demo"));
+
+        assert!(
+            sets.writes.contains("Root.Demo.Sensor Compound.Sensor"),
+            "the scheduler must see the same concrete write as runtime: {sets:?}"
+        );
+        assert!(!sets.writes.contains("Root.Demo.Sensor Compound"));
     }
 }
