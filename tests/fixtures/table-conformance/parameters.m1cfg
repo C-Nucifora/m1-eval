@@ -1,0 +1,48 @@
+<?xml version="1.0"?>
+<!-- Synthetic table conformance calibration. X is the fastest body axis. -->
+<Configuration Locale="English_Australia.1252" DefaultLocale="C">
+ <Group Name="">
+  <Table Name="Tables.Curve">
+   <X><Cells Type="f32"><Cell Site="0,0,0">-10</Cell><Cell Site="1,0,0">0</Cell><Cell Site="2,0,0">20</Cell></Cells></X>
+   <Body><Cells Type="f32"><Cell Site="0,0,0">50</Cell><Cell Site="1,0,0">100</Cell><Cell Site="2,0,0">200</Cell></Cells></Body>
+  </Table>
+  <Table Name="Tables.Grid">
+   <X><Cells Type="f32"><Cell Site="0,0,0">0</Cell><Cell Site="1,0,0">10</Cell><Cell Site="2,0,0">30</Cell></Cells></X>
+   <Y><Cells Type="f32"><Cell Site="0,0,0">-5</Cell><Cell Site="0,1,0">5</Cell><Cell Site="0,2,0">25</Cell></Cells></Y>
+   <Body><Cells Type="f32">
+    <Cell Site="0,0,0">-8</Cell><Cell Site="1,0,0">92</Cell><Cell Site="2,0,0">292</Cell>
+    <Cell Site="0,1,0">22</Cell><Cell Site="1,1,0">122</Cell><Cell Site="2,1,0">322</Cell>
+    <Cell Site="0,2,0">82</Cell><Cell Site="1,2,0">182</Cell><Cell Site="2,2,0">382</Cell>
+   </Cells></Body>
+  </Table>
+  <Table Name="Tables.Cube">
+   <X><Cells Type="f32"><Cell Site="0,0,0">-1</Cell><Cell Site="1,0,0">1</Cell></Cells></X>
+   <Y><Cells Type="f32"><Cell Site="0,0,0">0</Cell><Cell Site="0,1,0">2</Cell><Cell Site="0,2,0">6</Cell></Cells></Y>
+   <Z><Cells Type="f32"><Cell Site="0,0,0">10</Cell><Cell Site="0,0,1">20</Cell></Cells></Z>
+   <Body><Cells Type="f32">
+    <Cell Site="0,0,0">-90</Cell><Cell Site="1,0,0">110</Cell>
+    <Cell Site="0,1,0">-70</Cell><Cell Site="1,1,0">130</Cell>
+    <Cell Site="0,2,0">-30</Cell><Cell Site="1,2,0">170</Cell>
+    <Cell Site="0,0,1">-80</Cell><Cell Site="1,0,1">120</Cell>
+    <Cell Site="0,1,1">-60</Cell><Cell Site="1,1,1">140</Cell>
+    <Cell Site="0,2,1">-20</Cell><Cell Site="1,2,1">180</Cell>
+   </Cells></Body>
+  </Table>
+  <Table Name="Tables.Single">
+   <X><Cells Type="f32"><Cell Site="0,0,0">5</Cell></Cells></X>
+   <Body><Cells Type="f32"><Cell Site="0,0,0">42</Cell></Cells></Body>
+  </Table>
+  <Table Name="Tables.Extend">
+   <X><Cells Type="f32"><Cell Site="0,0,0">0</Cell><Cell Site="1,0,0">10</Cell></Cells></X>
+   <Y><Cells Type="f32"><Cell Site="0,0,0">0</Cell><Cell Site="0,1,0">20</Cell></Cells></Y>
+   <Body><Cells Type="f32">
+    <Cell Site="0,0,0">1</Cell><Cell Site="1,0,0">21</Cell>
+    <Cell Site="0,1,0">61</Cell><Cell Site="1,1,0">81</Cell>
+   </Cells></Body>
+  </Table>
+  <Table Name="Tables.Enum Map">
+   <X><Cells Type="enum"><Cell Site="0,0,0">0</Cell><Cell Site="1,0,0">2</Cell><Cell Site="2,0,0">7</Cell></Cells></X>
+   <Body><Cells Type="f32"><Cell Site="0,0,0">11</Cell><Cell Site="1,0,0">22</Cell><Cell Site="2,0,0">77</Cell></Cells></Body>
+  </Table>
+ </Group>
+</Configuration>

@@ -31,7 +31,7 @@ do not compare computed channel values with captured M1 results.
 | Advertised area | State | Current contract |
 | --- | --- | --- |
 | Expressions, statements, enums, and inline user functions | **Assumed** | Covered by unit and synthetic-project tests. M1 evaluation results have not been captured for comparison. |
-| `.m1cfg` parameters and 1/2/3-D table lookup | **Assumed** | Parsing, interpolation, and edge clamping use synthetic fixtures. Use the matching calibration file for actual values. Without it, parameters use typed external defaults. Table `.Lookup()` and `.Get()` fail in strict modes; whole-project mode may opt in to an external `0.0` fallback. |
+| `.m1cfg` parameters and 1/2/3-D table lookup | **Assumed** | The reader honors explicit `Site="x,y,z"` coordinates with X changing fastest, enum axes, and each project's clamp or extrapolation flags. Synthetic vectors cover exact sites, interpolation, every boundary, and malformed tables. No M1 Sim table capture is available yet. Use the matching calibration for actual values. Without it, parameters use typed external defaults. Table `.Lookup()` and `.Get()` fail in strict modes; whole-project mode may opt in to an external `0.0` fallback. |
 | `Calculate.*`, `Limit.*`, `Convert.*`, enum conversions, core value-object methods, and table methods | **Assumed** | Implemented methods have hand-derived tests. `AsString`, `Validate`, `Constrain`, `GetUnscheduled`, and `Set` resolve against eligible receiver classes; channel `Set` applies its project validation range before writing. `--coverage` remains authoritative for the methods a project uses. |
 | Filters, integrals, derivatives, debounce, delay, change detection, timers, and `static local` state | **Assumed** | Update laws and startup behavior are explicit implementation assumptions with hand-derived tests, not M1 value comparisons. |
 | `CanComms.*`, `Serial.*`, `System.*`, `Logging.*`, DBC objects, and other hardware-backed calls | **Assumed / Stubbed** | Each call crosses a typed adapter boundary with its resolved receiver, source call site, arguments, and evaluator time. Exact-site scenario values take precedence over wildcard values and an attached adapter. `System.ElapsedTime` reports the interval since that call site last ran. Its first tick-zero call returns zero, while a site first reached later uses its function step. Tick calls use the deterministic base timeline. `System.FlashSize` and `System.FlashFree` require scenario or adapter data; they never become a dangerous zero. Remaining unhandled calls use documented typed stubs or fail loud. |
@@ -52,7 +52,9 @@ dependency-cone runners.
   logical, bitwise), ternary, member access, enums, `if/else`, `when/is`,
   `expand/to`, `local` / `static local`.
 - **Table lookup** — 1/2/3-D linear interpolation over `.m1cfg` calibration
-  cells, with clamping at the axis edges.
+  cells. Body sites use X-fastest M1 coordinates. Numeric boundaries clamp by
+  default and extrapolate only when the project enables that end. Enum axes
+  select calibrated values exactly.
 - **Tier-1 pure builtins** — `Calculate.*`, `Limit.*`, `Convert.*`, table
   `.Lookup()`.
 - **Tier-2 stateful builtins** (the hard core) — `Filter.FirstOrder`,
@@ -252,13 +254,16 @@ m1-eval --project Project.m1prj --coverage
 # synthetic runner tests, not M1 compatibility evidence.
 m1-eval \
   --conformance tests/fixtures/conformance/synthetic-mini.toml \
-  --conformance tests/fixtures/conformance/synthetic-initial-state.toml
+  --conformance tests/fixtures/conformance/synthetic-initial-state.toml \
+  --conformance tests/fixtures/conformance/synthetic-tables.toml
 ```
 
 `--project` defaults to the nearest `Project.m1prj` upward (or `$M1_PROJECT`).
 See [`docs/cli.md`](docs/cli.md) for the full flag list, scenario format, and
 exit-code contract. [`docs/conformance.md`](docs/conformance.md) defines the
 golden-vector schema and the M1 Sim capture procedure.
+[`docs/table-conformance.md`](docs/table-conformance.md) records the table
+layout, boundary, malformed-data, and table-specific evidence contracts.
 
 The real-project smoke tests remain read-only and keep proprietary files out of
 the repository. Point each variable at a corpus repository root, version

@@ -5,9 +5,9 @@
    <Cell Type="f32"><![CDATA[2.5]]></Cell>
   </Parameter>
   <Table Name="Demo.Map">
-   <X><Cells Type="f32" Unit="rpm"><Cell>0</Cell><Cell>100</Cell></Cells></X>
-   <Y><Cells Type="f32" Unit="%"><Cell>0</Cell><Cell>1</Cell></Cells></Y>
-   <Body><Cells Type="f32"><Cell>10</Cell><Cell>20</Cell><Cell>30</Cell><Cell>40</Cell></Cells></Body>
+   <X><Cells Type="f32" Unit="rpm"><Cell Site="0,0,0">0</Cell><Cell Site="1,0,0">100</Cell></Cells></X>
+   <Y><Cells Type="f32" Unit="%"><Cell Site="0,0,0">0</Cell><Cell Site="0,1,0">1</Cell></Cells></Y>
+   <Body><Cells Type="f32"><Cell Site="0,0,0">10</Cell><Cell Site="1,0,0">30</Cell><Cell Site="0,1,0">20</Cell><Cell Site="1,1,0">40</Cell></Cells></Body>
   </Table>
  </Group>
 </Configuration>

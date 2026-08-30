@@ -1,0 +1,360 @@
+# SPDX-License-Identifier: GPL-3.0-or-later
+# Hand-derived table vectors. This is not M1 Sim evidence.
+schema_version = 1
+name = "synthetic table layout and boundaries"
+calculation_rate_hz = 100.0
+
+[project]
+root = "../table-conformance"
+project = "Project.m1prj"
+config = "parameters.m1cfg"
+
+[[project.files]]
+path = "Project.m1prj"
+sha256 = "5c619271b5b14fea6f1a85a1e6aec1b722bd902de082ca40a51e0edb9bdf30d7"
+
+[[project.files]]
+path = "Scripts/Tables.Update.m1scr"
+sha256 = "41bcda8073cc2dcd48dbd82f77a618aa3b12efb3a8398d1977ea5b2534e76e3c"
+
+[[project.files]]
+path = "parameters.m1cfg"
+sha256 = "3c75c0d982d972647583d1f0a927dab1561e70f7bb2e245002e7884b9722d03a"
+
+[provenance]
+kind = "synthetic"
+source = "tests/fixtures/table-conformance, affine 1-D, 2-D, and 3-D tables"
+procedure = "docs/table-conformance.md#synthetic-vectors"
+notes = "Expected values are hand-derived. They exercise the runner but do not establish M1 Sim compatibility."
+
+[run]
+mode = "function"
+target = "Tables.Update"
+
+[[steps]]
+time_s = 0.0
+inputs = [
+  { channel = "Root.Tables.Curve X", value = { type = "floating-point", value = "-10" } },
+  { channel = "Root.Tables.Grid X", value = { type = "floating-point", value = "0" } },
+  { channel = "Root.Tables.Grid Y", value = { type = "floating-point", value = "-5" } },
+  { channel = "Root.Tables.Cube X", value = { type = "floating-point", value = "-1" } },
+  { channel = "Root.Tables.Cube Y", value = { type = "floating-point", value = "0" } },
+  { channel = "Root.Tables.Cube Z", value = { type = "floating-point", value = "10" } },
+  { channel = "Root.Tables.Single X", value = { type = "floating-point", value = "5" } },
+  { channel = "Root.Tables.Extend X", value = { type = "floating-point", value = "0" } },
+  { channel = "Root.Tables.Extend Y", value = { type = "floating-point", value = "0" } },
+  { channel = "Root.Tables.Mode In", value = { type = "enum", enum_type = "Table Mode", member = "Idle" } },
+]
+expected = [
+  { channel = "Root.Tables.Curve Out", value = { type = "floating-point", value = "50" }, tolerance = { type = "floating-point", absolute = "0", relative = "0" } },
+  { channel = "Root.Tables.Grid Out", value = { type = "floating-point", value = "-8" }, tolerance = { type = "floating-point", absolute = "0", relative = "0" } },
+  { channel = "Root.Tables.Cube Out", value = { type = "floating-point", value = "-90" }, tolerance = { type = "floating-point", absolute = "0", relative = "0" } },
+  { channel = "Root.Tables.Single Out", value = { type = "floating-point", value = "42" }, tolerance = { type = "floating-point", absolute = "0", relative = "0" } },
+  { channel = "Root.Tables.Extend Out", value = { type = "floating-point", value = "1" }, tolerance = { type = "floating-point", absolute = "0", relative = "0" } },
+  { channel = "Root.Tables.Enum Out", value = { type = "floating-point", value = "11" }, tolerance = { type = "floating-point", absolute = "0", relative = "0" } },
+]
+
+[[steps]]
+time_s = 0.01
+inputs = [
+  { channel = "Root.Tables.Curve X", value = { type = "floating-point", value = "0" } },
+  { channel = "Root.Tables.Grid X", value = { type = "floating-point", value = "10" } },
+  { channel = "Root.Tables.Grid Y", value = { type = "floating-point", value = "5" } },
+  { channel = "Root.Tables.Cube X", value = { type = "floating-point", value = "1" } },
+  { channel = "Root.Tables.Cube Y", value = { type = "floating-point", value = "2" } },
+  { channel = "Root.Tables.Cube Z", value = { type = "floating-point", value = "20" } },
+  { channel = "Root.Tables.Single X", value = { type = "floating-point", value = "5" } },
+  { channel = "Root.Tables.Extend X", value = { type = "floating-point", value = "10" } },
+  { channel = "Root.Tables.Extend Y", value = { type = "floating-point", value = "20" } },
+  { channel = "Root.Tables.Mode In", value = { type = "enum", enum_type = "Table Mode", member = "Active" } },
+]
+expected = [
+  { channel = "Root.Tables.Curve Out", value = { type = "floating-point", value = "100" }, tolerance = { type = "floating-point", absolute = "0", relative = "0" } },
+  { channel = "Root.Tables.Grid Out", value = { type = "floating-point", value = "122" }, tolerance = { type = "floating-point", absolute = "0", relative = "0" } },
+  { channel = "Root.Tables.Cube Out", value = { type = "floating-point", value = "140" }, tolerance = { type = "floating-point", absolute = "0", relative = "0" } },
+  { channel = "Root.Tables.Single Out", value = { type = "floating-point", value = "42" }, tolerance = { type = "floating-point", absolute = "0", relative = "0" } },
+  { channel = "Root.Tables.Extend Out", value = { type = "floating-point", value = "81" }, tolerance = { type = "floating-point", absolute = "0", relative = "0" } },
+  { channel = "Root.Tables.Enum Out", value = { type = "floating-point", value = "22" }, tolerance = { type = "floating-point", absolute = "0", relative = "0" } },
+]
+
+[[steps]]
+time_s = 0.02
+inputs = [
+  { channel = "Root.Tables.Curve X", value = { type = "floating-point", value = "20" } },
+  { channel = "Root.Tables.Grid X", value = { type = "floating-point", value = "30" } },
+  { channel = "Root.Tables.Grid Y", value = { type = "floating-point", value = "25" } },
+  { channel = "Root.Tables.Cube X", value = { type = "floating-point", value = "1" } },
+  { channel = "Root.Tables.Cube Y", value = { type = "floating-point", value = "6" } },
+  { channel = "Root.Tables.Cube Z", value = { type = "floating-point", value = "20" } },
+  { channel = "Root.Tables.Single X", value = { type = "floating-point", value = "5" } },
+  { channel = "Root.Tables.Extend X", value = { type = "floating-point", value = "10" } },
+  { channel = "Root.Tables.Extend Y", value = { type = "floating-point", value = "20" } },
+  { channel = "Root.Tables.Mode In", value = { type = "enum", enum_type = "Table Mode", member = "Fault" } },
+]
+expected = [
+  { channel = "Root.Tables.Curve Out", value = { type = "floating-point", value = "200" }, tolerance = { type = "floating-point", absolute = "0", relative = "0" } },
+  { channel = "Root.Tables.Grid Out", value = { type = "floating-point", value = "382" }, tolerance = { type = "floating-point", absolute = "0", relative = "0" } },
+  { channel = "Root.Tables.Cube Out", value = { type = "floating-point", value = "180" }, tolerance = { type = "floating-point", absolute = "0", relative = "0" } },
+  { channel = "Root.Tables.Single Out", value = { type = "floating-point", value = "42" }, tolerance = { type = "floating-point", absolute = "0", relative = "0" } },
+  { channel = "Root.Tables.Extend Out", value = { type = "floating-point", value = "81" }, tolerance = { type = "floating-point", absolute = "0", relative = "0" } },
+  { channel = "Root.Tables.Enum Out", value = { type = "floating-point", value = "77" }, tolerance = { type = "floating-point", absolute = "0", relative = "0" } },
+]
+
+[[steps]]
+time_s = 0.03
+inputs = [
+  { channel = "Root.Tables.Curve X", value = { type = "floating-point", value = "-7.5" } },
+  { channel = "Root.Tables.Grid X", value = { type = "floating-point", value = "2.5" } },
+  { channel = "Root.Tables.Grid Y", value = { type = "floating-point", value = "-2.5" } },
+  { channel = "Root.Tables.Cube X", value = { type = "floating-point", value = "-0.5" } },
+  { channel = "Root.Tables.Cube Y", value = { type = "floating-point", value = "0.5" } },
+  { channel = "Root.Tables.Cube Z", value = { type = "floating-point", value = "12.5" } },
+  { channel = "Root.Tables.Single X", value = { type = "floating-point", value = "0" } },
+  { channel = "Root.Tables.Extend X", value = { type = "floating-point", value = "2.5" } },
+  { channel = "Root.Tables.Extend Y", value = { type = "floating-point", value = "5" } },
+  { channel = "Root.Tables.Mode In", value = { type = "enum", enum_type = "Table Mode", member = "Active" } },
+]
+expected = [
+  { channel = "Root.Tables.Curve Out", value = { type = "floating-point", value = "62.5" }, tolerance = { type = "floating-point", absolute = "0", relative = "0" } },
+  { channel = "Root.Tables.Grid Out", value = { type = "floating-point", value = "24.5" }, tolerance = { type = "floating-point", absolute = "0", relative = "0" } },
+  { channel = "Root.Tables.Cube Out", value = { type = "floating-point", value = "-32.5" }, tolerance = { type = "floating-point", absolute = "0", relative = "0" } },
+  { channel = "Root.Tables.Single Out", value = { type = "floating-point", value = "42" }, tolerance = { type = "floating-point", absolute = "0", relative = "0" } },
+  { channel = "Root.Tables.Extend Out", value = { type = "floating-point", value = "21" }, tolerance = { type = "floating-point", absolute = "0", relative = "0" } },
+  { channel = "Root.Tables.Enum Out", value = { type = "floating-point", value = "22" }, tolerance = { type = "floating-point", absolute = "0", relative = "0" } },
+]
+
+[[steps]]
+time_s = 0.04
+inputs = [
+  { channel = "Root.Tables.Curve X", value = { type = "floating-point", value = "-20" } },
+  { channel = "Root.Tables.Grid X", value = { type = "floating-point", value = "-10" } },
+  { channel = "Root.Tables.Grid Y", value = { type = "floating-point", value = "-10" } },
+  { channel = "Root.Tables.Cube X", value = { type = "floating-point", value = "-2" } },
+  { channel = "Root.Tables.Cube Y", value = { type = "floating-point", value = "-1" } },
+  { channel = "Root.Tables.Cube Z", value = { type = "floating-point", value = "5" } },
+  { channel = "Root.Tables.Single X", value = { type = "floating-point", value = "-100" } },
+  { channel = "Root.Tables.Extend X", value = { type = "floating-point", value = "-5" } },
+  { channel = "Root.Tables.Extend Y", value = { type = "floating-point", value = "-10" } },
+  { channel = "Root.Tables.Mode In", value = { type = "enum", enum_type = "Table Mode", member = "Idle" } },
+]
+expected = [
+  { channel = "Root.Tables.Curve Out", value = { type = "floating-point", value = "50" }, tolerance = { type = "floating-point", absolute = "0", relative = "0" } },
+  { channel = "Root.Tables.Grid Out", value = { type = "floating-point", value = "-8" }, tolerance = { type = "floating-point", absolute = "0", relative = "0" } },
+  { channel = "Root.Tables.Cube Out", value = { type = "floating-point", value = "-90" }, tolerance = { type = "floating-point", absolute = "0", relative = "0" } },
+  { channel = "Root.Tables.Single Out", value = { type = "floating-point", value = "42" }, tolerance = { type = "floating-point", absolute = "0", relative = "0" } },
+  { channel = "Root.Tables.Extend Out", value = { type = "floating-point", value = "-39" }, tolerance = { type = "floating-point", absolute = "0", relative = "0" } },
+  { channel = "Root.Tables.Enum Out", value = { type = "floating-point", value = "11" }, tolerance = { type = "floating-point", absolute = "0", relative = "0" } },
+]
+
+# Isolated X-low probes; every other numeric axis remains inside its range.
+[[steps]]
+time_s = 0.05
+inputs = [
+  { channel = "Root.Tables.Curve X", value = { type = "floating-point", value = "-20" } },
+  { channel = "Root.Tables.Grid X", value = { type = "floating-point", value = "-10" } },
+  { channel = "Root.Tables.Grid Y", value = { type = "floating-point", value = "0" } },
+  { channel = "Root.Tables.Cube X", value = { type = "floating-point", value = "-2" } },
+  { channel = "Root.Tables.Cube Y", value = { type = "floating-point", value = "1" } },
+  { channel = "Root.Tables.Cube Z", value = { type = "floating-point", value = "15" } },
+  { channel = "Root.Tables.Single X", value = { type = "floating-point", value = "-100" } },
+  { channel = "Root.Tables.Extend X", value = { type = "floating-point", value = "-5" } },
+  { channel = "Root.Tables.Extend Y", value = { type = "floating-point", value = "10" } },
+  { channel = "Root.Tables.Mode In", value = { type = "enum", enum_type = "Table Mode", member = "Active" } },
+]
+expected = [
+  { channel = "Root.Tables.Curve Out", value = { type = "floating-point", value = "50" }, tolerance = { type = "floating-point", absolute = "0", relative = "0" } },
+  { channel = "Root.Tables.Grid Out", value = { type = "floating-point", value = "7" }, tolerance = { type = "floating-point", absolute = "0", relative = "0" } },
+  { channel = "Root.Tables.Cube Out", value = { type = "floating-point", value = "-75" }, tolerance = { type = "floating-point", absolute = "0", relative = "0" } },
+  { channel = "Root.Tables.Single Out", value = { type = "floating-point", value = "42" }, tolerance = { type = "floating-point", absolute = "0", relative = "0" } },
+  { channel = "Root.Tables.Extend Out", value = { type = "floating-point", value = "21" }, tolerance = { type = "floating-point", absolute = "0", relative = "0" } },
+  { channel = "Root.Tables.Enum Out", value = { type = "floating-point", value = "22" }, tolerance = { type = "floating-point", absolute = "0", relative = "0" } },
+]
+
+# Isolated X-high probes.
+[[steps]]
+time_s = 0.06
+inputs = [
+  { channel = "Root.Tables.Curve X", value = { type = "floating-point", value = "30" } },
+  { channel = "Root.Tables.Grid X", value = { type = "floating-point", value = "40" } },
+  { channel = "Root.Tables.Grid Y", value = { type = "floating-point", value = "0" } },
+  { channel = "Root.Tables.Cube X", value = { type = "floating-point", value = "2" } },
+  { channel = "Root.Tables.Cube Y", value = { type = "floating-point", value = "1" } },
+  { channel = "Root.Tables.Cube Z", value = { type = "floating-point", value = "15" } },
+  { channel = "Root.Tables.Single X", value = { type = "floating-point", value = "100" } },
+  { channel = "Root.Tables.Extend X", value = { type = "floating-point", value = "15" } },
+  { channel = "Root.Tables.Extend Y", value = { type = "floating-point", value = "10" } },
+  { channel = "Root.Tables.Mode In", value = { type = "enum", enum_type = "Table Mode", member = "Fault" } },
+]
+expected = [
+  { channel = "Root.Tables.Curve Out", value = { type = "floating-point", value = "200" }, tolerance = { type = "floating-point", absolute = "0", relative = "0" } },
+  { channel = "Root.Tables.Grid Out", value = { type = "floating-point", value = "307" }, tolerance = { type = "floating-point", absolute = "0", relative = "0" } },
+  { channel = "Root.Tables.Cube Out", value = { type = "floating-point", value = "125" }, tolerance = { type = "floating-point", absolute = "0", relative = "0" } },
+  { channel = "Root.Tables.Single Out", value = { type = "floating-point", value = "42" }, tolerance = { type = "floating-point", absolute = "0", relative = "0" } },
+  { channel = "Root.Tables.Extend Out", value = { type = "floating-point", value = "61" }, tolerance = { type = "floating-point", absolute = "0", relative = "0" } },
+  { channel = "Root.Tables.Enum Out", value = { type = "floating-point", value = "77" }, tolerance = { type = "floating-point", absolute = "0", relative = "0" } },
+]
+
+# Isolated Y-low probes.
+[[steps]]
+time_s = 0.07
+inputs = [
+  { channel = "Root.Tables.Curve X", value = { type = "floating-point", value = "-5" } },
+  { channel = "Root.Tables.Grid X", value = { type = "floating-point", value = "5" } },
+  { channel = "Root.Tables.Grid Y", value = { type = "floating-point", value = "-10" } },
+  { channel = "Root.Tables.Cube X", value = { type = "floating-point", value = "0" } },
+  { channel = "Root.Tables.Cube Y", value = { type = "floating-point", value = "-1" } },
+  { channel = "Root.Tables.Cube Z", value = { type = "floating-point", value = "15" } },
+  { channel = "Root.Tables.Single X", value = { type = "floating-point", value = "5" } },
+  { channel = "Root.Tables.Extend X", value = { type = "floating-point", value = "5" } },
+  { channel = "Root.Tables.Extend Y", value = { type = "floating-point", value = "-10" } },
+  { channel = "Root.Tables.Mode In", value = { type = "enum", enum_type = "Table Mode", member = "Idle" } },
+]
+expected = [
+  { channel = "Root.Tables.Curve Out", value = { type = "floating-point", value = "75" }, tolerance = { type = "floating-point", absolute = "0", relative = "0" } },
+  { channel = "Root.Tables.Grid Out", value = { type = "floating-point", value = "42" }, tolerance = { type = "floating-point", absolute = "0", relative = "0" } },
+  { channel = "Root.Tables.Cube Out", value = { type = "floating-point", value = "15" }, tolerance = { type = "floating-point", absolute = "0", relative = "0" } },
+  { channel = "Root.Tables.Single Out", value = { type = "floating-point", value = "42" }, tolerance = { type = "floating-point", absolute = "0", relative = "0" } },
+  { channel = "Root.Tables.Extend Out", value = { type = "floating-point", value = "-19" }, tolerance = { type = "floating-point", absolute = "0", relative = "0" } },
+  { channel = "Root.Tables.Enum Out", value = { type = "floating-point", value = "11" }, tolerance = { type = "floating-point", absolute = "0", relative = "0" } },
+]
+
+# Isolated Y-high probes.
+[[steps]]
+time_s = 0.08
+inputs = [
+  { channel = "Root.Tables.Curve X", value = { type = "floating-point", value = "-5" } },
+  { channel = "Root.Tables.Grid X", value = { type = "floating-point", value = "5" } },
+  { channel = "Root.Tables.Grid Y", value = { type = "floating-point", value = "30" } },
+  { channel = "Root.Tables.Cube X", value = { type = "floating-point", value = "0" } },
+  { channel = "Root.Tables.Cube Y", value = { type = "floating-point", value = "7" } },
+  { channel = "Root.Tables.Cube Z", value = { type = "floating-point", value = "15" } },
+  { channel = "Root.Tables.Single X", value = { type = "floating-point", value = "5" } },
+  { channel = "Root.Tables.Extend X", value = { type = "floating-point", value = "5" } },
+  { channel = "Root.Tables.Extend Y", value = { type = "floating-point", value = "30" } },
+  { channel = "Root.Tables.Mode In", value = { type = "enum", enum_type = "Table Mode", member = "Active" } },
+]
+expected = [
+  { channel = "Root.Tables.Curve Out", value = { type = "floating-point", value = "75" }, tolerance = { type = "floating-point", absolute = "0", relative = "0" } },
+  { channel = "Root.Tables.Grid Out", value = { type = "floating-point", value = "132" }, tolerance = { type = "floating-point", absolute = "0", relative = "0" } },
+  { channel = "Root.Tables.Cube Out", value = { type = "floating-point", value = "75" }, tolerance = { type = "floating-point", absolute = "0", relative = "0" } },
+  { channel = "Root.Tables.Single Out", value = { type = "floating-point", value = "42" }, tolerance = { type = "floating-point", absolute = "0", relative = "0" } },
+  { channel = "Root.Tables.Extend Out", value = { type = "floating-point", value = "101" }, tolerance = { type = "floating-point", absolute = "0", relative = "0" } },
+  { channel = "Root.Tables.Enum Out", value = { type = "floating-point", value = "22" }, tolerance = { type = "floating-point", absolute = "0", relative = "0" } },
+]
+
+# Isolated Z-low probes.
+[[steps]]
+time_s = 0.09
+inputs = [
+  { channel = "Root.Tables.Curve X", value = { type = "floating-point", value = "-5" } },
+  { channel = "Root.Tables.Grid X", value = { type = "floating-point", value = "5" } },
+  { channel = "Root.Tables.Grid Y", value = { type = "floating-point", value = "0" } },
+  { channel = "Root.Tables.Cube X", value = { type = "floating-point", value = "0" } },
+  { channel = "Root.Tables.Cube Y", value = { type = "floating-point", value = "1" } },
+  { channel = "Root.Tables.Cube Z", value = { type = "floating-point", value = "5" } },
+  { channel = "Root.Tables.Single X", value = { type = "floating-point", value = "5" } },
+  { channel = "Root.Tables.Extend X", value = { type = "floating-point", value = "5" } },
+  { channel = "Root.Tables.Extend Y", value = { type = "floating-point", value = "10" } },
+  { channel = "Root.Tables.Mode In", value = { type = "enum", enum_type = "Table Mode", member = "Fault" } },
+]
+expected = [
+  { channel = "Root.Tables.Curve Out", value = { type = "floating-point", value = "75" }, tolerance = { type = "floating-point", absolute = "0", relative = "0" } },
+  { channel = "Root.Tables.Grid Out", value = { type = "floating-point", value = "57" }, tolerance = { type = "floating-point", absolute = "0", relative = "0" } },
+  { channel = "Root.Tables.Cube Out", value = { type = "floating-point", value = "20" }, tolerance = { type = "floating-point", absolute = "0", relative = "0" } },
+  { channel = "Root.Tables.Single Out", value = { type = "floating-point", value = "42" }, tolerance = { type = "floating-point", absolute = "0", relative = "0" } },
+  { channel = "Root.Tables.Extend Out", value = { type = "floating-point", value = "41" }, tolerance = { type = "floating-point", absolute = "0", relative = "0" } },
+  { channel = "Root.Tables.Enum Out", value = { type = "floating-point", value = "77" }, tolerance = { type = "floating-point", absolute = "0", relative = "0" } },
+]
+
+# Isolated Z-high probes.
+[[steps]]
+time_s = 0.10
+inputs = [
+  { channel = "Root.Tables.Curve X", value = { type = "floating-point", value = "-5" } },
+  { channel = "Root.Tables.Grid X", value = { type = "floating-point", value = "5" } },
+  { channel = "Root.Tables.Grid Y", value = { type = "floating-point", value = "0" } },
+  { channel = "Root.Tables.Cube X", value = { type = "floating-point", value = "0" } },
+  { channel = "Root.Tables.Cube Y", value = { type = "floating-point", value = "1" } },
+  { channel = "Root.Tables.Cube Z", value = { type = "floating-point", value = "25" } },
+  { channel = "Root.Tables.Single X", value = { type = "floating-point", value = "5" } },
+  { channel = "Root.Tables.Extend X", value = { type = "floating-point", value = "5" } },
+  { channel = "Root.Tables.Extend Y", value = { type = "floating-point", value = "10" } },
+  { channel = "Root.Tables.Mode In", value = { type = "enum", enum_type = "Table Mode", member = "Idle" } },
+]
+expected = [
+  { channel = "Root.Tables.Curve Out", value = { type = "floating-point", value = "75" }, tolerance = { type = "floating-point", absolute = "0", relative = "0" } },
+  { channel = "Root.Tables.Grid Out", value = { type = "floating-point", value = "57" }, tolerance = { type = "floating-point", absolute = "0", relative = "0" } },
+  { channel = "Root.Tables.Cube Out", value = { type = "floating-point", value = "30" }, tolerance = { type = "floating-point", absolute = "0", relative = "0" } },
+  { channel = "Root.Tables.Single Out", value = { type = "floating-point", value = "42" }, tolerance = { type = "floating-point", absolute = "0", relative = "0" } },
+  { channel = "Root.Tables.Extend Out", value = { type = "floating-point", value = "41" }, tolerance = { type = "floating-point", absolute = "0", relative = "0" } },
+  { channel = "Root.Tables.Enum Out", value = { type = "floating-point", value = "11" }, tolerance = { type = "floating-point", absolute = "0", relative = "0" } },
+]
+
+[[steps]]
+time_s = 0.11
+inputs = [
+  { channel = "Root.Tables.Curve X", value = { type = "floating-point", value = "30" } },
+  { channel = "Root.Tables.Grid X", value = { type = "floating-point", value = "40" } },
+  { channel = "Root.Tables.Grid Y", value = { type = "floating-point", value = "30" } },
+  { channel = "Root.Tables.Cube X", value = { type = "floating-point", value = "2" } },
+  { channel = "Root.Tables.Cube Y", value = { type = "floating-point", value = "7" } },
+  { channel = "Root.Tables.Cube Z", value = { type = "floating-point", value = "25" } },
+  { channel = "Root.Tables.Single X", value = { type = "floating-point", value = "100" } },
+  { channel = "Root.Tables.Extend X", value = { type = "floating-point", value = "15" } },
+  { channel = "Root.Tables.Extend Y", value = { type = "floating-point", value = "30" } },
+  { channel = "Root.Tables.Mode In", value = { type = "enum", enum_type = "Table Mode", member = "Fault" } },
+]
+expected = [
+  { channel = "Root.Tables.Curve Out", value = { type = "floating-point", value = "200" }, tolerance = { type = "floating-point", absolute = "0", relative = "0" } },
+  { channel = "Root.Tables.Grid Out", value = { type = "floating-point", value = "382" }, tolerance = { type = "floating-point", absolute = "0", relative = "0" } },
+  { channel = "Root.Tables.Cube Out", value = { type = "floating-point", value = "180" }, tolerance = { type = "floating-point", absolute = "0", relative = "0" } },
+  { channel = "Root.Tables.Single Out", value = { type = "floating-point", value = "42" }, tolerance = { type = "floating-point", absolute = "0", relative = "0" } },
+  { channel = "Root.Tables.Extend Out", value = { type = "floating-point", value = "121" }, tolerance = { type = "floating-point", absolute = "0", relative = "0" } },
+  { channel = "Root.Tables.Enum Out", value = { type = "floating-point", value = "77" }, tolerance = { type = "floating-point", absolute = "0", relative = "0" } },
+]
+
+[[steps]]
+time_s = 0.12
+inputs = [
+  { channel = "Root.Tables.Curve X", value = { type = "floating-point", value = "-20" } },
+  { channel = "Root.Tables.Grid X", value = { type = "floating-point", value = "-10" } },
+  { channel = "Root.Tables.Grid Y", value = { type = "floating-point", value = "30" } },
+  { channel = "Root.Tables.Cube X", value = { type = "floating-point", value = "-2" } },
+  { channel = "Root.Tables.Cube Y", value = { type = "floating-point", value = "7" } },
+  { channel = "Root.Tables.Cube Z", value = { type = "floating-point", value = "5" } },
+  { channel = "Root.Tables.Single X", value = { type = "floating-point", value = "0" } },
+  { channel = "Root.Tables.Extend X", value = { type = "floating-point", value = "-5" } },
+  { channel = "Root.Tables.Extend Y", value = { type = "floating-point", value = "30" } },
+  { channel = "Root.Tables.Mode In", value = { type = "enum", enum_type = "Table Mode", member = "Active" } },
+]
+expected = [
+  { channel = "Root.Tables.Curve Out", value = { type = "floating-point", value = "50" }, tolerance = { type = "floating-point", absolute = "0", relative = "0" } },
+  { channel = "Root.Tables.Grid Out", value = { type = "floating-point", value = "82" }, tolerance = { type = "floating-point", absolute = "0", relative = "0" } },
+  { channel = "Root.Tables.Cube Out", value = { type = "floating-point", value = "-30" }, tolerance = { type = "floating-point", absolute = "0", relative = "0" } },
+  { channel = "Root.Tables.Single Out", value = { type = "floating-point", value = "42" }, tolerance = { type = "floating-point", absolute = "0", relative = "0" } },
+  { channel = "Root.Tables.Extend Out", value = { type = "floating-point", value = "81" }, tolerance = { type = "floating-point", absolute = "0", relative = "0" } },
+  { channel = "Root.Tables.Enum Out", value = { type = "floating-point", value = "22" }, tolerance = { type = "floating-point", absolute = "0", relative = "0" } },
+]
+
+[[steps]]
+time_s = 0.13
+inputs = [
+  { channel = "Root.Tables.Curve X", value = { type = "floating-point", value = "30" } },
+  { channel = "Root.Tables.Grid X", value = { type = "floating-point", value = "40" } },
+  { channel = "Root.Tables.Grid Y", value = { type = "floating-point", value = "-10" } },
+  { channel = "Root.Tables.Cube X", value = { type = "floating-point", value = "2" } },
+  { channel = "Root.Tables.Cube Y", value = { type = "floating-point", value = "-1" } },
+  { channel = "Root.Tables.Cube Z", value = { type = "floating-point", value = "25" } },
+  { channel = "Root.Tables.Single X", value = { type = "floating-point", value = "10" } },
+  { channel = "Root.Tables.Extend X", value = { type = "floating-point", value = "15" } },
+  { channel = "Root.Tables.Extend Y", value = { type = "floating-point", value = "-10" } },
+  { channel = "Root.Tables.Mode In", value = { type = "enum", enum_type = "Table Mode", member = "Idle" } },
+]
+expected = [
+  { channel = "Root.Tables.Curve Out", value = { type = "floating-point", value = "200" }, tolerance = { type = "floating-point", absolute = "0", relative = "0" } },
+  { channel = "Root.Tables.Grid Out", value = { type = "floating-point", value = "292" }, tolerance = { type = "floating-point", absolute = "0", relative = "0" } },
+  { channel = "Root.Tables.Cube Out", value = { type = "floating-point", value = "120" }, tolerance = { type = "floating-point", absolute = "0", relative = "0" } },
+  { channel = "Root.Tables.Single Out", value = { type = "floating-point", value = "42" }, tolerance = { type = "floating-point", absolute = "0", relative = "0" } },
+  { channel = "Root.Tables.Extend Out", value = { type = "floating-point", value = "1" }, tolerance = { type = "floating-point", absolute = "0", relative = "0" } },
+  { channel = "Root.Tables.Enum Out", value = { type = "floating-point", value = "11" }, tolerance = { type = "floating-point", absolute = "0", relative = "0" } },
+]

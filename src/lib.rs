@@ -7,9 +7,10 @@ pub mod value;
 pub use value::{FixedPoint7dps, M1Scalar, M1ScalarKind, Value};
 
 pub mod calib;
-pub use calib::{CalTable, Calibration};
+pub use calib::{AxisExtrapolation, CalAxis, CalAxisValues, CalTable, Calibration};
 
 pub mod table;
+pub use table::TableInput;
 
 pub mod loader;
 pub use loader::{Loaded, load};

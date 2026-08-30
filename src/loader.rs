@@ -112,7 +112,7 @@ pub fn load(project_path: &Path, cfg_path: Option<&Path>) -> Result<Loaded, Eval
     // Read the calibration *values*. We read the file ourselves (rather than
     // re-using `m1-typecheck`'s loader) because `with_config` keeps only the
     // shape; `Calibration::from_m1cfg_str` keeps the numbers.
-    let calib = match cfg_path {
+    let mut calib = match cfg_path {
         Some(cfg) => {
             let xml = read_xml(cfg)?;
             Calibration::from_m1cfg_str(&xml)?
@@ -121,6 +121,7 @@ pub fn load(project_path: &Path, cfg_path: Option<&Path>) -> Result<Loaded, Eval
     };
 
     let project_xml = read_xml(project_path)?;
+    calib.apply_project_table_properties(&project_xml, &project)?;
     let signature_m1_types = signature_m1_types(&project_xml)?;
     let object_rules = ObjectRules::from_project_xml(&project_xml)?;
     let triggers = TriggerMap::from_project_xml(&project_xml, &project, &scripts)?;
@@ -294,7 +295,7 @@ mod tests {
         assert_eq!(map.axes.len(), 2);
         assert_eq!(
             map.body,
-            vec![10.0, 20.0, 30.0, 40.0]
+            vec![10.0, 30.0, 20.0, 40.0]
                 .into_iter()
                 .map(crate::value::M1Scalar::FloatingPoint)
                 .collect::<Vec<_>>()
