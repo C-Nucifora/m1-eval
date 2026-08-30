@@ -227,6 +227,36 @@ bytes = [0x11]
 }
 
 #[test]
+fn cone_mode_does_not_run_startup_serial_initialization() {
+    let scenario = Scenario::from_toml_str(
+        r#"
+mode = "cone"
+target = "Root.Serial Test.Byte A"
+duration_s = 0.01
+base_rate_hz = 100.0
+
+[[serial.rx]]
+time_s = 0.0
+port = 0
+bytes = [0x11]
+"#,
+    )
+    .expect("cone-mode serial scenario parses");
+    let error = engine()
+        .run(&scenario)
+        .expect_err("cone mode must not borrow whole-project startup state");
+
+    assert_serial_bad_call(
+        &error,
+        "Serial.Receive: port 0 is not initialized; call Serial.PortInit first",
+    );
+    assert_eq!(
+        error.to_string(),
+        "in Serial Test.Receive A.m1scr at t = 0.000 s: bad call: Serial.Receive: port 0 is not initialized; call Serial.PortInit first"
+    );
+}
+
+#[test]
 fn overriding_port_init_does_not_mutate_virtual_serial_state() {
     let scenario = Scenario::from_toml_str(
         r#"
