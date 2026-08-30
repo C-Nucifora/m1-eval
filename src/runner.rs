@@ -458,6 +458,9 @@ fn tick_loop(
     let mut env = Env::new();
     let mut state = StateStore::new();
     let mut trace = Trace::new();
+    // A virtual serial adapter is run-local state. Repeating the same scenario
+    // starts with fresh ports, handles, cursors, and buffers.
+    let mut serial = crate::virtual_serial::VirtualSerial::new(&scenario.serial)?;
 
     // Unseeded-channel defaulting is the scenario's EXPLICIT opt-in
     // (`allow_default_inputs = true`, whole-project mode only): an unseeded
@@ -533,12 +536,14 @@ fn tick_loop(
                     Some(hardware) => Some(&mut **hardware),
                     None => None,
                 },
+                serial: crate::expr::SerialRuntime::Shared(&mut serial),
             };
             exec_script_with_runtime(&root, &mut ctx, &mut runtime)
                 .map_err(|e| e.in_script(&sched.script.name, None))?;
         }
         trace.external.extend(startup_trace.external);
         trace.hardware.extend(startup_trace.hardware);
+        trace.serial.extend(startup_trace.serial);
     }
 
     for i in 0..ticks {
@@ -596,6 +601,7 @@ fn tick_loop(
                     Some(hardware) => Some(&mut **hardware),
                     None => None,
                 },
+                serial: crate::expr::SerialRuntime::Shared(&mut serial),
             };
             exec_script_with_runtime(&root, &mut ctx, &mut runtime)
                 .map_err(|e| e.in_script(&sched.script.name, Some(t)))?;
@@ -1159,6 +1165,7 @@ fn run_counterfactual_inner(
     let mut env = Env::new();
     let mut state = StateStore::new();
     let mut trace = Trace::new();
+    let mut serial = crate::virtual_serial::VirtualSerial::empty();
     // A counterfactual seeds every logged channel as ground truth, so an unseeded
     // *channel* read still fails loud (like function/cone mode): a cone function
     // reading a channel the log does not carry is a genuine error, not a guess.
@@ -1234,6 +1241,7 @@ fn run_counterfactual_inner(
                             Some(hardware) => Some(&mut **hardware),
                             None => None,
                         },
+                        serial: crate::expr::SerialRuntime::Shared(&mut serial),
                     };
                     crate::expr::eval_with_runtime(&value_node, &mut ctx, &mut runtime)?
                 }
@@ -1242,6 +1250,7 @@ fn run_counterfactual_inner(
         }
         trace.external.extend(override_trace.external);
         trace.hardware.extend(override_trace.hardware);
+        trace.serial.extend(override_trace.serial);
         for (path, value) in pending {
             let value = crate::expr::coerce_for_channel(&path, value, &loaded.project)?;
             env.set(path, value);
@@ -1281,6 +1290,7 @@ fn run_counterfactual_inner(
                     Some(hardware) => Some(&mut **hardware),
                     None => None,
                 },
+                serial: crate::expr::SerialRuntime::Shared(&mut serial),
             };
             exec_script_with_runtime(&root, &mut ctx, &mut runtime)
                 .map_err(|e| e.in_script(&sched.script.name, Some(t)))?;
@@ -1501,6 +1511,7 @@ mod tests {
             }],
             overrides: vec![],
             io: vec![],
+            serial: Default::default(),
             allow_default_inputs: false,
         };
         let trace = run(&loaded, &scenario).expect("enum-seeded run evaluates");
@@ -1532,6 +1543,7 @@ mod tests {
             }],
             overrides: vec![],
             io: vec![],
+            serial: Default::default(),
             allow_default_inputs: false,
         };
         let err = run(&loaded, &scenario).expect_err("string input fails loud");
@@ -1555,6 +1567,7 @@ mod tests {
             inputs: vec![],
             overrides: vec![],
             io: vec![],
+            serial: Default::default(),
             allow_default_inputs: false,
         };
         let err = run(&loaded, &scenario).expect_err("unseeded input fails loud");

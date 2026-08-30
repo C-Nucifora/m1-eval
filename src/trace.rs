@@ -28,7 +28,8 @@
 //! is deterministic, with a `time` column followed by channels in sorted-name
 //! order.
 
-use crate::hardware::{HardwareProvenance, ResolvedReceiver};
+use crate::env::CallSite;
+use crate::hardware::{EvalPhase, EvalTime, HardwareProvenance, ResolvedReceiver};
 use crate::value::{M1Scalar, Value};
 use std::collections::{BTreeMap, BTreeSet};
 
@@ -56,6 +57,44 @@ pub struct Trace {
     /// Structured source records for hardware-backed call sites. A set keeps
     /// repeated ticks compact while retaining every route a site used.
     pub hardware: BTreeSet<HardwareProvenance>,
+    /// Ordered byte transfers through the deterministic virtual serial adapter.
+    /// Unlike de-duplicated hardware provenance, repeated transfers are retained.
+    pub serial: Vec<SerialEvent>,
+}
+
+/// Direction of one observable virtual serial transfer.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum SerialDirection {
+    /// Bytes copied from a scenario-controlled port into a handle receive buffer.
+    Rx,
+    /// Bytes copied from a handle transmit buffer onto a virtual port.
+    Tx,
+}
+
+impl SerialDirection {
+    fn as_str(self) -> &'static str {
+        match self {
+            SerialDirection::Rx => "rx",
+            SerialDirection::Tx => "tx",
+        }
+    }
+}
+
+/// One ordered virtual serial byte event.
+#[derive(Debug, Clone, PartialEq)]
+pub struct SerialEvent {
+    /// Receive or transmit.
+    pub direction: SerialDirection,
+    /// Evaluator time at which the script observed or emitted the bytes.
+    pub time: EvalTime,
+    /// Virtual M1 serial port number.
+    pub port: i32,
+    /// Stable nonzero handle used by the call.
+    pub handle: u32,
+    /// Bytes transferred in wire order.
+    pub bytes: Vec<u8>,
+    /// Exact `Serial.Receive` or `Serial.Transmit` call occurrence.
+    pub site: CallSite,
 }
 
 /// One reported default substitution: what value was substituted and which
@@ -120,9 +159,14 @@ impl Trace {
         self.hardware.insert(provenance);
     }
 
+    /// Append one virtual serial transfer in execution order.
+    pub fn record_serial(&mut self, event: SerialEvent) {
+        self.serial.push(event);
+    }
+
     /// Serialise the channel columns + time axis to JSON. The shape is
     /// `{ "time": [...], "channels": { path: [...] }, "external": [...],
-    /// "hardware": [...] }`,
+    /// "hardware": [...], "serial": [...] }`,
     /// values rendered by `value_json`. This historical untyped shape cannot
     /// expose M1 scalar-family metadata. JSON has no non-finite number syntax, so
     /// NaN and positive or negative infinity are written as `null`. Deterministic
@@ -147,6 +191,8 @@ impl Trace {
         out.push_str(&join(self.external.iter().map(|p| json_string(p))));
         out.push_str("],\"hardware\":[");
         out.push_str(&join(self.hardware.iter().map(hardware_json)));
+        out.push_str("],\"serial\":[");
+        out.push_str(&join(self.serial.iter().map(serial_json)));
         out.push_str("]}");
         out
     }
@@ -175,6 +221,27 @@ impl Trace {
         }
         out
     }
+}
+
+/// Render one ordered virtual serial transfer.
+fn serial_json(event: &SerialEvent) -> String {
+    let phase = match event.time.phase {
+        EvalPhase::Startup => "startup",
+        EvalPhase::Periodic => "periodic",
+    };
+    let bytes = join(event.bytes.iter().map(u8::to_string));
+    format!(
+        "{{\"direction\":{},\"time_s\":{},\"phase\":{},\"base_tick\":{},\"port\":{},\"handle\":{},\"bytes\":[{}],\"script\":{},\"offset\":{}}}",
+        json_string(event.direction.as_str()),
+        f64_json(event.time.elapsed_s),
+        json_string(phase),
+        event.time.base_tick,
+        event.port,
+        event.handle,
+        bytes,
+        json_string(event.site.script()),
+        event.site.offset(),
+    )
 }
 
 /// Render one structured hardware provenance record.
@@ -362,7 +429,7 @@ mod tests {
         // BTreeMap ordering: A before B regardless of insertion order.
         assert_eq!(
             json,
-            "{\"time\":[0],\"channels\":{\"A\":[true],\"B\":[2]},\"external\":[\"A\"],\"hardware\":[]}"
+            "{\"time\":[0],\"channels\":{\"A\":[true],\"B\":[2]},\"external\":[\"A\"],\"hardware\":[],\"serial\":[]}"
         );
     }
 
@@ -382,7 +449,7 @@ mod tests {
 
         assert_eq!(
             tr.to_json(),
-            "{\"time\":[0],\"channels\":{\"Fixed\":[0.1000001],\"Float\":[0.1],\"Int\":[-2147483648],\"Uint\":[4294967295]},\"external\":[],\"hardware\":[]}"
+            "{\"time\":[0],\"channels\":{\"Fixed\":[0.1000001],\"Float\":[0.1],\"Int\":[-2147483648],\"Uint\":[4294967295]},\"external\":[],\"hardware\":[],\"serial\":[]}"
         );
     }
 
@@ -401,7 +468,7 @@ mod tests {
         let json = tr.to_json();
         assert_eq!(
             json,
-            "{\"time\":[null,null,null],\"channels\":{\"M1\":[null,null,null]},\"external\":[],\"hardware\":[]}"
+            "{\"time\":[null,null,null],\"channels\":{\"M1\":[null,null,null]},\"external\":[],\"hardware\":[],\"serial\":[]}"
         );
         let parsed: serde_json::Value =
             serde_json::from_str(&json).expect("trace output must be valid JSON");
@@ -421,5 +488,38 @@ mod tests {
         let lines: Vec<&str> = csv.lines().collect();
         assert_eq!(lines[0], "time,\"Root.A,B\"");
         assert_eq!(lines[1], "0,\"x,y\"");
+    }
+
+    #[test]
+    fn serial_events_are_ordered_json_metadata_and_not_csv_columns() {
+        let mut trace = Trace::new();
+        trace.push_tick(0.25);
+        trace.record_channel("Out", Value::m1_integer(1));
+        trace.record_serial(SerialEvent {
+            direction: SerialDirection::Tx,
+            time: EvalTime::periodic(25, 0.25, 0.01, 0.02),
+            port: 2,
+            handle: 7,
+            bytes: vec![0x1b, 0x30],
+            site: CallSite::new("Demo.Send.m1scr", 42),
+        });
+
+        let json: serde_json::Value =
+            serde_json::from_str(&trace.to_json()).expect("serial trace is valid JSON");
+        assert_eq!(
+            json["serial"],
+            serde_json::json!([{
+                "direction": "tx",
+                "time_s": 0.25,
+                "phase": "periodic",
+                "base_tick": 25,
+                "port": 2,
+                "handle": 7,
+                "bytes": [27, 48],
+                "script": "Demo.Send.m1scr",
+                "offset": 42
+            }])
+        );
+        assert_eq!(trace.to_csv(), "time,Out\n0.25,1\n");
     }
 }

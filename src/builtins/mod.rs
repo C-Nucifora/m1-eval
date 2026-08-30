@@ -757,6 +757,21 @@ fn classify_library(object: &str, method: &str) -> CallCapability {
         let known = !intrinsics::get()
             .library_overloads(object, method)
             .is_empty();
+        if object == "Serial" && known && crate::virtual_serial::is_adapter_backed(method) {
+            return capability(
+                BuiltinSupport::AdapterBacked,
+                CallRoute::IoLibrary(object.to_string()),
+            );
+        }
+        if object == "Serial" && known && crate::virtual_serial::is_explicitly_unsupported(method) {
+            // Keep the IO route so an exact/wildcard scenario override or user
+            // adapter still gets first refusal before the virtual RS232 model
+            // rejects LIN behavior.
+            return capability(
+                BuiltinSupport::Unsupported,
+                CallRoute::IoLibrary(object.to_string()),
+            );
+        }
         if object == "System" && known && MODELED_SYSTEM_METHODS.contains(&method) {
             return capability(
                 BuiltinSupport::Modeled,
@@ -1824,6 +1839,7 @@ mod tests {
             let mut runtime = EvalRuntime {
                 time: crate::hardware::EvalTime::at_start(0.01),
                 hardware,
+                serial: crate::expr::SerialRuntime::fresh(),
             };
             dispatch_with_runtime(object, method, args, site, &mut ctx, &mut runtime)
         }
@@ -2562,6 +2578,12 @@ mod tests {
                 let method = overload.name.as_str();
                 let support = if object == "System" && MODELED_SYSTEM_METHODS.contains(&method) {
                     BuiltinSupport::Modeled
+                } else if object == "Serial" && crate::virtual_serial::is_adapter_backed(method) {
+                    BuiltinSupport::AdapterBacked
+                } else if object == "Serial"
+                    && crate::virtual_serial::is_explicitly_unsupported(method)
+                {
+                    BuiltinSupport::Unsupported
                 } else if io_stub::required_metadata(object, method) {
                     BuiltinSupport::AdapterBacked
                 } else {
@@ -2598,7 +2620,7 @@ mod tests {
                 BuiltinSupport::Modeled => &report.assumed,
                 BuiltinSupport::AdapterBacked => &report.adapter_backed,
                 BuiltinSupport::Stubbed => &report.stubbed,
-                _ => unreachable!("catalog test covers executable methods"),
+                BuiltinSupport::Unsupported => &report.unsupported,
             };
             assert!(
                 bucket.iter().any(|item| item.name == name),
@@ -2619,8 +2641,10 @@ mod tests {
                 .collect();
             let mut harness = Harness::new();
             match harness.call(object, method, &args) {
-                Err(EvalError::MissingHardwareMetadata { .. })
+                Err(EvalError::BadCall { .. } | EvalError::MissingHardwareMetadata { .. })
                     if expected == BuiltinSupport::AdapterBacked => {}
+                Err(EvalError::UnsupportedBuiltin { .. })
+                    if expected == BuiltinSupport::Unsupported => {}
                 Err(EvalError::UnsupportedBuiltin { .. }) => {
                     panic!("coverage says {expected:?}, but dispatch rejects {name}")
                 }
@@ -2659,7 +2683,6 @@ mod tests {
             ("CanComms", "GetUnsignedInteger"), // Integer -> 0
             ("CanComms", "RxMessage"),          // Boolean -> false
             ("CanComms", "SetFloat"),           // Void -> unit
-            ("Serial", "GetFloat"),
             ("Logging", "Running"),
         ];
         for (object, method) in cases {
@@ -2669,6 +2692,16 @@ mod tests {
                 "{object}.{method} should be a stub"
             );
         }
+        assert_eq!(
+            classify_builtin("Serial", "GetFloat"),
+            BuiltinSupport::AdapterBacked,
+            "implemented virtual serial reads should be adapter-backed"
+        );
+        assert_eq!(
+            classify_builtin("Serial", "SetLinHeader"),
+            BuiltinSupport::Unsupported,
+            "unmodeled LIN framing should remain unsupported"
+        );
         for method in ["ElapsedTime", "TickPeriod", "Ticks", "TicksSince"] {
             assert_eq!(
                 classify_builtin("System", method),

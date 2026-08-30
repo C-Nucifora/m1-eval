@@ -34,7 +34,8 @@ do not compare computed channel values with captured M1 results.
 | `.m1cfg` parameters and 1/2/3-D table lookup | **Assumed** | Parsing, interpolation, and edge clamping use synthetic fixtures. Use the matching calibration file for actual values. Without it, parameters use typed external defaults. Table `.Lookup()` and `.Get()` fail in strict modes; whole-project mode may opt in to an external `0.0` fallback. |
 | `Calculate.*`, `Limit.*`, `Convert.*`, enum conversions, core value-object methods, and table methods | **Assumed** | Implemented methods have hand-derived tests. `AsString`, `Validate`, `Constrain`, `GetUnscheduled`, and `Set` resolve against eligible receiver classes; channel `Set` applies its project validation range before writing. `--coverage` remains authoritative for the methods a project uses. |
 | Filters, integrals, derivatives, debounce, delay, change detection, timers, and `static local` state | **Assumed** | Update laws and startup behavior are explicit implementation assumptions with hand-derived tests, not M1 value comparisons. |
-| `CanComms.*`, `Serial.*`, `System.*`, `Logging.*`, DBC objects, and other hardware-backed calls | **Assumed / Stubbed** | Each call crosses a typed adapter boundary with its resolved receiver, source call site, arguments, and evaluator time. Exact-site scenario values take precedence over wildcard values and an attached adapter. `System.ElapsedTime` reports the interval since that call site last ran. Its first tick-zero call returns zero, while a site first reached later uses its function step. Tick calls use the deterministic base timeline. `System.FlashSize` and `System.FlashFree` require scenario or adapter data; they never become a dangerous zero. Remaining unhandled calls use documented typed stubs or fail loud. |
+| Virtual `Serial.*` RS232 byte buffers | **Assumed** | A fresh adapter per run provides stable nonzero handles, timed scenario RX, independent handle cursors, endian-aware numeric access, TX capture, and real port status. LIN stays unsupported. The exact evaluator contracts and evidence boundaries are in [`docs/virtual-serial.md`](docs/virtual-serial.md). |
+| `CanComms.*`, `System.*`, `Logging.*`, DBC objects, and other hardware-backed calls | **Assumed / Stubbed** | Each call crosses a typed adapter boundary with its resolved receiver, source call site, arguments, and evaluator time. Exact-site scenario values take precedence over wildcard values and an attached adapter. `System.ElapsedTime` reports the interval since that call site last ran. Its first tick-zero call returns zero, while a site first reached later uses its function step. Tick calls use the deterministic base timeline. `System.FlashSize` and `System.FlashFree` require scenario or adapter data; they never become a dangerous zero. Remaining unhandled calls use documented typed stubs or fail loud. |
 | Scenario parsing, tick grids, trace output, and `--coverage` | **Assumed** | These are deterministic m1-eval contracts tested with synthetic data. A `Supported` coverage entry means implemented, not M1-verified. |
 | Single-function and upstream dependency-cone runners | **Assumed** | Selection, ordering, and zero-order hold are tested on synthetic projects. |
 | Whole-project multi-rate scheduling | **Assumed** | Trigger rates come from `Project.m1prj`; same-rate dependency order, fastest-first rate groups, startup order, and cross-rate stale reads are the evaluator's model. |
@@ -61,8 +62,9 @@ dependency-cone runners.
 - **Tier-3 IO.** Hardware calls use a typed `HardwareAdapter` boundary. The
   adapter receives `ResolvedReceiver`, `CallSite`, arguments, and `EvalTime`.
   Routing is exact-site scenario value, wildcard scenario value, adapter,
-  deterministic `System` model, generic typed stub, then fail loud. Trace
-  provenance records which route supplied each call site.
+  virtual serial, deterministic `System` model, generic typed stub, then fail
+  loud. Trace provenance records which route supplied each call site. Virtual
+  serial transfers also have ordered byte events in JSON traces.
 - **Two runners** — *single-function* (run one chosen function each tick over a
   time series) and *dependency-cone* (run a target channel plus its upstream
   cone, topologically ordered).
@@ -194,10 +196,12 @@ exact call.
 ## Quickstart
 
 `m1-eval` runs offline. It does not connect to an ECU, sample sensors, emulate a
-CAN or serial bus, or reproduce firmware timing. A `Project.m1prj` is always
-required because it supplies symbols, types, and trigger rates. Pass the matching
-`.m1cfg` when a run needs real parameter values or table cells. Without it, an
-unseeded parameter uses a type-correct externally-driven default. Table
+CAN bus, perform live serial IO, or reproduce firmware timing. It does provide a
+deterministic virtual RS232 byte-buffer model for scenario tests. A
+`Project.m1prj` is always required because it supplies symbols, types, and trigger
+rates. Pass the matching `.m1cfg` when a run needs real parameter values or table
+cells. Without it, an unseeded parameter uses a type-correct externally-driven
+default. Table
 `.Lookup()` and `.Get()` fail in strict modes. In whole-project mode,
 `allow_default_inputs` also permits an externally-driven `0.0` table fallback.
 The evaluator does not load `.m1dbc` files.
@@ -209,6 +213,11 @@ values win over wildcards. Library consumers can instead call
 `Engine::run_with_adapter`. `System.FlashSize` and `System.FlashFree` require one
 of those sources. Run `--coverage` first to see the implemented, assumed,
 adapter-backed, stubbed, and unsupported calls in a project.
+
+Inject virtual RS232 bytes with `[[serial.rx]]`. The runner releases each chunk
+according to evaluator time, and JSON traces retain ordered RX/TX byte events;
+CSV remains channel-only. See [`docs/virtual-serial.md`](docs/virtual-serial.md)
+for the schema, supported methods, routing order, and explicit assumptions.
 
 Whole-project mode is strict about ordinary missing channels unless
 `allow_default_inputs = true` or `--allow-default-inputs` is set. The CLI then
