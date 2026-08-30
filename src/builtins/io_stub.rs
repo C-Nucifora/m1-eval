@@ -1,90 +1,103 @@
 // SPDX-License-Identifier: GPL-3.0-or-later
-//! Tier-3 IO builtins (`CanComms.*`, `Serial.*`, `System.*`, `Logging.*`) as
-//! scenario-fed values or documented stubs.
+//! Hardware-call routing for library and project receivers.
 //!
 //! These builtins touch hardware (CAN/serial buses, the firmware clock, the
-//! logger). An offline deterministic evaluator cannot truly run them, so each
-//! call resolves in this order:
+//! logger). Each call resolves in this order:
 //!
-//! 1. **Scenario override.** If the scenario seeded a value for this exact call
-//!    (`Env::io_override("Object.Method")`), return it. This is how a scenario or
-//!    a log replay externally drives a hardware-backed builtin.
-//! 2. **Specific documented stub.** A small set of calls have a *meaningful*
-//!    offline value — e.g. `System.TickPeriod()` is the evaluator's tick step
-//!    `ctx.dt`, and `System.XcpConnected()`/`Logging.Running()` are false because
-//!    no tuning tool or logger is attached offline. The `Void` side-effect calls
-//!    (`System.Debug`, `System.AllowTuning`, …) are no-ops returning a benign
-//!    value. Each stub's meaning is documented in `documented_stub`, never
-//!    copied from MoTeC.
-//! 3. **Generic typed stub.** Every *other* method that the intrinsic registry
+//! 1. An exact-call-site scenario override.
+//! 2. A wildcard scenario override for the call name.
+//! 3. An external [`HardwareAdapter`](crate::hardware::HardwareAdapter).
+//! 4. The deterministic `System` clock/tick model.
+//! 5. A generic typed stub. Every other method that the intrinsic registry
 //!    lists for the object is a hardware-backed read/write with no meaningful
 //!    offline value, but a determinate *type*. Rather than abort a whole-project
 //!    run on the first CAN read, we return the type-correct zero/false/empty
 //!    default for the overload's declared return type (see `typed_io_default`).
 //!    This is the externally-driven default a scenario/log replay would override.
-//! 4. **Fail loud.** A method the registry does *not* list on the object is
+//! 6. Fail loud. A method the registry does not list on the object is
 //!    genuinely unknown — we never invent a value for it, so it returns
 //!    [`EvalError::UnsupportedBuiltin`].
 //!
-//! Whenever a value is produced (override or stub), the call is flagged
-//! externally driven in the [`Trace`](crate::trace::Trace) so a consumer knows
-//! that column is simulated input, not evaluated output.
+//! `System.FlashSize` and `System.FlashFree` deliberately skip the zero fallback.
+//! A scenario or adapter must supply them, otherwise evaluation returns an
+//! actionable [`EvalError::MissingHardwareMetadata`]. Every successful route is
+//! recorded as structured provenance in the [`Trace`](crate::trace::Trace).
 
+use crate::env::CallSite;
 use crate::error::EvalError;
 use crate::expr::{EvalCtx, coerce_for_declared_type, coerce_for_scalar_kind};
+use crate::hardware::{
+    AdapterReply, HardwareCall, HardwareProvenance, HardwareValueSource, ResolvedReceiver,
+};
 use crate::value::{FixedPoint7dps, M1Scalar, M1ScalarKind, Value};
 use m1_typecheck::intrinsics;
 use m1_typecheck::types::ValueType;
 
-/// Evaluate one Tier-3 IO call. `library_object` is the canonical intrinsic
-/// catalog object. `source_object` keeps the exact spelling used for scenario
-/// overrides, trace keys, and errors. See the module docs for the resolution
-/// order.
+/// Evaluate one hardware-library call. `library_object` is the canonical
+/// intrinsic catalog object. `source_object` keeps the exact spelling used for
+/// compatibility scenario keys, trace keys, and errors. See the module docs for
+/// the routing order.
 pub fn call(
     library_object: &str,
     source_object: &str,
     method: &str,
     args: &[Value],
+    site: CallSite,
     ctx: &mut EvalCtx,
 ) -> Result<Value, EvalError> {
-    let key = format!("{source_object}.{method}");
+    let call = HardwareCall {
+        receiver: ResolvedReceiver::Library {
+            object: library_object.to_string(),
+        },
+        source_receiver: source_object.to_string(),
+        method: method.to_string(),
+        site,
+        arguments: args.to_vec(),
+        time: ctx.time,
+    };
+    let returns = library_return_type(library_object, method);
 
-    // 1. Scenario override wins.
-    if let Some(v) = ctx.env.io_override(&key).cloned() {
-        let returns = intrinsics::get()
-            .library_overloads(library_object, method)
-            .first()
-            .map(|overload| overload.returns.as_str());
-        let v = match returns {
-            Some(returns) => coerce_io_override(&key, v, returns, ctx)?,
-            None => v,
-        };
-        mark_external(ctx, &key);
-        return Ok(v);
+    if let Some((value, source)) = scenario_override(ctx, &call) {
+        let value = coerce_hardware_value(value, returns, &call, ctx)?;
+        return complete(ctx, &call, value, source);
     }
 
-    // 2. Specific documented offline stubs (a *meaningful* offline value).
-    if let Some(v) = documented_stub(library_object, method, args, ctx)? {
-        mark_external(ctx, &key);
-        return Ok(v);
+    if let Some(hardware) = ctx.hardware.as_deref_mut()
+        && let AdapterReply::Value(value) = hardware.call(&call)?
+    {
+        let value = coerce_hardware_value(value, returns, &call, ctx)?;
+        return complete(ctx, &call, value, HardwareValueSource::Adapter);
     }
 
-    // 3. Generic typed stub: any other method the intrinsic registry lists for
-    //    this object is a hardware-backed read/write. It has no meaningful offline
-    //    value, but a determinate return *type* — so return the type-correct
-    //    default rather than abort the run on the first CAN read. The default is
-    //    the externally-driven value a scenario / log replay would override.
-    if let Some(v) = typed_io_default(library_object, method) {
-        mark_external(ctx, &key);
-        return Ok(v);
+    if let Some(value) = system_model(library_object, method, args, ctx)? {
+        return complete(ctx, &call, value, HardwareValueSource::SystemModel);
     }
 
-    // 4. Fail loud — the method is not in the registry for this object, so it is
-    //    genuinely unknown. We never fabricate a value for an unknown method.
+    if required_metadata(library_object, method) {
+        return Err(EvalError::MissingHardwareMetadata {
+            call: call.canonical_name(),
+        });
+    }
+
+    if let Some(value) = documented_stub(library_object, method, args) {
+        return complete(ctx, &call, value, HardwareValueSource::GenericStub);
+    }
+
+    if let Some(value) = typed_io_default(library_object, method) {
+        return complete(ctx, &call, value, HardwareValueSource::GenericStub);
+    }
+
     Err(EvalError::UnsupportedBuiltin {
         object: source_object.to_string(),
         method: method.to_string(),
     })
+}
+
+fn library_return_type(object: &str, method: &str) -> Option<&'static str> {
+    intrinsics::get()
+        .library_overloads(object, method)
+        .first()
+        .map(|overload| overload.returns.as_str())
 }
 
 /// The type-correct externally-driven default for an IO-library `object.method`,
@@ -125,33 +138,66 @@ fn typed_io_default(object: &str, method: &str) -> Option<Value> {
     })
 }
 
-/// Restore a scenario IO override to the method's declared return family. The
-/// scenario wire format permits untyped numbers for compatibility, but a call
-/// result must still enter script execution with its M1 signedness and width.
-fn coerce_io_override(
-    key: &str,
+/// Restore a scenario or adapter value to the method's declared return family.
+fn coerce_hardware_value(
     value: Value,
-    returns: &str,
+    returns: Option<&str>,
+    call: &HardwareCall,
     ctx: &EvalCtx,
 ) -> Result<Value, EvalError> {
+    let key = call.canonical_name();
     match returns {
-        "Integer" => coerce_for_scalar_kind(key, value, M1ScalarKind::Integer),
-        "UnsignedInteger" => coerce_for_scalar_kind(key, value, M1ScalarKind::UnsignedInteger),
-        "FloatingPoint" => coerce_for_scalar_kind(key, value, M1ScalarKind::FloatingPoint),
-        "FixedPoint7dps" => coerce_for_scalar_kind(key, value, M1ScalarKind::FixedPoint7dps),
-        "Boolean" => coerce_for_declared_type(key, value, ValueType::Boolean, ctx.project),
-        "String" => coerce_for_declared_type(key, value, ValueType::String, ctx.project),
+        Some("Integer") => coerce_for_scalar_kind(&key, value, M1ScalarKind::Integer),
+        Some("UnsignedInteger") => {
+            coerce_for_scalar_kind(&key, value, M1ScalarKind::UnsignedInteger)
+        }
+        Some("FloatingPoint") => coerce_for_scalar_kind(&key, value, M1ScalarKind::FloatingPoint),
+        Some("FixedPoint7dps") => coerce_for_scalar_kind(&key, value, M1ScalarKind::FixedPoint7dps),
+        Some("Boolean") => coerce_for_declared_type(&key, value, ValueType::Boolean, ctx.project),
+        Some("String") => coerce_for_declared_type(&key, value, ValueType::String, ctx.project),
         // Void and opaque handles do not have an M1 scalar family to restore.
         _ => Ok(value),
     }
 }
 
-/// Flag an IO call's channel as externally driven in the trace, if a sink is
-/// active.
-fn mark_external(ctx: &mut EvalCtx, key: &str) {
-    if let Some(trace) = ctx.trace.as_deref_mut() {
-        trace.mark_external(key);
+/// Find an exact-site scenario override before either canonical or
+/// source-spelled wildcard keys.
+fn scenario_override(ctx: &EvalCtx, call: &HardwareCall) -> Option<(Value, HardwareValueSource)> {
+    let canonical = call.canonical_name();
+    let source = call.source_name();
+    let keys = if canonical == source {
+        vec![canonical]
+    } else {
+        vec![canonical, source]
+    };
+
+    for key in &keys {
+        if let Some(value) = ctx.env.io_override_at(key, &call.site) {
+            return Some((value.clone(), HardwareValueSource::ScenarioExact));
+        }
     }
+    for key in &keys {
+        if let Some(value) = ctx.env.io_override(key) {
+            return Some((value.clone(), HardwareValueSource::ScenarioWildcard));
+        }
+    }
+    None
+}
+
+/// Record the selected route, flag external values, and return the result.
+fn complete(
+    ctx: &mut EvalCtx,
+    call: &HardwareCall,
+    value: Value,
+    source: HardwareValueSource,
+) -> Result<Value, EvalError> {
+    if let Some(trace) = ctx.trace.as_deref_mut() {
+        if source.is_external() {
+            trace.mark_external(call.source_name());
+        }
+        trace.record_hardware(HardwareProvenance::new(call, source));
+    }
+    Ok(value)
 }
 
 /// Evaluate one project-object IO call `<object>.<method>(...)`.
@@ -160,54 +206,82 @@ fn mark_external(ctx: &mut EvalCtx, key: &str) {
 /// DBC CAN message/signal object (`Balls3EV25.DashVals.Tx/TxOpen/SetBit/…`,
 /// `IZZE DBC.*.GetScaled/Receive`), a `GroupCompound` CAN service-bits push
 /// (`Service Bits.Update`), a package `Output.SetState`, or a buzzer's `.Buzze`.
-/// None of these can be truly evaluated offline — they read from / write to a
-/// CAN bus or an output pin we are not driving — so each resolves, like the
-/// library stubs, in three steps:
+/// None of these can be evaluated from project data alone: they read from or
+/// write to a CAN bus or output pin. Each call uses the shared hardware routing
+/// order:
 ///
-/// 1. **Scenario override.** A value seeded under `"<object>.<method>"` (e.g. a
-///    log replay driving a `GetScaled`/`Receive`) wins.
-/// 2. **Documented stub.** A reader has a determinate offline default
+/// 1. **Exact-site scenario override.** A value for this script and byte offset
+///    wins over every other route.
+/// 2. **Wildcard scenario override.** A value seeded under
+///    `"<object>.<method>"` drives every matching call site.
+/// 3. **Adapter.** An attached [`HardwareAdapter`](crate::HardwareAdapter) sees
+///    the resolved receiver, call site, arguments, and evaluator time.
+/// 4. **Documented stub.** A reader has a determinate offline default
 ///    (`Receive` → `false`, no message arrived; `GetScaled` → `0.0`;
 ///    `GetUnsignedInteger` → `0`; `TxOpen` → an opaque handle `0`); a void writer
 ///    (`Tx`/`TxInitialise`/`Init`/`SetBit`/`SetUnsignedInteger`/`Update`/
 ///    `SetState`/`Buzze`) returns the unit value (a no-op offline). The stub `0`
 ///    for reads is deliberate (not fail-loud) so a whole-project run does not
 ///    abort on every CAN read.
-/// 3. **Fail loud.** Any other method on the object has no determinate offline
+/// 5. **Fail loud.** Any other method on the object has no determinate offline
 ///    value → [`EvalError::UnsupportedBuiltin`]. We never invent a bus value.
 ///
 /// Every produced value flags `"<object>.<method>"` externally driven in the
-/// trace, so a consumer knows the column is simulated input, not evaluated
-/// output. Routing is keyed by the *method* name — the object varies per project
-/// (`DashVals`, `Service Bits`, `Fan Output`) but the method fixes the offline
-/// semantics.
+/// trace, so a consumer knows the value came from outside evaluator computation.
+/// Structured provenance retains the resolved receiver and selected route.
 pub fn project_object_call(
-    object: &str,
+    receiver: ResolvedReceiver,
+    source_object: &str,
     method: &str,
-    _args: &[Value],
+    args: &[Value],
+    site: CallSite,
     ctx: &mut EvalCtx,
 ) -> Result<Value, EvalError> {
-    let key = format!("{object}.{method}");
+    let call = HardwareCall {
+        receiver,
+        source_receiver: source_object.to_string(),
+        method: method.to_string(),
+        site,
+        arguments: args.to_vec(),
+        time: ctx.time,
+    };
+    let returns = project_return_type(method);
 
-    // 1. Scenario override wins (e.g. a log replay driving a CAN read).
-    if let Some(v) = ctx.env.io_override(&key).cloned() {
-        let returns = match method {
-            "TxOpen" | "GetUnsignedInteger" => Some("UnsignedInteger"),
-            "GetInteger" => Some("Integer"),
-            "GetScaled" | "GetFloat" => Some("FloatingPoint"),
-            "Receive" | "GetBit" => Some("Boolean"),
-            _ => None,
-        };
-        let v = match returns {
-            Some(returns) => coerce_io_override(&key, v, returns, ctx)?,
-            None => v,
-        };
-        mark_external(ctx, &key);
-        return Ok(v);
+    if let Some((value, source)) = scenario_override(ctx, &call) {
+        let value = coerce_hardware_value(value, returns, &call, ctx)?;
+        return complete(ctx, &call, value, source);
     }
 
-    // 2. Documented offline stub, keyed by the method name.
-    let v = match method {
+    if let Some(hardware) = ctx.hardware.as_deref_mut()
+        && let AdapterReply::Value(value) = hardware.call(&call)?
+    {
+        let value = coerce_hardware_value(value, returns, &call, ctx)?;
+        return complete(ctx, &call, value, HardwareValueSource::Adapter);
+    }
+
+    if let Some(value) = project_stub(method) {
+        return complete(ctx, &call, value, HardwareValueSource::GenericStub);
+    }
+
+    Err(EvalError::UnsupportedBuiltin {
+        object: source_object.to_string(),
+        method: method.to_string(),
+    })
+}
+
+fn project_return_type(method: &str) -> Option<&'static str> {
+    match method {
+        "TxOpen" | "GetUnsignedInteger" => Some("UnsignedInteger"),
+        "GetInteger" => Some("Integer"),
+        "GetScaled" | "GetFloat" => Some("FloatingPoint"),
+        "Receive" | "GetBit" => Some("Boolean"),
+        _ => None,
+    }
+}
+
+/// Documented offline fallback for a recognized project-object method.
+fn project_stub(method: &str) -> Option<Value> {
+    Some(match method {
         // A CAN message `.TxOpen()` returns an opaque transmit handle; offline it
         // is the determinate zero handle.
         "TxOpen" => Value::m1_unsigned(0),
@@ -233,15 +307,8 @@ pub fn project_object_call(
         | "SetScaled" | "SetFloat" | "SetFromBaseUnit" | "Set" | "Update" | "SetState"
         | "Buzze" => Value::Bool(true),
         // Any other method on the object has no determinate offline value.
-        _ => {
-            return Err(EvalError::UnsupportedBuiltin {
-                object: object.to_string(),
-                method: method.to_string(),
-            });
-        }
-    };
-    mark_external(ctx, &key);
-    Ok(v)
+        _ => return None,
+    })
 }
 
 /// The project-object IO methods handled as documented offline stubs (flagged
@@ -270,18 +337,59 @@ pub const PROJECT_OBJECT_STUB_METHODS: &[&str] = &[
     "Buzze",
 ];
 
-/// The documented offline value for a Tier-3 call, or `Ok(None)` when there is no
-/// determinate stub (so the caller fails loud). Each stub is a paraphrased,
-/// defensible offline interpretation — not a guessed sensor reading.
-fn documented_stub(
+/// Deterministic clock and tick behavior derived only from [`EvalCtx::time`].
+fn system_model(
     object: &str,
     method: &str,
-    _args: &[Value],
-    ctx: &mut EvalCtx,
+    args: &[Value],
+    ctx: &EvalCtx,
 ) -> Result<Option<Value>, EvalError> {
+    if object != "System" {
+        return Ok(None);
+    }
+    let now = ctx.time.base_tick as u32;
     let v = match (object, method) {
-        // The scheduler tick period is exactly the evaluator's tick step.
-        ("System", "TickPeriod") => Value::m1_float(ctx.dt as f32),
+        ("System", "ElapsedTime") => Value::m1_float(ctx.time.elapsed_s as f32),
+        ("System", "TickPeriod") | ("System", "HiResTickPeriod") => {
+            Value::m1_float(ctx.time.base_period_s as f32)
+        }
+        ("System", "Ticks") | ("System", "HiResTicks") => Value::m1_unsigned(now),
+        ("System", "TicksSince") | ("System", "HiResTicksSince") => {
+            Value::m1_unsigned(now.wrapping_sub(unsigned_arg(args, 0, method)?))
+        }
+        ("System", "TicksBetween") => Value::m1_unsigned(
+            unsigned_arg(args, 1, method)?.wrapping_sub(unsigned_arg(args, 0, method)?),
+        ),
+        ("System", "TicksRemaining") => Value::m1_unsigned(
+            unsigned_arg(args, 1, method)?.wrapping_sub(unsigned_arg(args, 0, method)?),
+        ),
+        _ => return Ok(None),
+    };
+    Ok(Some(v))
+}
+
+fn unsigned_arg(args: &[Value], index: usize, method: &str) -> Result<u32, EvalError> {
+    let value = args.get(index).ok_or_else(|| EvalError::BadCall {
+        detail: format!("System.{method} is missing argument {}", index + 1),
+    })?;
+    match coerce_for_scalar_kind(
+        &format!("System.{method} argument {}", index + 1),
+        value.clone(),
+        M1ScalarKind::UnsignedInteger,
+    )? {
+        Value::M1(M1Scalar::UnsignedInteger(value)) => Ok(value),
+        _ => unreachable!("unsigned coercion returns an unsigned M1 scalar"),
+    }
+}
+
+/// Metadata whose zero value would be unsafe to mistake for a real ECU fact.
+pub(crate) fn required_metadata(object: &str, method: &str) -> bool {
+    object == "System" && matches!(method, "FlashSize" | "FlashFree")
+}
+
+/// A documented offline fallback which carries a definite non-hardware meaning.
+fn documented_stub(object: &str, method: &str, args: &[Value]) -> Option<Value> {
+    let v = match (object, method) {
         // No tuning tool (XCP) is connected during offline evaluation.
         ("System", "XcpConnected") => Value::Bool(false),
         // Void side-effects: no observable result offline. Return a benign value
@@ -292,14 +400,14 @@ fn documented_stub(
         | ("System", "Unused")
         | ("System", "Preserve") => Value::Bool(true),
         // No data logger is running / unloading in offline evaluation. Only the
-        // zero-argument overloads have a determinate stub; the per-system
-        // overloads (one Integer arg) fail loud.
-        ("Logging", "Running") if _args.is_empty() => Value::Bool(false),
-        ("Logging", "Unloading") if _args.is_empty() => Value::Bool(false),
+        // zero-argument overloads have this specific meaning; per-system
+        // overloads continue to the generic typed fallback.
+        ("Logging", "Running") if args.is_empty() => Value::Bool(false),
+        ("Logging", "Unloading") if args.is_empty() => Value::Bool(false),
         // Everything else has no determinate offline value.
-        _ => return Ok(None),
+        _ => return None,
     };
-    Ok(Some(v))
+    Some(v)
 }
 
 #[cfg(test)]
@@ -341,7 +449,25 @@ mod tests {
         /// routing (object recognition + this stub module) is exercised end to
         /// end, with the trace sink attached.
         fn io(&mut self, object: &str, method: &str, args: &[Value]) -> Result<Value, EvalError> {
-            let site = CallSite::new("Demo.Update.m1scr", 0);
+            self.io_at(
+                object,
+                method,
+                args,
+                CallSite::new("Demo.Update.m1scr", 0),
+                crate::hardware::EvalTime::at_start(0.02),
+                None,
+            )
+        }
+
+        fn io_at(
+            &mut self,
+            object: &str,
+            method: &str,
+            args: &[Value],
+            site: CallSite,
+            time: crate::hardware::EvalTime,
+            hardware: Option<&mut dyn crate::hardware::HardwareAdapter>,
+        ) -> Result<Value, EvalError> {
             let mut ctx = EvalCtx {
                 project: &self.project,
                 calib: &self.calib,
@@ -350,7 +476,8 @@ mod tests {
                 group: Some("Root.Demo"),
                 fn_symbol: Some("Root.Demo.Update"),
                 script_name: "Demo.Update.m1scr",
-                dt: 0.02,
+                time,
+                hardware,
                 scripts: &[],
                 signature_m1_types: None,
                 object_rules: None,
@@ -362,14 +489,26 @@ mod tests {
     }
 
     #[test]
-    fn system_tick_period_is_dt() {
+    fn system_tick_period_uses_the_base_grid_not_the_function_step() {
         let mut h = Harness::new();
+        let time = crate::hardware::EvalTime::periodic(4, 0.04, 0.01, 0.02);
         assert_eq!(
-            h.io("System", "TickPeriod", &[]).unwrap(),
-            Value::m1_float(0.02)
+            h.io_at(
+                "System",
+                "TickPeriod",
+                &[],
+                CallSite::new("Demo.Update.m1scr", 10),
+                time,
+                None,
+            )
+            .unwrap(),
+            Value::m1_float(0.01)
         );
-        // The call is flagged externally driven.
-        assert!(h.trace.is_external("System.TickPeriod"));
+        assert!(!h.trace.is_external("System.TickPeriod"));
+        assert!(h.trace.hardware.iter().any(|record| {
+            record.source == HardwareValueSource::SystemModel
+                && record.canonical_call() == "System.TickPeriod"
+        }));
     }
 
     #[test]
@@ -421,6 +560,25 @@ mod tests {
             Value::m1_float(12.5)
         );
         assert!(h.trace.is_external("CanComms.GetFloat"));
+    }
+
+    #[test]
+    fn wildcard_scenario_keys_do_not_collide_across_receivers() {
+        let mut h = Harness::new();
+        h.env
+            .set_io_override("CanComms.GetFloat", Value::m1_float(12.5));
+        h.env
+            .set_io_override("Serial.GetFloat", Value::m1_float(99.0));
+        let args = [Value::m1_unsigned(0), Value::m1_integer(0)];
+
+        assert_eq!(
+            h.io("CanComms", "GetFloat", &args).unwrap(),
+            Value::m1_float(12.5)
+        );
+        assert_eq!(
+            h.io("Serial", "GetFloat", &args).unwrap(),
+            Value::m1_float(99.0)
+        );
     }
 
     #[test]
@@ -553,16 +711,180 @@ mod tests {
     }
 
     #[test]
-    fn system_call_returns_typed_external_stub() {
+    fn system_elapsed_time_and_ticks_follow_the_evaluator_timeline() {
         let mut h = Harness::new();
-        // `System.ElapsedTime` has no *meaningful* offline value, but the registry
-        // lists it with a `FloatingPoint` return, so the typed stub is 0.0 (an
-        // externally-driven default), not a fail-loud abort.
+        let time = crate::hardware::EvalTime::periodic(125, 1.25, 0.01, 0.05);
         assert_eq!(
-            h.io("System", "ElapsedTime", &[]).unwrap(),
-            Value::m1_float(0.0)
+            h.io_at(
+                "System",
+                "ElapsedTime",
+                &[],
+                CallSite::new("Demo.Update.m1scr", 20),
+                time,
+                None,
+            )
+            .unwrap(),
+            Value::m1_float(1.25)
         );
-        assert!(h.trace.is_external("System.ElapsedTime"));
+        assert_eq!(
+            h.io_at(
+                "System",
+                "Ticks",
+                &[],
+                CallSite::new("Demo.Update.m1scr", 30),
+                time,
+                None,
+            )
+            .unwrap(),
+            Value::m1_unsigned(125)
+        );
+        assert_eq!(
+            h.io_at(
+                "System",
+                "TicksSince",
+                &[Value::m1_unsigned(120)],
+                CallSite::new("Demo.Update.m1scr", 40),
+                time,
+                None,
+            )
+            .unwrap(),
+            Value::m1_unsigned(5)
+        );
+        assert_eq!(
+            h.io_at(
+                "System",
+                "TicksBetween",
+                &[Value::m1_unsigned(u32::MAX - 1), Value::m1_unsigned(1)],
+                CallSite::new("Demo.Update.m1scr", 50),
+                time,
+                None,
+            )
+            .unwrap(),
+            Value::m1_unsigned(3),
+            "tick differences retain unsigned wraparound"
+        );
+        assert!(!h.trace.is_external("System.ElapsedTime"));
+    }
+
+    #[test]
+    fn flash_metadata_fails_loud_without_scenario_or_adapter_data() {
+        let mut h = Harness::new();
+        for method in ["FlashSize", "FlashFree"] {
+            let error = h.io("System", method, &[]).unwrap_err();
+            assert_eq!(
+                error,
+                EvalError::MissingHardwareMetadata {
+                    call: format!("System.{method}")
+                }
+            );
+            let message = error.to_string();
+            assert!(message.contains("[[io]]"), "{message}");
+            assert!(message.contains("HardwareAdapter"), "{message}");
+        }
+    }
+
+    #[derive(Debug)]
+    struct RecordingAdapter {
+        reply: AdapterReply,
+        calls: Vec<HardwareCall>,
+    }
+
+    impl crate::hardware::HardwareAdapter for RecordingAdapter {
+        fn call(&mut self, call: &HardwareCall) -> Result<AdapterReply, EvalError> {
+            self.calls.push(call.clone());
+            Ok(self.reply.clone())
+        }
+    }
+
+    #[test]
+    fn adapter_receives_resolved_call_site_arguments_and_time() {
+        let mut h = Harness::new();
+        let site = CallSite::new("Demo.Update.m1scr", 77);
+        let time = crate::hardware::EvalTime::periodic(9, 0.09, 0.01, 0.02);
+        let args = [Value::m1_unsigned(4), Value::m1_integer(8)];
+        let mut adapter = RecordingAdapter {
+            // The registry return family is FloatingPoint, so the evaluator must
+            // restore this integer adapter reply to binary32.
+            reply: AdapterReply::Value(Value::m1_integer(12)),
+            calls: Vec::new(),
+        };
+
+        let value = h
+            .io_at(
+                "Library.CanComms",
+                "GetFloat",
+                &args,
+                site.clone(),
+                time,
+                Some(&mut adapter),
+            )
+            .unwrap();
+        assert_eq!(value, Value::m1_float(12.0));
+        assert_eq!(adapter.calls.len(), 1);
+        let call = &adapter.calls[0];
+        assert_eq!(
+            call.receiver,
+            ResolvedReceiver::Library {
+                object: "CanComms".to_string()
+            }
+        );
+        assert_eq!(call.source_receiver, "Library.CanComms");
+        assert_eq!(call.site, site);
+        assert_eq!(call.arguments, args);
+        assert_eq!(call.time, time);
+        assert!(h.trace.hardware.iter().any(|record| {
+            record.source == HardwareValueSource::Adapter && record.site == site
+        }));
+    }
+
+    #[test]
+    fn exact_site_then_wildcard_scenario_values_precede_the_adapter() {
+        let mut h = Harness::new();
+        let exact = CallSite::new("Demo.Update.m1scr", 10);
+        let other = CallSite::new("Demo.Update.m1scr", 20);
+        h.env
+            .set_io_override("CanComms.GetFloat", Value::m1_float(1.0));
+        h.env
+            .set_io_override_at("CanComms.GetFloat", exact.clone(), Value::m1_float(2.0));
+        let mut adapter = RecordingAdapter {
+            reply: AdapterReply::Value(Value::m1_float(3.0)),
+            calls: Vec::new(),
+        };
+        let args = [Value::m1_unsigned(0), Value::m1_integer(0)];
+
+        assert_eq!(
+            h.io_at(
+                "CanComms",
+                "GetFloat",
+                &args,
+                exact,
+                crate::hardware::EvalTime::at_start(0.01),
+                Some(&mut adapter),
+            )
+            .unwrap(),
+            Value::m1_float(2.0)
+        );
+        assert_eq!(
+            h.io_at(
+                "CanComms",
+                "GetFloat",
+                &args,
+                other,
+                crate::hardware::EvalTime::at_start(0.01),
+                Some(&mut adapter),
+            )
+            .unwrap(),
+            Value::m1_float(1.0)
+        );
+        assert!(adapter.calls.is_empty(), "scenario values must win");
+        let sources: Vec<HardwareValueSource> = h
+            .trace
+            .hardware
+            .iter()
+            .map(|record| record.source)
+            .collect();
+        assert!(sources.contains(&HardwareValueSource::ScenarioExact));
+        assert!(sources.contains(&HardwareValueSource::ScenarioWildcard));
     }
 
     #[test]
@@ -592,6 +914,27 @@ mod tests {
         }
         // A failed call is not marked external.
         assert!(!h.trace.is_external("CanComms.NotARealMethod"));
+    }
+
+    #[test]
+    fn adapter_gets_first_refusal_before_an_unknown_hardware_method_fails() {
+        let mut h = Harness::new();
+        let mut adapter = RecordingAdapter {
+            reply: AdapterReply::Value(Value::m1_unsigned(44)),
+            calls: Vec::new(),
+        };
+        let value = h
+            .io_at(
+                "CanComms",
+                "NotARealMethod",
+                &[],
+                CallSite::new("Demo.Update.m1scr", 90),
+                crate::hardware::EvalTime::at_start(0.01),
+                Some(&mut adapter),
+            )
+            .expect("adapter handles method absent from the catalog");
+        assert_eq!(value, Value::m1_unsigned(44));
+        assert_eq!(adapter.calls[0].canonical_name(), "CanComms.NotARealMethod");
     }
 
     #[test]

@@ -17,10 +17,10 @@
 //!
 //! ## Externally-driven channels
 //!
-//! Tier-3 IO stubs (M6 Task 19) produce values the engine cannot truly compute —
-//! they come from the scenario or a documented stub. Those channels are flagged
-//! in [`Trace::external`] so a consumer knows which columns are simulated input
-//! rather than evaluated output.
+//! Scenario values, adapters, and hardware stubs produce values the engine did
+//! not compute. Those call names are flagged in [`Trace::external`].
+//! [`Trace::hardware`] adds the resolved receiver, exact call site, and selected
+//! route. Deterministic `System` calls have provenance but are not external.
 //!
 //! Internal channel and expression columns retain their M1 scalar family. The
 //! established JSON and CSV formats are untyped compatibility outputs, so they
@@ -28,6 +28,7 @@
 //! is deterministic, with a `time` column followed by channels in sorted-name
 //! order.
 
+use crate::hardware::{HardwareProvenance, ResolvedReceiver};
 use crate::value::{M1Scalar, Value};
 use std::collections::{BTreeMap, BTreeSet};
 
@@ -42,15 +43,19 @@ pub struct Trace {
     /// Per-expression value columns, keyed by `(script_name, byte_offset)`. Used
     /// by the value overlay; sparse (only expressions the sink recorded appear).
     pub exprs: BTreeMap<(String, usize), Vec<Value>>,
-    /// Channels whose values are externally driven (scenario-fed or a documented
-    /// Tier-3 stub) rather than computed by the engine. Metadata only — these
-    /// channels still appear in [`Trace::channels`].
+    /// Names whose values are externally driven by a scenario, adapter, default,
+    /// or documented hardware fallback rather than computed by the engine.
+    /// Channel names still appear in [`Trace::channels`]; hardware call names
+    /// have structured detail in [`Trace::hardware`].
     pub external: BTreeSet<String>,
     /// Unseeded inputs substituted with a type-correct startup default under the
     /// scenario's explicit `allow_default_inputs` opt-in, keyed by canonical
     /// channel path. Metadata only (not part of the JSON/CSV trace body): the
     /// honest record of every value the run GUESSED rather than computed.
     pub defaulted: BTreeMap<String, DefaultedInput>,
+    /// Structured source records for hardware-backed call sites. A set keeps
+    /// repeated ticks compact while retaining every route a site used.
+    pub hardware: BTreeSet<HardwareProvenance>,
 }
 
 /// One reported default substitution: what value was substituted and which
@@ -100,7 +105,7 @@ impl Trace {
             });
     }
 
-    /// Flag a channel as externally driven (scenario-fed or a Tier-3 stub).
+    /// Flag a channel or hardware call name as externally driven.
     pub fn mark_external(&mut self, path: impl Into<String>) {
         self.external.insert(path.into());
     }
@@ -110,8 +115,14 @@ impl Trace {
         self.external.contains(path)
     }
 
+    /// Record how one hardware call obtained its value.
+    pub fn record_hardware(&mut self, provenance: HardwareProvenance) {
+        self.hardware.insert(provenance);
+    }
+
     /// Serialise the channel columns + time axis to JSON. The shape is
-    /// `{ "time": [...], "channels": { path: [...] }, "external": [...] }`,
+    /// `{ "time": [...], "channels": { path: [...] }, "external": [...],
+    /// "hardware": [...] }`,
     /// values rendered by `value_json`. This historical untyped shape cannot
     /// expose M1 scalar-family metadata. JSON has no non-finite number syntax, so
     /// NaN and positive or negative infinity are written as `null`. Deterministic
@@ -134,6 +145,8 @@ impl Trace {
         }
         out.push_str("},\"external\":[");
         out.push_str(&join(self.external.iter().map(|p| json_string(p))));
+        out.push_str("],\"hardware\":[");
+        out.push_str(&join(self.hardware.iter().map(hardware_json)));
         out.push_str("]}");
         out
     }
@@ -162,6 +175,25 @@ impl Trace {
         }
         out
     }
+}
+
+/// Render one structured hardware provenance record.
+fn hardware_json(item: &HardwareProvenance) -> String {
+    let (receiver_kind, receiver_name) = match &item.receiver {
+        ResolvedReceiver::Library { object } => ("library", object.as_str()),
+        ResolvedReceiver::Project { path } => ("project", path.as_str()),
+        ResolvedReceiver::Unresolved { spelling } => ("unresolved", spelling.as_str()),
+    };
+    format!(
+        "{{\"receiver\":{{\"kind\":{},\"name\":{}}},\"source_call\":{},\"method\":{},\"script\":{},\"offset\":{},\"source\":{}}}",
+        json_string(receiver_kind),
+        json_string(receiver_name),
+        json_string(&item.source_call),
+        json_string(&item.method),
+        json_string(item.site.script()),
+        item.site.offset(),
+        json_string(item.source.as_str()),
+    )
 }
 
 /// Join an iterator of strings with commas.
@@ -330,7 +362,7 @@ mod tests {
         // BTreeMap ordering: A before B regardless of insertion order.
         assert_eq!(
             json,
-            "{\"time\":[0],\"channels\":{\"A\":[true],\"B\":[2]},\"external\":[\"A\"]}"
+            "{\"time\":[0],\"channels\":{\"A\":[true],\"B\":[2]},\"external\":[\"A\"],\"hardware\":[]}"
         );
     }
 
@@ -350,7 +382,7 @@ mod tests {
 
         assert_eq!(
             tr.to_json(),
-            "{\"time\":[0],\"channels\":{\"Fixed\":[0.1000001],\"Float\":[0.1],\"Int\":[-2147483648],\"Uint\":[4294967295]},\"external\":[]}"
+            "{\"time\":[0],\"channels\":{\"Fixed\":[0.1000001],\"Float\":[0.1],\"Int\":[-2147483648],\"Uint\":[4294967295]},\"external\":[],\"hardware\":[]}"
         );
     }
 
@@ -369,7 +401,7 @@ mod tests {
         let json = tr.to_json();
         assert_eq!(
             json,
-            "{\"time\":[null,null,null],\"channels\":{\"M1\":[null,null,null]},\"external\":[]}"
+            "{\"time\":[null,null,null],\"channels\":{\"M1\":[null,null,null]},\"external\":[],\"hardware\":[]}"
         );
         let parsed: serde_json::Value =
             serde_json::from_str(&json).expect("trace output must be valid JSON");

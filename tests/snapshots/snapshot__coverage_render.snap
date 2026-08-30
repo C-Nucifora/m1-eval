@@ -7,6 +7,8 @@ Supported:
   construct local_declaration
 Assumed:
   (none)
+Adapter-backed:
+  (none)
 Stubbed:
   (none)
 Unsupported:

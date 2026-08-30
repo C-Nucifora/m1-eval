@@ -4,7 +4,8 @@
 //!
 //! `Engine` is the one entry point a consumer (the visualiser, the CLI, a later
 //! LSP) uses. It owns the loaded project internally and exposes only `m1-eval`'s
-//! own types — [`Scenario`], [`Trace`], [`CoverageReport`], [`EvalError`]. No
+//! own types: [`Scenario`], [`Trace`], [`CoverageReport`], [`EvalError`], and
+//! [`HardwareAdapter`]. No
 //! `m1-core`/`m1-typecheck` type appears in any method signature, mirroring
 //! `m1-doc`'s boundary discipline: there is exactly one engine, and the views
 //! over it (visualiser, LSP) are thin.
@@ -24,9 +25,14 @@ use crate::counterfactual::Override;
 use crate::coverage::CoverageReport;
 use crate::diff::{Counterfactual, Diff};
 use crate::error::EvalError;
+use crate::hardware::HardwareAdapter;
 use crate::loader::{Loaded, load};
 use crate::log::Log;
-use crate::runner::{CounterfactualCfg, run as run_scenario, run_counterfactual};
+use crate::runner::{
+    CounterfactualCfg, run as run_scenario, run_counterfactual,
+    run_counterfactual_with_adapter as replay_with_adapter,
+    run_with_adapter as run_scenario_with_adapter,
+};
 use crate::scenario::Scenario;
 use crate::trace::Trace;
 use std::path::Path;
@@ -181,6 +187,23 @@ impl Engine {
         run_counterfactual(&self.loaded, log, &self.overrides, &cfg)
     }
 
+    /// Run the attached counterfactual log through an external hardware adapter.
+    /// Hardware calls in override expressions and recomputed scripts share the
+    /// same adapter and deterministic replay timeline.
+    pub fn run_counterfactual_with_adapter(
+        &self,
+        hardware: &mut dyn HardwareAdapter,
+    ) -> Result<Trace, EvalError> {
+        let log = self.log.as_ref().ok_or_else(|| EvalError::MissingInput {
+            channel: "counterfactual run needs a log: call load_log first".to_string(),
+        })?;
+        let cfg = CounterfactualCfg {
+            base_rate_hz: self.default_counterfactual_rate(),
+            duration_s: 0.0,
+        };
+        replay_with_adapter(&self.loaded, log, &self.overrides, &cfg, hardware)
+    }
+
     /// Run the counterfactual replay and diff the result against the logged ground
     /// truth, returning a [`Counterfactual`] (the recomputed [`Trace`] plus the
     /// per-channel [`Diff`]). This is the headline Phase-3 output: "override this
@@ -227,10 +250,22 @@ impl Engine {
         run_scenario(&self.loaded, scenario)
     }
 
+    /// Evaluate a scenario with an external typed hardware adapter.
+    ///
+    /// The adapter is borrowed only for this run and may keep mutable state.
+    /// Exact-site and wildcard scenario IO values take precedence over it.
+    pub fn run_with_adapter(
+        &self,
+        scenario: &Scenario,
+        hardware: &mut dyn HardwareAdapter,
+    ) -> Result<Trace, EvalError> {
+        run_scenario_with_adapter(&self.loaded, scenario, hardware)
+    }
+
     /// Report which builtins/constructs every loaded script uses and whether the
-    /// engine supports, assumes, stubs, or cannot handle each, along with the
-    /// whole-project execution schedule. Pure static analysis — no scenario
-    /// needed; safe to call before [`Engine::run`].
+    /// engine supports, assumes, requires adapter data for, stubs, or cannot
+    /// handle each, along with the whole-project execution schedule. Pure static
+    /// analysis; no scenario is needed, so this is safe before [`Engine::run`].
     pub fn coverage(&self) -> CoverageReport {
         CoverageReport::analyse_loaded(&self.loaded)
     }
@@ -239,6 +274,10 @@ impl Engine {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::hardware::{
+        AdapterReply, EvalPhase, HardwareAdapter, HardwareCall, HardwareValueSource,
+        ResolvedReceiver,
+    };
     use crate::value::Value;
     use std::path::Path;
 
@@ -249,6 +288,225 @@ mod tests {
             Some(&dir.join("parameters.m1cfg")),
         )
         .expect("mini fixture loads through the engine")
+    }
+
+    fn hardware_engine() -> Engine {
+        let dir = Path::new(env!("CARGO_MANIFEST_DIR")).join("tests/fixtures/hardware");
+        Engine::load(&dir.join("Project.m1prj"), None).expect("hardware fixture loads")
+    }
+
+    fn hardware_scenario(extra: &str) -> Scenario {
+        Scenario::from_toml_str(&format!(
+            "mode = \"function\"\ntarget = \"Hardware.Update\"\nduration_s = 0.03\nbase_rate_hz = 100.0\n{extra}"
+        ))
+        .expect("hardware scenario parses")
+    }
+
+    #[derive(Default)]
+    struct MetadataAdapter {
+        calls: Vec<HardwareCall>,
+    }
+
+    impl HardwareAdapter for MetadataAdapter {
+        fn call(&mut self, call: &HardwareCall) -> Result<AdapterReply, EvalError> {
+            self.calls.push(call.clone());
+            Ok(match call.method.as_str() {
+                "FlashSize" => AdapterReply::Value(Value::m1_integer(8_388_608)),
+                "FlashFree" => AdapterReply::Value(Value::m1_integer(2_097_152)),
+                _ => AdapterReply::Unhandled,
+            })
+        }
+    }
+
+    #[test]
+    fn engine_adapter_drives_required_metadata_and_system_uses_the_tick_grid() {
+        let engine = hardware_engine();
+        let scenario = hardware_scenario("");
+        let mut adapter = MetadataAdapter::default();
+        let trace = engine
+            .run_with_adapter(&scenario, &mut adapter)
+            .expect("adapter-backed hardware run succeeds");
+
+        assert_eq!(
+            trace.channels["Root.Hardware.Elapsed"],
+            vec![
+                Value::m1_float(0.0),
+                Value::m1_float(0.01),
+                Value::m1_float(0.02),
+            ]
+        );
+        assert_eq!(
+            trace.channels["Root.Hardware.Period"],
+            vec![Value::m1_float(0.01); 3]
+        );
+        assert_eq!(
+            trace.channels["Root.Hardware.Tick"],
+            vec![
+                Value::m1_unsigned(0),
+                Value::m1_unsigned(1),
+                Value::m1_unsigned(2),
+            ]
+        );
+        for channel in ["FlashSizeA", "FlashSizeB"] {
+            assert_eq!(
+                trace.channels[&format!("Root.Hardware.{channel}")],
+                vec![Value::m1_unsigned(8_388_608); 3]
+            );
+        }
+        assert_eq!(
+            trace.channels["Root.Hardware.FlashFreeValue"],
+            vec![Value::m1_unsigned(2_097_152); 3]
+        );
+
+        let metadata: Vec<&HardwareCall> = adapter
+            .calls
+            .iter()
+            .filter(|call| matches!(call.method.as_str(), "FlashSize" | "FlashFree"))
+            .collect();
+        assert_eq!(
+            metadata.len(),
+            9,
+            "three metadata calls on each of three ticks"
+        );
+        assert!(metadata.iter().all(|call| {
+            call.receiver
+                == ResolvedReceiver::Library {
+                    object: "System".to_string(),
+                }
+                && call.source_receiver == "System"
+        }));
+        assert_eq!(
+            metadata
+                .iter()
+                .map(|call| call.time.base_tick)
+                .collect::<Vec<_>>(),
+            vec![0, 0, 0, 1, 1, 1, 2, 2, 2]
+        );
+        assert!(trace.hardware.iter().any(|record| {
+            record.source == HardwareValueSource::Adapter
+                && record.canonical_call() == "System.FlashSize"
+        }));
+        assert!(trace.hardware.iter().any(|record| {
+            record.source == HardwareValueSource::SystemModel
+                && record.canonical_call() == "System.ElapsedTime"
+        }));
+
+        let json: serde_json::Value =
+            serde_json::from_str(&trace.to_json()).expect("hardware trace is valid JSON");
+        let hardware = json["hardware"]
+            .as_array()
+            .expect("hardware provenance array");
+        assert!(hardware.iter().any(|record| {
+            record["receiver"]["kind"] == "library"
+                && record["receiver"]["name"] == "System"
+                && record["source_call"] == "System.FlashSize"
+                && record["method"] == "FlashSize"
+                && record["script"] == "Hardware.Update.m1scr"
+                && record["source"] == "adapter"
+                && record["offset"].is_u64()
+        }));
+        assert!(hardware.iter().any(|record| {
+            record["source_call"] == "System.ElapsedTime" && record["source"] == "system-model"
+        }));
+    }
+
+    #[test]
+    fn startup_hardware_calls_receive_startup_time_and_keep_provenance() {
+        let engine = hardware_engine();
+        let scenario = Scenario::from_toml_str(
+            "mode = \"whole-project\"\nduration_s = 0.03\nbase_rate_hz = 100.0\n",
+        )
+        .expect("whole-project hardware scenario parses");
+        let mut adapter = MetadataAdapter::default();
+        let trace = engine
+            .run_with_adapter(&scenario, &mut adapter)
+            .expect("whole-project hardware run succeeds");
+
+        assert_eq!(
+            trace.channels["Root.Hardware.StartupTick"],
+            vec![Value::m1_unsigned(0); 3]
+        );
+        let startup = adapter
+            .calls
+            .iter()
+            .find(|call| call.site.script() == "Hardware.Init.m1scr")
+            .expect("startup call reaches the adapter before the System model");
+        assert_eq!(startup.method, "Ticks");
+        assert_eq!(startup.time.phase, EvalPhase::Startup);
+        assert_eq!(startup.time.base_tick, 0);
+        assert_eq!(startup.time.elapsed_s, 0.0);
+        assert_eq!(startup.time.base_period_s, 0.01);
+        assert_eq!(startup.time.step_s, 0.01);
+        assert!(trace.hardware.iter().any(|record| {
+            record.site.script() == "Hardware.Init.m1scr"
+                && record.source == HardwareValueSource::SystemModel
+                && record.canonical_call() == "System.Ticks"
+        }));
+    }
+
+    #[test]
+    fn missing_flash_metadata_aborts_with_script_and_tick_context() {
+        let engine = hardware_engine();
+        let error = engine.run(&hardware_scenario("")).unwrap_err();
+        assert_eq!(
+            error.root_cause(),
+            &EvalError::MissingHardwareMetadata {
+                call: "System.FlashSize".to_string()
+            }
+        );
+        let message = error.to_string();
+        assert!(message.contains("Hardware.Update.m1scr"), "{message}");
+        assert!(message.contains("t = 0.000 s"), "{message}");
+        assert!(message.contains("[[io]]"), "{message}");
+    }
+
+    #[test]
+    fn scenario_exact_site_override_does_not_collide_with_the_other_call() {
+        let engine = hardware_engine();
+        let source = include_str!("../tests/fixtures/hardware/Scripts/Hardware.Update.m1scr");
+        let first_offset = source
+            .match_indices("System.FlashSize")
+            .next()
+            .expect("first FlashSize call")
+            .0;
+        let extra = format!(
+            r#"
+
+[[io]]
+call = "System.FlashSize"
+const = 4194304
+
+[[io]]
+call = "System.FlashSize"
+script = "Hardware.Update.m1scr"
+offset = {first_offset}
+const = 8388608
+
+[[io]]
+call = "System.FlashFree"
+const = 2097152
+"#
+        );
+        let trace = engine
+            .run(&hardware_scenario(&extra))
+            .expect("site-specific scenario run succeeds");
+
+        assert_eq!(
+            trace.channels["Root.Hardware.FlashSizeA"],
+            vec![Value::m1_unsigned(8_388_608); 3]
+        );
+        assert_eq!(
+            trace.channels["Root.Hardware.FlashSizeB"],
+            vec![Value::m1_unsigned(4_194_304); 3]
+        );
+        assert!(trace.hardware.iter().any(|record| {
+            record.source == HardwareValueSource::ScenarioExact
+                && record.site.offset() == first_offset
+        }));
+        assert!(trace.hardware.iter().any(|record| {
+            record.source == HardwareValueSource::ScenarioWildcard
+                && record.canonical_call() == "System.FlashSize"
+        }));
     }
 
     #[test]
@@ -606,6 +864,41 @@ const = 6.0
             other.iter().all(|v| *v == Value::m1_float(42.0)),
             "{other:?}"
         );
+    }
+
+    #[test]
+    fn counterfactual_override_expression_uses_the_hardware_adapter_timeline() {
+        let mut engine = cf_engine();
+        let (_dir, path) = temp_log("csv", CF_LOG_CSV);
+        engine.load_log(&path).expect("log attaches");
+        engine
+            .override_channel("Root.CF.Sensor=System.FlashSize()")
+            .expect("hardware expression override parses");
+        let mut adapter = MetadataAdapter::default();
+
+        let trace = engine
+            .run_counterfactual_with_adapter(&mut adapter)
+            .expect("counterfactual hardware expression runs");
+        assert_eq!(trace.time, vec![0.0, 0.01]);
+        let flash_calls: Vec<&HardwareCall> = adapter
+            .calls
+            .iter()
+            .filter(|call| call.method == "FlashSize")
+            .collect();
+        assert_eq!(flash_calls.len(), 2);
+        assert_eq!(flash_calls[0].site.script(), "<counterfactual-override>");
+        assert_eq!(flash_calls[0].time.base_tick, 0);
+        assert_eq!(flash_calls[1].time.base_tick, 1);
+        assert!(
+            flash_calls
+                .iter()
+                .all(|call| call.time.phase == EvalPhase::Periodic)
+        );
+        assert!(trace.hardware.iter().any(|record| {
+            record.source == HardwareValueSource::Adapter
+                && record.site.script() == "<counterfactual-override>"
+                && record.canonical_call() == "System.FlashSize"
+        }));
     }
 
     #[test]

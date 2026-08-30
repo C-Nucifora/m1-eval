@@ -203,7 +203,11 @@ pub fn call(
             group: callee_group.as_deref(),
             fn_symbol: Some(canon.as_str()),
             script_name: &callee_script_name,
-            dt: ctx.dt,
+            time: ctx.time,
+            hardware: match ctx.hardware.as_mut() {
+                Some(hardware) => Some(&mut **hardware),
+                None => None,
+            },
             scripts: ctx.scripts,
             signature_m1_types: ctx.signature_m1_types,
             object_rules: ctx.object_rules,
@@ -278,6 +282,15 @@ mod tests {
         /// Call the helper through `userfn::call`, with the caller's lexical
         /// context (group `Root.Caller`, fn `Root.Caller.Update`).
         fn call(&mut self, callee: &str, args: &[Value]) -> Result<Option<Value>, EvalError> {
+            self.call_with_adapter(callee, args, None)
+        }
+
+        fn call_with_adapter(
+            &mut self,
+            callee: &str,
+            args: &[Value],
+            hardware: Option<&mut dyn crate::hardware::HardwareAdapter>,
+        ) -> Result<Option<Value>, EvalError> {
             // Split the immutable project/scripts borrow from the mutable stores.
             let project = &self.loaded.project;
             let scripts = &self.loaded.scripts;
@@ -289,7 +302,8 @@ mod tests {
                 group: Some("Root.Caller"),
                 fn_symbol: Some("Root.Caller.Update"),
                 script_name: "Caller.Update.m1scr",
-                dt: 0.01,
+                time: crate::hardware::EvalTime::at_start(0.01),
+                hardware,
                 scripts,
                 signature_m1_types: Some(&self.loaded.signature_m1_types),
                 object_rules: Some(&self.loaded.object_rules),
@@ -355,6 +369,47 @@ mod tests {
             Some(Value::M1(M1Scalar::FixedPoint7dps(
                 crate::value::FixedPoint7dps::ZERO,
             )))
+        );
+    }
+
+    #[derive(Default)]
+    struct NestedHardwareAdapter {
+        calls: Vec<crate::hardware::HardwareCall>,
+    }
+
+    impl crate::hardware::HardwareAdapter for NestedHardwareAdapter {
+        fn call(
+            &mut self,
+            call: &crate::hardware::HardwareCall,
+        ) -> Result<crate::hardware::AdapterReply, EvalError> {
+            self.calls.push(call.clone());
+            Ok(crate::hardware::AdapterReply::Value(Value::M1(
+                M1Scalar::FixedPoint7dps(crate::value::FixedPoint7dps::from_raw(123)),
+            )))
+        }
+    }
+
+    #[test]
+    fn nested_user_function_keeps_the_hardware_adapter_and_time() {
+        let mut h = Harness::new();
+        let mut adapter = NestedHardwareAdapter::default();
+        assert_eq!(
+            h.call_with_adapter(
+                "Root.Helper.InferredFixed",
+                &[Value::m1_float(0.0)],
+                Some(&mut adapter),
+            )
+            .unwrap(),
+            Some(Value::M1(M1Scalar::FixedPoint7dps(
+                crate::value::FixedPoint7dps::from_raw(123)
+            )))
+        );
+        assert_eq!(adapter.calls.len(), 1);
+        assert_eq!(adapter.calls[0].method, "GetFixed7DP");
+        assert_eq!(adapter.calls[0].site.script(), "Helper.InferredFixed.m1scr");
+        assert_eq!(
+            adapter.calls[0].time,
+            crate::hardware::EvalTime::at_start(0.01)
         );
     }
 

@@ -2,7 +2,8 @@
 //! The stateful (time-domain) builtins — the hard core of the evaluator.
 //!
 //! Each operator is a small state machine keyed by its [`CallSite`] and advanced
-//! once per tick by `ctx.dt`. State lives in [`crate::env::StateStore`] as an
+//! once per execution by `ctx.time.step_s`. State lives in
+//! [`crate::env::StateStore`] as an
 //! [`OpState`] variant; a fresh site starts [`OpState::Uninit`] and the operator
 //! seeds itself on its first tick so the discretisation has a defined prior
 //! value. The update laws below are paraphrased from our understanding of the M1
@@ -204,7 +205,8 @@ fn reduce_time(current: f64, dt: f64) -> f64 {
 /// share one countdown. We therefore key the state by the **object path**
 /// (`object_key`, a [`CallSite`] with the object path in the script slot and a
 /// zero offset) rather than the individual call site — `Start`/`Remaining`/… on
-/// one Timer all address the same state. The countdown advances by `ctx.dt` each
+/// one Timer all address the same state. The countdown advances by
+/// `ctx.time.step_s` each
 /// time `Remaining` is read (the documented Phase-1 model: a
 /// Timer is read once per tick, so reading advances it one tick), clamped at
 /// zero. `Start(period)` (re)loads the period and runs; `Stop` halts without
@@ -219,7 +221,7 @@ pub fn timer(
     if !matches!(method, "Start" | "Stop" | "Reset" | "Remaining") {
         return Ok(None);
     }
-    let dt = ctx.dt;
+    let dt = ctx.time.step_s;
     let slot = ctx.state.entry(object_key);
     // Read the current countdown (default: stopped at zero).
     let (mut remaining, mut running) = match slot {
@@ -296,7 +298,7 @@ fn first_order(args: &[Value], site: CallSite, ctx: &mut EvalCtx) -> Result<Valu
         Some(v) => v.as_bool()?,
         None => false,
     };
-    let dt = ctx.dt as f32;
+    let dt = ctx.time.step_s as f32;
     let a0 = first_order_alpha(tc, dt);
 
     let slot = ctx.state.entry(site);
@@ -329,7 +331,7 @@ fn extremum(
         Some(v) => v.as_bool()?,
         None => false,
     };
-    let a0 = first_order_alpha(tc, ctx.dt as f32);
+    let a0 = first_order_alpha(tc, ctx.time.step_s as f32);
 
     let slot = ctx.state.entry(site);
     let prev = match slot {
@@ -391,7 +393,7 @@ fn integral_normal(args: &[Value], site: CallSite, ctx: &mut EvalCtx) -> Result<
     let max = numeric_f32(&args[2])?;
     let reset = args[3].as_bool()?;
     let preset = numeric_f32(&args[4])?;
-    let dt = ctx.dt as f32;
+    let dt = ctx.time.step_s as f32;
 
     let slot = ctx.state.entry(site);
     let prev = match slot {
@@ -464,7 +466,7 @@ fn derivative_normal(
     filtered: bool,
 ) -> Result<Value, EvalError> {
     let x = numeric_f32(&args[0])?;
-    let dt = ctx.dt as f32;
+    let dt = ctx.time.step_s as f32;
     let slot = ctx.state.entry(site);
     let prev = match slot {
         OpState::Derivative { prev_x, prev_d } => Some((*prev_x, *prev_d)),
@@ -503,7 +505,7 @@ fn derivative_adaptive(
     let x = numeric_f32(&args[0])?;
     let delta = numeric_f32(&args[1])?;
     let max_dt = seconds(&args[2])?;
-    let dt = ctx.dt;
+    let dt = ctx.time.step_s;
     let slot = ctx.state.entry(site);
 
     let prev = match slot {
@@ -583,7 +585,7 @@ fn edge_delay(
 ) -> Result<Value, EvalError> {
     let cond = args[0].as_bool()?;
     let delay = seconds(&args[1])?;
-    let dt = ctx.dt;
+    let dt = ctx.time.step_s;
     let slot = ctx.state.entry(site);
     let prev = match slot {
         OpState::Timed { output, held, .. } => Some((*output, *held)),
@@ -629,7 +631,7 @@ fn delay_stable(args: &[Value], site: CallSite, ctx: &mut EvalCtx) -> Result<Val
     // integral. Preserve the sampled argument/reference in its exact M1 family,
     // but apply the signature's binary32 coercion at this call boundary.
     let delta = args.get(2).map(numeric_f32).transpose()?;
-    let dt = ctx.dt;
+    let dt = ctx.time.step_s;
     let slot = ctx.state.entry(site);
     let prev = match slot {
         OpState::ChangeBy {
@@ -697,7 +699,7 @@ fn debounce(
 fn debounce_stable(args: &[Value], site: CallSite, ctx: &mut EvalCtx) -> Result<Value, EvalError> {
     let cond = args[0].as_bool()?;
     let filter = seconds(&args[1])?;
-    let dt = ctx.dt;
+    let dt = ctx.time.step_s;
     let slot = ctx.state.entry(site);
     let prev = match slot {
         OpState::Timed {
@@ -737,7 +739,7 @@ fn debounce_stable(args: &[Value], site: CallSite, ctx: &mut EvalCtx) -> Result<
 fn debounce_filter(args: &[Value], site: CallSite, ctx: &mut EvalCtx) -> Result<Value, EvalError> {
     let cond = args[0].as_bool()?;
     let response = numeric_f32(&args[1])?;
-    let a0 = first_order_alpha(response, ctx.dt as f32);
+    let a0 = first_order_alpha(response, ctx.time.step_s as f32);
     let target = if cond { 1.0 } else { 0.0 };
     let slot = ctx.state.entry(site);
     let (prev_level, prev_out) = match slot {
@@ -822,7 +824,7 @@ fn change_by(
         Some(v) => Some(seconds(v)?),
         None => None,
     };
-    let dt = ctx.dt;
+    let dt = ctx.time.step_s;
     let slot = ctx.state.entry(site);
     let prev = match slot {
         OpState::ChangeBy {
@@ -894,7 +896,7 @@ fn change_edge(
         Some(v) => Some(seconds(v)?),
         None => None,
     };
-    let dt = ctx.dt;
+    let dt = ctx.time.step_s;
     let slot = ctx.state.entry(site);
     let prev = match slot {
         OpState::ChangeEdge { prev, held } => Some((*prev, *held)),
@@ -979,7 +981,7 @@ fn calculate_stateful(
 fn calc_stable(args: &[Value], site: CallSite, ctx: &mut EvalCtx) -> Result<Value, EvalError> {
     let x = args[0].m1_scalar()?;
     let filter = seconds(&args[1])?;
-    let dt = ctx.dt;
+    let dt = ctx.time.step_s;
     let slot = ctx.state.entry(site);
     let prev = match slot {
         OpState::ChangeBy { prev_x, held, .. } => Some((*prev_x, *held)),
@@ -1017,7 +1019,7 @@ fn calc_between(
     let min = args[1].m1_scalar()?;
     let max = args[2].m1_scalar()?;
     let filter = seconds(&args[3])?;
-    let dt = ctx.dt;
+    let dt = ctx.time.step_s;
     let in_range = matches!(
         scalar_cmp(x, min),
         Some(Ordering::Equal | Ordering::Greater)
@@ -1035,7 +1037,7 @@ fn calc_hysteresis(args: &[Value], site: CallSite, ctx: &mut EvalCtx) -> Result<
     let low = args[1].m1_scalar()?;
     let high = args[2].m1_scalar()?;
     let filter = seconds(&args[3])?;
-    let dt = ctx.dt;
+    let dt = ctx.time.step_s;
     // Candidate target: above-high wants true, below-low wants false, else hold.
     let want = if matches!(
         scalar_cmp(x, high),
@@ -1162,7 +1164,8 @@ mod tests {
                 group: Some("Root.Demo"),
                 fn_symbol: Some("Root.Demo.Update"),
                 script_name: "Demo.Update.m1scr",
-                dt: self.dt,
+                time: crate::hardware::EvalTime::at_start(self.dt),
+                hardware: None,
                 scripts: &[],
                 signature_m1_types: None,
                 object_rules: None,
@@ -1501,7 +1504,8 @@ mod tests {
                 group: Some("Root.Demo"),
                 fn_symbol: Some("Root.Demo.Update"),
                 script_name: "Demo.Update.m1scr",
-                dt: h.dt,
+                time: crate::hardware::EvalTime::at_start(h.dt),
+                hardware: None,
                 scripts: &[],
                 signature_m1_types: None,
                 object_rules: None,
@@ -1535,7 +1539,8 @@ mod tests {
             group: Some("Root.Demo"),
             fn_symbol: Some("Root.Demo.Update"),
             script_name: "Demo.Update.m1scr",
-            dt: h.dt,
+            time: crate::hardware::EvalTime::at_start(h.dt),
+            hardware: None,
             scripts: &[],
             signature_m1_types: None,
             object_rules: None,
@@ -1937,7 +1942,8 @@ mod tests {
                 group: Some("Root.Demo"),
                 fn_symbol: Some("Root.Demo.Update"),
                 script_name: "Demo.Update.m1scr",
-                dt: h.dt,
+                time: crate::hardware::EvalTime::at_start(h.dt),
+                hardware: None,
                 scripts: &[],
                 signature_m1_types: None,
                 object_rules: None,
@@ -1979,7 +1985,8 @@ mod tests {
                 group: Some("Root.Demo"),
                 fn_symbol: Some("Root.Demo.Update"),
                 script_name: "Demo.Update.m1scr",
-                dt: h.dt,
+                time: crate::hardware::EvalTime::at_start(h.dt),
+                hardware: None,
                 scripts: &[],
                 signature_m1_types: None,
                 object_rules: None,
@@ -2015,7 +2022,8 @@ mod tests {
                 group: Some("Root.Demo"),
                 fn_symbol: Some("Root.Demo.Update"),
                 script_name: "Demo.Update.m1scr",
-                dt: h.dt,
+                time: crate::hardware::EvalTime::at_start(h.dt),
+                hardware: None,
                 scripts: &[],
                 signature_m1_types: None,
                 object_rules: None,

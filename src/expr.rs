@@ -27,6 +27,7 @@
 use crate::calib::Calibration;
 use crate::env::{CallSite, Env, StateStore};
 use crate::error::EvalError;
+use crate::hardware::{EvalTime, HardwareAdapter};
 use crate::ident::{Target, classify};
 use crate::value::{FixedPoint7dps, M1Scalar, M1ScalarKind, Value};
 use m1_core::{Field, Kind, Node};
@@ -37,12 +38,13 @@ use std::collections::{HashMap, HashSet};
 
 /// Everything an expression needs to evaluate against: the typed project model,
 /// the calibration values, the mutable value/state stores, the lexical context
-/// (enclosing group, backing function symbol, script name), and the tick `dt`.
+/// (enclosing group, backing function symbol, script name), evaluator time, and
+/// an optional hardware adapter.
 ///
 /// The per-expression value sink (the `Trace`) and user-function call wiring are
 /// later milestones; M4 carries only what literals/identifiers/operators/calls
 /// need. The borrow of `project`/`calib` is shared; `env`/`state` are exclusive.
-pub struct EvalCtx<'a> {
+pub struct EvalCtx<'a, 'h> {
     /// The typed symbol model (for name resolution and symbol kinds).
     pub project: &'a Project,
     /// Calibration values (parameter scalars + table cells).
@@ -58,8 +60,13 @@ pub struct EvalCtx<'a> {
     pub fn_symbol: Option<&'a str>,
     /// The current script's file name, for [`CallSite`] identity.
     pub script_name: &'a str,
-    /// The tick step in seconds (stateful operators advance by this).
-    pub dt: f64,
+    /// Deterministic evaluator timeline. Stateful operators advance by
+    /// [`EvalTime::step_s`]; hardware calls also receive the base-grid tick,
+    /// elapsed time, and base period.
+    pub time: EvalTime,
+    /// Optional typed hardware implementation. When absent, hardware calls
+    /// continue through deterministic `System` behavior and documented stubs.
+    pub hardware: Option<&'h mut dyn HardwareAdapter>,
     /// Every parsed script in the project, so an inline user-function call
     /// ([`crate::builtins::userfn`]) can find the backing `ParsedScript` of the
     /// callee symbol (the reverse of `function_symbol_for_script`). Threaded from
@@ -78,10 +85,10 @@ pub struct EvalCtx<'a> {
     /// runtime call cycle fails loud past a fixed bound rather than overflowing
     /// the stack (the upstream static check is T097; this is the runtime guard).
     pub depth: u32,
-    /// Optional per-expression / external-channel sink. When present, the call
-    /// evaluator records each builtin call's result value at its [`CallSite`],
-    /// and Tier-3 IO stubs flag the channels they externally drive. `None` in
-    /// unit tests that only want the returned value.
+    /// Optional per-expression, external-value, and hardware-provenance sink.
+    /// When present, the call evaluator records each builtin result at its
+    /// [`CallSite`] and hardware dispatch records the route that supplied it.
+    /// `None` in unit tests that only want the returned value.
     pub trace: Option<&'a mut crate::trace::Trace>,
 }
 
@@ -1304,7 +1311,7 @@ mod tests {
             }
         }
 
-        fn ctx(&mut self) -> EvalCtx<'_> {
+        fn ctx(&mut self) -> EvalCtx<'_, '_> {
             EvalCtx {
                 project: &self.project,
                 calib: &self.calib,
@@ -1313,7 +1320,8 @@ mod tests {
                 group: Some("Root.Demo"),
                 fn_symbol: Some("Root.Demo.Update"),
                 script_name: "Demo.Update.m1scr",
-                dt: 0.01,
+                time: crate::hardware::EvalTime::at_start(0.01),
+                hardware: None,
                 scripts: &[],
                 signature_m1_types: None,
                 object_rules: None,

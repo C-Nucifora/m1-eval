@@ -5,8 +5,8 @@
 //! target channel), the time grid (`duration_s` + `base_rate_hz`), the input
 //! sources for the channels the engine does not itself compute (constants or
 //! piecewise time series), any channel overrides that pin a value over the
-//! top of everything else, and any IO-call overrides (`[[io]]`) that drive a
-//! hardware-backed builtin read directly.
+//! top of everything else, and any hardware-call overrides (`[[io]]`) that
+//! drive a hardware-backed call directly.
 //!
 //! ## Wire formats
 //!
@@ -33,8 +33,14 @@
 //! const = 0.0
 //!
 //! [[io]]
-//! call = "CanComms.GetFloat"          # a Tier-3 IO call spelling, not a path
+//! call = "CanComms.GetFloat"          # wildcard for every matching call site
 //! series = [[0.0, 12.5], [0.5, 99.0]]
+//!
+//! [[io]]
+//! call = "CanComms.GetFloat"          # this occurrence only
+//! script = "Demo.Update.m1scr"
+//! offset = 418
+//! const = 7.5
 //! ```
 //!
 //! ## Time-series resampling
@@ -53,9 +59,11 @@
 //! Identifiers may contain spaces (`Cooling Fan.Output`); channel names are used
 //! verbatim as canonical-ish paths and never split on whitespace.
 
+use crate::env::CallSite;
 use crate::error::EvalError;
 use crate::value::{FixedPoint7dps, M1Scalar, Value};
 use serde::Deserialize;
+use std::collections::BTreeSet;
 
 /// Which runner a scenario drives, and the thing it targets.
 #[derive(Debug, Clone, PartialEq)]
@@ -113,19 +121,20 @@ impl InputSeries {
     }
 }
 
-/// One scenario-driven Tier-3 IO call override: the call spelling plus the
-/// value the call returns over time. Sampled per tick exactly like an input;
-/// the evaluator's IO dispatch consults these overrides before any documented
-/// or generic typed stub ([`crate::env::Env::io_override`]), so the scenario —
-/// not the offline default — supplies what the hardware "reads".
+/// One scenario-driven hardware-call override: the call name plus the value the
+/// call returns over time. The evaluator samples it per tick like an input and
+/// consults it before an external adapter or built-in fallback.
 #[derive(Debug, Clone, PartialEq)]
 pub struct IoSeries {
-    /// The IO call this drives, spelled `"Object.Method"` (e.g.
+    /// The hardware call this drives, spelled `"Object.Method"` (e.g.
     /// `"CanComms.GetFloat"`, `"System.FlashSize"`, `"DBC PC.Dash
-    /// Switches.Receive"`) — the same key the coverage report and trace use for
-    /// Tier-3 calls. It is a call spelling, not a symbol path: never
-    /// canonicalised, spaces preserved verbatim.
+    /// Switches.Receive"`). Dispatch tries the resolved canonical name and the
+    /// source spelling, with spaces preserved verbatim.
     pub call: String,
+    /// Exact call occurrence to drive. `None` is the backwards-compatible
+    /// wildcard which applies to every site of `call`. An exact selector wins
+    /// over the wildcard for the same call.
+    pub site: Option<CallSite>,
     /// Whether it is a constant or a time series.
     pub kind: InputKind,
 }
@@ -175,9 +184,8 @@ pub struct Scenario {
     /// Channels pinned to a constant or series, layered *over* the inputs and
     /// any computed value. Same shape as [`Scenario::inputs`].
     pub overrides: Vec<InputSeries>,
-    /// Scenario-driven Tier-3 IO call overrides (`[[io]]`): what a
-    /// hardware-backed builtin call returns, keyed by its `"Object.Method"`
-    /// spelling and resampled every tick. See [`IoSeries`].
+    /// Scenario-driven hardware-call overrides (`[[io]]`), keyed by
+    /// `"Object.Method"` and resampled every tick. See [`IoSeries`].
     pub io: Vec<IoSeries>,
     /// Whole-project mode only: substitute type-correct startup defaults for
     /// unseeded channel reads (each substitution is reported on the trace)
@@ -493,11 +501,17 @@ struct RawInput {
     series: Option<Vec<(f64, RawValue)>>,
 }
 
-/// A raw `[[io]]` entry: an IO call spelling plus exactly one of
-/// `const`/`series` — the same value shape as an input, keyed by `call`.
+/// A raw `[[io]]` entry: a hardware call name plus exactly one of
+/// `const`/`series`, with an optional exact call-site selector.
 #[derive(Debug, Deserialize)]
 struct RawIo {
     call: String,
+    /// Both fields select one exact call occurrence. Omitting both creates a
+    /// wildcard. Supplying only one is rejected.
+    #[serde(default)]
+    script: Option<String>,
+    #[serde(default)]
+    offset: Option<usize>,
     #[serde(default)]
     #[serde(rename = "const")]
     constant: Option<RawValue>,
@@ -669,6 +683,24 @@ impl RawScenario {
             .into_iter()
             .map(RawIo::into_io)
             .collect::<Result<Vec<_>, _>>()?;
+        let mut io_selectors = BTreeSet::new();
+        for entry in &io {
+            if !io_selectors.insert((entry.call.clone(), entry.site.clone())) {
+                let selector = match &entry.site {
+                    Some(site) => format!(
+                        "{} in {} at byte {}",
+                        entry.call,
+                        site.script(),
+                        site.offset()
+                    ),
+                    None => format!("{} at every call site", entry.call),
+                };
+                return Err(EvalError::UnsupportedConstruct {
+                    kind: format!("duplicate io selector {selector:?}"),
+                    at: 0,
+                });
+            }
+        }
         Ok(Scenario {
             mode,
             inputs,
@@ -731,9 +763,31 @@ impl RawInput {
 impl RawIo {
     fn into_io(self) -> Result<IoSeries, EvalError> {
         let kind = raw_kind("io", &self.call, self.constant, self.series)?;
+        let site = match (self.script, self.offset) {
+            (None, None) => None,
+            (Some(script), Some(offset)) if !script.trim().is_empty() => {
+                Some(CallSite::new(script, offset))
+            }
+            (Some(_), Some(_)) => {
+                return Err(EvalError::UnsupportedConstruct {
+                    kind: format!("io {:?} has an empty `script` selector", self.call),
+                    at: 0,
+                });
+            }
+            _ => {
+                return Err(EvalError::UnsupportedConstruct {
+                    kind: format!(
+                        "io {:?} must set both `script` and `offset`, or omit both for a wildcard",
+                        self.call
+                    ),
+                    at: 0,
+                });
+            }
+        };
         Ok(IoSeries {
             call: self.call,
             kind,
+            site,
         })
     }
 }
@@ -1045,6 +1099,8 @@ const = true
 
 [[io]]
 call = "System.FlashSize"
+script = "Clock.Update.m1scr"
+offset = 42
 series = [[0.0, 4194304], [0.5, 8388608]]
 "#;
         let sc = Scenario::from_toml_str(toml).expect("valid scenario");
@@ -1061,6 +1117,7 @@ series = [[0.0, 4194304], [0.5, 8388608]]
 
         // The series override steps by zero-order hold, like an input.
         let flash = sc.io.iter().find(|o| o.call == "System.FlashSize").unwrap();
+        assert_eq!(flash.site, Some(CallSite::new("Clock.Update.m1scr", 42)));
         assert_eq!(flash.sample(0.0), Value::m1_integer(4_194_304));
         assert_eq!(flash.sample(0.49), Value::m1_integer(4_194_304));
         assert_eq!(flash.sample(0.5), Value::m1_integer(8_388_608));
@@ -1090,6 +1147,39 @@ duration_s = 1.0
 call = "CanComms.GetFloat"
 "#;
         assert!(Scenario::from_toml_str(toml).is_err());
+    }
+
+    #[test]
+    fn io_site_selector_requires_script_and_offset_together() {
+        for selector in ["script = \"Demo.Update.m1scr\"", "offset = 12"] {
+            let toml = format!(
+                "mode = \"whole-project\"\nduration_s = 1.0\n\n[[io]]\ncall = \"System.FlashSize\"\n{selector}\nconst = 1\n"
+            );
+            let error = Scenario::from_toml_str(&toml).unwrap_err();
+            assert!(error.to_string().contains("both `script` and `offset`"));
+        }
+    }
+
+    #[test]
+    fn duplicate_io_selectors_fail_instead_of_overwriting() {
+        let toml = r#"
+mode = "whole-project"
+duration_s = 1.0
+
+[[io]]
+call = "System.FlashSize"
+script = "Demo.Update.m1scr"
+offset = 12
+const = 1
+
+[[io]]
+call = "System.FlashSize"
+script = "Demo.Update.m1scr"
+offset = 12
+const = 2
+"#;
+        let error = Scenario::from_toml_str(toml).unwrap_err();
+        assert!(error.to_string().contains("duplicate io selector"));
     }
 
     #[test]

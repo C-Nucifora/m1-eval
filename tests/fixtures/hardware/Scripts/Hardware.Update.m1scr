@@ -1,0 +1,7 @@
+// Synthetic hardware-boundary fixture. No proprietary content.
+Elapsed = System.ElapsedTime();
+Period = System.TickPeriod();
+Tick = System.Ticks();
+FlashSizeA = System.FlashSize();
+FlashSizeB = System.FlashSize();
+FlashFreeValue = System.FlashFree();

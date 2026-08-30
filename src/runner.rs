@@ -44,10 +44,11 @@ use crate::counterfactual::Override;
 use crate::env::{Env, StateStore};
 use crate::error::EvalError;
 use crate::expr::EvalCtx;
+use crate::hardware::{EvalTime, HardwareAdapter};
 use crate::ident::{Target, classify};
 use crate::loader::Loaded;
 use crate::log::Log;
-use crate::scenario::{InputSeries, RunMode, Scenario};
+use crate::scenario::{InputSeries, IoSeries, RunMode, Scenario};
 use crate::stmt::exec_script;
 use crate::summary::io_sets;
 use crate::trace::Trace;
@@ -74,6 +75,27 @@ struct Scheduled<'a> {
 /// input, or any evaluation error aborts the run rather than producing a
 /// partially-guessed trace.
 pub fn run(loaded: &Loaded, scenario: &Scenario) -> Result<Trace, EvalError> {
+    run_inner(loaded, scenario, None)
+}
+
+/// Run a scenario with a typed external hardware adapter.
+///
+/// Scenario call-site overrides still win. Calls not handled by `hardware`
+/// continue through deterministic `System` behavior, documented stubs, and the
+/// normal fail-loud boundary.
+pub fn run_with_adapter(
+    loaded: &Loaded,
+    scenario: &Scenario,
+    hardware: &mut dyn HardwareAdapter,
+) -> Result<Trace, EvalError> {
+    run_inner(loaded, scenario, Some(hardware))
+}
+
+fn run_inner(
+    loaded: &Loaded,
+    scenario: &Scenario,
+    hardware: Option<&mut dyn HardwareAdapter>,
+) -> Result<Trace, EvalError> {
     match &scenario.mode {
         RunMode::Function(name) => {
             // A single function has no schedule rate of its own; it runs every
@@ -86,7 +108,7 @@ pub fn run(loaded: &Loaded, scenario: &Scenario) -> Result<Trace, EvalError> {
                 sched: scheduled,
                 rate_hz: base,
             }];
-            tick_loop(loaded, scenario, &rated, base)
+            tick_loop(loaded, scenario, &rated, base, hardware)
         }
         RunMode::Cone(target) => {
             let base = require_base_rate(scenario)?;
@@ -98,7 +120,7 @@ pub fn run(loaded: &Loaded, scenario: &Scenario) -> Result<Trace, EvalError> {
                     rate_hz: base,
                 })
                 .collect();
-            tick_loop(loaded, scenario, &rated, base)
+            tick_loop(loaded, scenario, &rated, base, hardware)
         }
         RunMode::WholeProject => {
             // Enumerate every periodically-scheduled function, ordered
@@ -107,7 +129,7 @@ pub fn run(loaded: &Loaded, scenario: &Scenario) -> Result<Trace, EvalError> {
             // its own period as `dt`.
             let ordered = build_whole_project_schedule(loaded);
             let base = resolve_base_rate(scenario, &ordered)?;
-            tick_loop(loaded, scenario, &ordered, base)
+            tick_loop(loaded, scenario, &ordered, base, hardware)
         }
     }
 }
@@ -413,6 +435,7 @@ fn tick_loop(
     scenario: &Scenario,
     schedule: &[ScheduledRated],
     base_rate_hz: f64,
+    mut hardware: Option<&mut dyn HardwareAdapter>,
 ) -> Result<Trace, EvalError> {
     let ticks = tick_count(scenario.duration_s, base_rate_hz);
 
@@ -474,6 +497,10 @@ fn tick_loop(
     // hold from tick 0 on. dt is the base period — startup code has no rate of
     // its own, and its stateful operators see one nominal step.
     if !startup.is_empty() {
+        // Startup has no time-axis row. Capture hardware metadata separately so
+        // its provenance survives while startup channel/expression samples do
+        // not create columns that are one element ahead of the periodic grid.
+        let mut startup_trace = Trace::new();
         for (path, series) in &inputs {
             let value = crate::expr::coerce_for_channel(path, series.sample(0.0), &loaded.project)?;
             env.set(path.clone(), value);
@@ -482,9 +509,7 @@ fn tick_loop(
             let value = crate::expr::coerce_for_channel(path, series.sample(0.0), &loaded.project)?;
             env.set(path.clone(), value);
         }
-        for io in &scenario.io {
-            env.set_io_override(io.call.clone(), io.sample(0.0));
-        }
+        seed_io_overrides(&mut env, &scenario.io, 0.0);
         for sched in &startup {
             let root = sched.script.cst.root();
             let mut ctx = EvalCtx {
@@ -495,18 +520,21 @@ fn tick_loop(
                 group: sched.group.as_deref(),
                 fn_symbol: sched.fn_symbol.as_deref(),
                 script_name: &sched.script.name,
-                dt: 1.0 / base_rate_hz,
+                time: EvalTime::startup(1.0 / base_rate_hz),
+                hardware: match hardware.as_mut() {
+                    Some(hardware) => Some(&mut **hardware),
+                    None => None,
+                },
                 scripts: &loaded.scripts,
                 signature_m1_types: Some(&loaded.signature_m1_types),
                 object_rules: Some(&loaded.object_rules),
                 depth: 0,
-                // No trace: no tick is open yet, and record_channel appends
-                // blindly — a startup record would desync columns from the time
-                // axis. Startup writes surface via the tick-0 zero-order hold.
-                trace: None,
+                trace: Some(&mut startup_trace),
             };
             exec_script(&root, &mut ctx).map_err(|e| e.in_script(&sched.script.name, None))?;
         }
+        trace.external.extend(startup_trace.external);
+        trace.hardware.extend(startup_trace.hardware);
     }
 
     for i in 0..ticks {
@@ -525,13 +553,11 @@ fn tick_loop(
             let value = crate::expr::coerce_for_channel(path, series.sample(t), &loaded.project)?;
             env.set(path.clone(), value);
         }
-        // IO-call overrides are resampled on the same grid. The key is a call
-        // spelling (`"Object.Method"`), not a symbol path, so it is not
-        // canonicalised here. IO dispatch restores the sampled value to the
-        // method's declared M1 return family before script execution.
-        for io in &scenario.io {
-            env.set_io_override(io.call.clone(), io.sample(t));
-        }
+        // Hardware-call overrides are resampled on the same grid. Keep the
+        // scenario's spelling here; dispatch compares it with both the resolved
+        // canonical key and the source-spelled key. It then restores the sampled
+        // value to the method's declared M1 return family.
+        seed_io_overrides(&mut env, &scenario.io, t);
 
         // 2. Open the tick.
         trace.push_tick(t);
@@ -553,7 +579,11 @@ fn tick_loop(
                 group: sched.group.as_deref(),
                 fn_symbol: sched.fn_symbol.as_deref(),
                 script_name: &sched.script.name,
-                dt: plan.dt,
+                time: EvalTime::periodic(i as u64, t, 1.0 / base_rate_hz, plan.dt),
+                hardware: match hardware.as_mut() {
+                    Some(hardware) => Some(&mut **hardware),
+                    None => None,
+                },
                 scripts: &loaded.scripts,
                 signature_m1_types: Some(&loaded.signature_m1_types),
                 object_rules: Some(&loaded.object_rules),
@@ -591,6 +621,17 @@ fn tick_loop(
     }
 
     Ok(trace)
+}
+
+/// Sample wildcard and exact-site hardware overrides onto the current tick.
+fn seed_io_overrides(env: &mut Env, entries: &[IoSeries], t: f64) {
+    for entry in entries {
+        let value = entry.sample(t);
+        match &entry.site {
+            Some(site) => env.set_io_override_at(entry.call.clone(), site.clone(), value),
+            None => env.set_io_override(entry.call.clone(), value),
+        }
+    }
 }
 
 /// One function's per-tick execution plan: how many base ticks between runs and
@@ -707,8 +748,8 @@ fn tick_count(duration_s: f64, base_rate_hz: f64) -> usize {
 
 /// Canonicalise each scenario [`InputSeries`] channel to its project-symbol path
 /// so `Speed` and `Root.Demo.Speed` seed the same value-store key. A channel that
-/// does not resolve to a project symbol is kept verbatim (it may be a scenario-fed
-/// IO key or a not-yet-declared channel), so nothing is silently dropped.
+/// does not resolve to a project symbol is kept verbatim, so nothing is silently
+/// dropped.
 fn canonicalise<'a>(
     series: &'a [InputSeries],
     loaded: &Loaded,
@@ -1008,6 +1049,27 @@ pub fn run_counterfactual(
     overrides: &[Override],
     cfg: &CounterfactualCfg,
 ) -> Result<Trace, EvalError> {
+    run_counterfactual_inner(loaded, log, overrides, cfg, None)
+}
+
+/// Replay a counterfactual run with a typed external hardware adapter.
+pub fn run_counterfactual_with_adapter(
+    loaded: &Loaded,
+    log: &Log,
+    overrides: &[Override],
+    cfg: &CounterfactualCfg,
+    hardware: &mut dyn HardwareAdapter,
+) -> Result<Trace, EvalError> {
+    run_counterfactual_inner(loaded, log, overrides, cfg, Some(hardware))
+}
+
+fn run_counterfactual_inner(
+    loaded: &Loaded,
+    log: &Log,
+    overrides: &[Override],
+    cfg: &CounterfactualCfg,
+    mut hardware: Option<&mut dyn HardwareAdapter>,
+) -> Result<Trace, EvalError> {
     if cfg.base_rate_hz <= 0.0 {
         return Err(EvalError::UnsupportedConstruct {
             kind: format!(
@@ -1113,6 +1175,11 @@ pub fn run_counterfactual(
         //    the results are written together — so two overrides cannot observe one
         //    another's freshly-written value within the tick.
         let mut pending: Vec<(String, Value)> = Vec::with_capacity(prepared.len());
+        // Override expressions run before the tick opens. Capture only their
+        // source metadata in a temporary sink; channel and expression samples
+        // would otherwise sit one element ahead of the time axis.
+        let mut override_trace = Trace::new();
+        override_trace.push_tick(t);
         for ov in &prepared {
             let value = match ov {
                 PreparedOverride::Const { value, .. } => value.clone(),
@@ -1140,18 +1207,29 @@ pub fn run_counterfactual(
                         group: group.as_deref(),
                         fn_symbol: fn_symbol.as_deref(),
                         script_name: CF_OVERRIDE_SCRIPT,
-                        dt: 1.0 / base_rate_hz,
+                        time: EvalTime::periodic(
+                            i as u64,
+                            t,
+                            1.0 / base_rate_hz,
+                            1.0 / base_rate_hz,
+                        ),
+                        hardware: match hardware.as_mut() {
+                            Some(hardware) => Some(&mut **hardware),
+                            None => None,
+                        },
                         scripts: &loaded.scripts,
                         signature_m1_types: Some(&loaded.signature_m1_types),
                         object_rules: Some(&loaded.object_rules),
                         depth: 0,
-                        trace: None,
+                        trace: Some(&mut override_trace),
                     };
                     crate::expr::eval(&value_node, &mut ctx)?
                 }
             };
             pending.push((ov.channel().to_string(), value));
         }
+        trace.external.extend(override_trace.external);
+        trace.hardware.extend(override_trace.hardware);
         for (path, value) in pending {
             let value = crate::expr::coerce_for_channel(&path, value, &loaded.project)?;
             env.set(path, value);
@@ -1178,7 +1256,11 @@ pub fn run_counterfactual(
                 group: sched.group.as_deref(),
                 fn_symbol: sched.fn_symbol.as_deref(),
                 script_name: &sched.script.name,
-                dt: plan.dt,
+                time: EvalTime::periodic(i as u64, t, 1.0 / base_rate_hz, plan.dt),
+                hardware: match hardware.as_mut() {
+                    Some(hardware) => Some(&mut **hardware),
+                    None => None,
+                },
                 scripts: &loaded.scripts,
                 signature_m1_types: Some(&loaded.signature_m1_types),
                 object_rules: Some(&loaded.object_rules),

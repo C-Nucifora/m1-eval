@@ -29,7 +29,7 @@ m1-eval [--project P] [--config C]
 | `--log <PATH>` | Counterfactual replay: a recorded MoTeC log held as ground truth (`.csv`, or `.ld` with `--features ld`). Triggers a counterfactual run instead of a scenario run. |
 | `--override <CH=expr>` | Pin a logged channel to a constant or expression for the counterfactual run, recomputing only its downstream cone. Repeatable (override several channels). Requires `--log`. |
 | `--diff <PATH>` | Where to write the per-channel logged-vs-counterfactual delta. Format follows the extension (`.csv` / `.json`). Requires `--log`. |
-| `--coverage` | Print the coverage report (supported / assumed / stubbed / unsupported builtins and constructs, plus the per-function execution `Schedule:`) instead of, or alongside, a run. |
+| `--coverage` | Print the coverage report (supported / assumed / adapter-backed / stubbed / unsupported builtins and constructs, plus the per-function execution `Schedule:`) instead of, or alongside, a run. |
 | `--version`, `-V` | Print the version and exit `0`. |
 | `--help`, `-h` | Print usage and exit `0`. |
 
@@ -39,10 +39,11 @@ A run requires `--scenario` (to evaluate), `--log` (to replay a log), or
 declared in the scenario file; at most one may be given (combining two is a usage
 error, exit `2`). `--override` and `--diff` require `--log`.
 
-The `Supported` and `Assumed` buckets from `--coverage` distinguish a direct
-implementation from an explicit offline model. They are execution-route labels,
-not evidence maturity: both remain **Assumed** maturity until compared with
-captured M1 output. See the
+The `Supported`, `Assumed`, `Adapter-backed`, and `Stubbed` buckets distinguish a
+direct implementation, an explicit offline model, required external hardware
+metadata, and a typed offline fallback. They are execution-route labels, not
+evidence maturity. `Supported` and `Assumed` remain **Assumed** maturity until
+compared with captured M1 output. See the
 [README maturity contract](../README.md#maturity-contract) for the evidence
 labels and current status of each evaluator area.
 
@@ -80,11 +81,8 @@ channel = "Root.Engine.Output"
 const = 0.0
 
 # IO overrides drive a hardware-backed builtin call directly: the value the
-# call returns, keyed by its "Object.Method" spelling (a call key, not a
-# channel path — never canonicalised). Resampled every tick like an input,
-# and consulted before any documented or generic typed stub — so a scenario
-# can feed a CAN read (`Receive`/`GetBit`) or a system read (FlashSize)
-# without seeding the decoded channels around the reading script.
+# call returns, keyed by its "Object.Method" spelling. The entry below is a
+# wildcard for every matching call site and is resampled every tick.
 [[io]]
 call = "DBC PC.Dash Switches.Receive"
 const = true
@@ -92,6 +90,21 @@ const = true
 [[io]]
 call = "System.FlashSize"
 const = 8388608
+
+# Add both `script` and `offset` to select one exact CallSite. An exact entry
+# wins over the wildcard for the same call. The offset is the call expression's
+# zero-based UTF-8 byte offset in the named script.
+[[io]]
+call = "System.FlashSize"
+script = "Engine.Update.m1scr"
+offset = 418
+const = 4194304
+
+# FlashSize and FlashFree are required metadata. Supply them in the scenario;
+# unlike ordinary hardware reads, neither falls back to zero.
+[[io]]
+call = "System.FlashFree"
+const = 1048576
 ```
 
 Identifiers may contain spaces (e.g. `Cooling Fan.Output`); channel names are
@@ -100,7 +113,10 @@ used verbatim and never split on whitespace, only on `.` for path segments.
 ## Output
 
 - **JSON** (`--out trace.json`, or no `--out`):
-  `{ "time": [...], "channels": { path: [...] }, "external": [...] }`. The
+  `{ "time": [...], "channels": { path: [...] }, "external": [...], "hardware": [...] }`.
+  Each `hardware` record names the resolved receiver, source spelling, method,
+  script, byte offset, and selected route (`scenario-exact`,
+  `scenario-wildcard`, `adapter`, `system-model`, or `generic-stub`). The
   `external` list names channels whose values were externally driven rather than
   computed, including scenario inputs, Tier-3 stubs, parameter defaults, opt-in
   table fallbacks, and opt-in defaults for unseeded channels. JSON has no
@@ -118,7 +134,7 @@ These follow the shared toolchain contract (`m1-tools/docs/cli.md`):
 | Code | Meaning |
 | --- | --- |
 | `0` | Success — the run produced a trace, or the coverage report printed. |
-| `1` | The engine ran and **has something to report**: a project/calibration that would not load, a scenario that would not parse, or a fail-loud evaluation error (an unsupported builtin, a missing calibration value, an unresolved symbol, a missing input). |
+| `1` | The engine ran and **has something to report**: a project/calibration that would not load, a scenario that would not parse, or a fail-loud evaluation error (an unsupported builtin, missing hardware metadata, a missing calibration value, an unresolved symbol, or a missing input). |
 | `2` | A **usage error** — an unrecognised flag, no resolvable project, or neither `--scenario` nor `--coverage` given. |
 
 So `$? != 0` means "do not trust the output." Unsupported behavior fails loud.

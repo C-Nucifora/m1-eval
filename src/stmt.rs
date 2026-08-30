@@ -753,7 +753,7 @@ mod tests {
             }
         }
 
-        fn ctx(&mut self) -> EvalCtx<'_> {
+        fn ctx(&mut self) -> EvalCtx<'_, '_> {
             EvalCtx {
                 project: &self.project,
                 calib: &self.calib,
@@ -762,7 +762,8 @@ mod tests {
                 group: Some("Root.Demo"),
                 fn_symbol: Some("Root.Demo.Update"),
                 script_name: "Demo.Update.m1scr",
-                dt: 0.01,
+                time: crate::hardware::EvalTime::at_start(0.01),
+                hardware: None,
                 scripts: &[],
                 signature_m1_types: None,
                 object_rules: None,
@@ -1153,7 +1154,8 @@ mod tests {
             group: Some("Root.Demo"),
             fn_symbol: Some("Root.Demo.Update"),
             script_name: &script.name,
-            dt: 0.01,
+            time: crate::hardware::EvalTime::at_start(0.01),
+            hardware: None,
             scripts: &[],
             signature_m1_types: Some(&loaded.signature_m1_types),
             object_rules: Some(&loaded.object_rules),

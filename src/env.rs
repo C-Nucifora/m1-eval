@@ -32,7 +32,7 @@ use std::collections::HashMap;
 /// A stable identity for one stateful-operator occurrence in the source: the
 /// script basename and the byte offset of its call node. Stable across ticks for
 /// a fixed parse, so a `Filter`/`Integral`/`Delay` keeps its state between ticks.
-#[derive(Debug, Clone, PartialEq, Eq, Hash)]
+#[derive(Debug, Clone, PartialEq, Eq, PartialOrd, Ord, Hash)]
 pub struct CallSite(pub String, pub usize);
 
 impl CallSite {
@@ -163,11 +163,15 @@ pub struct Env {
     /// `static local` values, keyed by owning-function path + variable name.
     /// Persist across function entry/exit for the whole run.
     pub statics: HashMap<String, Value>,
-    /// Scenario-fed values for Tier-3 IO calls, keyed by the call spelling
-    /// `"Object.Method"` (e.g. `"CanComms.GetFloat"`). When a key is present the
-    /// IO stub returns it instead of a documented default — this is how a
-    /// scenario externally drives a hardware-backed builtin. Empty by default.
+    /// Wildcard scenario values for hardware calls, keyed by a canonical or
+    /// source-spelled `"Object.Method"` name. A matching value precedes the
+    /// adapter and every built-in fallback. Empty by default.
     pub io_overrides: HashMap<String, Value>,
+    /// Scenario values for one exact hardware call occurrence, keyed by its
+    /// call name plus [`CallSite`]. These take precedence over wildcard
+    /// [`Env::io_overrides`] so two calls to the same method can be driven
+    /// independently without inventing receiver aliases.
+    pub io_site_overrides: HashMap<(String, CallSite), Value>,
     /// The current function frame's return-value slot — the `Out` object an M1
     /// user function assigns to (`Out = <expr>;`). A single slot per *active*
     /// frame: `userfn::call` saves the caller's slot, clears it, runs the callee
@@ -229,14 +233,25 @@ impl Env {
         self.statics.insert(static_key(fn_symbol, var), value);
     }
 
-    /// A scenario-fed override for a Tier-3 IO call `"Object.Method"`, if set.
+    /// A wildcard scenario override for a hardware call name, if set.
     pub fn io_override(&self, call: &str) -> Option<&Value> {
         self.io_overrides.get(call)
     }
 
-    /// Seed a scenario value for a Tier-3 IO call `"Object.Method"`.
+    /// A scenario override for one exact hardware call occurrence.
+    pub fn io_override_at(&self, call: &str, site: &CallSite) -> Option<&Value> {
+        self.io_site_overrides
+            .get(&(call.to_string(), site.clone()))
+    }
+
+    /// Seed a wildcard scenario value for a hardware call name.
     pub fn set_io_override(&mut self, call: impl Into<String>, value: Value) {
         self.io_overrides.insert(call.into(), value);
+    }
+
+    /// Seed a scenario value for one exact hardware call occurrence.
+    pub fn set_io_override_at(&mut self, call: impl Into<String>, site: CallSite, value: Value) {
+        self.io_site_overrides.insert((call.into(), site), value);
     }
 
     /// Write the current frame's `Out` return slot — the value an `Out = <expr>;`

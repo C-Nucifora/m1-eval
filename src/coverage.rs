@@ -3,12 +3,13 @@
 //! engine *supports*.
 //!
 //! Before a run, a user wants to know which parts of their project the evaluator
-//! implements, which it will only stub (Tier-3 IO, externally
-//! driven), and which it cannot handle at all (and would fail loud on). This
-//! module walks every script's CST and answers that, statically:
+//! implements, which hardware metadata needs a scenario or adapter, which calls
+//! have a typed offline fallback, and which it cannot handle at all. This module
+//! walks every script's CST and answers that statically:
 //!
 //! - every call is resolved through the same project-aware capability model as
-//!   runtime dispatch — supported, assumed, stubbed, or unsupported;
+//!   runtime dispatch: supported, assumed, adapter-backed, stubbed, or
+//!   unsupported;
 //! - every statement/expression construct `Kind` is classified against the set
 //!   the evaluator implements.
 //!
@@ -54,15 +55,17 @@ pub struct UnresolvedTrigger {
     pub reason: String,
 }
 
-/// The coverage analysis result: which used items are supported, stubbed, or
-/// unsupported. Each list is de-duplicated and sorted for a deterministic report.
+/// The coverage analysis result. Each list is de-duplicated and sorted for a
+/// deterministic report.
 #[derive(Debug, Clone, Default, PartialEq)]
 pub struct CoverageReport {
     /// Items dispatched through a direct evaluator implementation.
     pub supported: Vec<CoverageItem>,
     /// Items dispatched through an explicit deterministic offline model.
     pub assumed: Vec<CoverageItem>,
-    /// Items handled as documented/scenario-fed stubs (Tier-3 IO).
+    /// Hardware metadata which requires a scenario or adapter value.
+    pub adapter_backed: Vec<CoverageItem>,
+    /// Hardware calls handled by documented typed offline fallbacks.
     pub stubbed: Vec<CoverageItem>,
     /// Items the engine does not handle (would fail loud at runtime).
     pub unsupported: Vec<CoverageItem>,
@@ -121,10 +124,7 @@ impl CoverageReport {
         project: Option<&Project>,
         triggers: Option<&TriggerMap>,
     ) -> CoverageReport {
-        let mut supported = BTreeSet::new();
-        let mut assumed = BTreeSet::new();
-        let mut stubbed = BTreeSet::new();
-        let mut unsupported = BTreeSet::new();
+        let mut buckets = CoverageBuckets::default();
         for script in scripts {
             // The script's enclosing group, for resolving group-relative callees.
             let group = project.and_then(|p| p.group_for_script(&script.name));
@@ -136,28 +136,35 @@ impl CoverageReport {
                 scripts,
             };
             let mut locals = HashMap::new();
-            walk(
-                &script.cst.root(),
-                &cx,
-                &mut locals,
-                &mut supported,
-                &mut assumed,
-                &mut stubbed,
-                &mut unsupported,
-            );
+            walk(&script.cst.root(), &cx, &mut locals, &mut buckets);
         }
+        let CoverageBuckets {
+            mut supported,
+            mut assumed,
+            mut adapter_backed,
+            mut stubbed,
+            unsupported,
+        } = buckets;
         // The public item identity is its displayed `(name, kind)`, so occurrences
         // in different scripts collapse into one line. Keep the weakest capability
         // seen for that identity. A supported occurrence must never hide another
         // occurrence that will be assumed, stubbed, or rejected at runtime.
-        stubbed.retain(|i| !unsupported.contains(i));
-        assumed.retain(|i| !unsupported.contains(i) && !stubbed.contains(i));
-        supported
-            .retain(|i| !unsupported.contains(i) && !stubbed.contains(i) && !assumed.contains(i));
+        adapter_backed.retain(|i| !unsupported.contains(i));
+        stubbed.retain(|i| !unsupported.contains(i) && !adapter_backed.contains(i));
+        assumed.retain(|i| {
+            !unsupported.contains(i) && !adapter_backed.contains(i) && !stubbed.contains(i)
+        });
+        supported.retain(|i| {
+            !unsupported.contains(i)
+                && !adapter_backed.contains(i)
+                && !stubbed.contains(i)
+                && !assumed.contains(i)
+        });
         let roles = build_trigger_roles(triggers);
         CoverageReport {
             supported: supported.into_iter().collect(),
             assumed: assumed.into_iter().collect(),
+            adapter_backed: adapter_backed.into_iter().collect(),
             stubbed: stubbed.into_iter().collect(),
             unsupported: unsupported.into_iter().collect(),
             schedule: build_schedule(scripts, project, triggers),
@@ -175,6 +182,7 @@ impl CoverageReport {
         let mut out = String::new();
         render_section(&mut out, "Supported", &self.supported);
         render_section(&mut out, "Assumed", &self.assumed);
+        render_section(&mut out, "Adapter-backed", &self.adapter_backed);
         render_section(&mut out, "Stubbed", &self.stubbed);
         render_section(&mut out, "Unsupported", &self.unsupported);
         render_schedule(
@@ -375,15 +383,22 @@ struct WalkCtx<'a> {
     scripts: &'a [ParsedScript],
 }
 
+/// Accumulators shared by the recursive coverage walk.
+#[derive(Default)]
+struct CoverageBuckets {
+    supported: BTreeSet<CoverageItem>,
+    assumed: BTreeSet<CoverageItem>,
+    adapter_backed: BTreeSet<CoverageItem>,
+    stubbed: BTreeSet<CoverageItem>,
+    unsupported: BTreeSet<CoverageItem>,
+}
+
 /// Recursively walk a node, bucketing builtin calls and reportable constructs.
 fn walk(
     node: &Node,
     cx: &WalkCtx,
     locals: &mut HashMap<String, crate::value::Value>,
-    supported: &mut BTreeSet<CoverageItem>,
-    assumed: &mut BTreeSet<CoverageItem>,
-    stubbed: &mut BTreeSet<CoverageItem>,
-    unsupported: &mut BTreeSet<CoverageItem>,
+    buckets: &mut CoverageBuckets,
 ) {
     // Calls use exactly the same project-aware capability model as runtime.
     if node.kind() == Kind::CallExpression
@@ -415,10 +430,11 @@ fn walk(
                 kind: ItemKind::Builtin,
             };
             match support {
-                BuiltinSupport::Direct => supported.insert(item),
-                BuiltinSupport::Modeled => assumed.insert(item),
-                BuiltinSupport::Stubbed => stubbed.insert(item),
-                BuiltinSupport::Unsupported => unsupported.insert(item),
+                BuiltinSupport::Direct => buckets.supported.insert(item),
+                BuiltinSupport::Modeled => buckets.assumed.insert(item),
+                BuiltinSupport::AdapterBacked => buckets.adapter_backed.insert(item),
+                BuiltinSupport::Stubbed => buckets.stubbed.insert(item),
+                BuiltinSupport::Unsupported => buckets.unsupported.insert(item),
             };
         }
     }
@@ -430,9 +446,9 @@ fn walk(
             kind: ItemKind::Construct,
         };
         if SUPPORTED_CONSTRUCTS.contains(&node.kind()) {
-            supported.insert(item);
+            buckets.supported.insert(item);
         } else {
-            unsupported.insert(item);
+            buckets.unsupported.insert(item);
         }
     }
 
@@ -441,7 +457,7 @@ fn walk(
     // bare and member calls see the same shadowing that dispatch does.
     if node.kind() == Kind::LocalDeclaration {
         for child in node.named_children() {
-            walk(&child, cx, locals, supported, assumed, stubbed, unsupported);
+            walk(&child, cx, locals, buckets);
         }
         let is_static = node
             .children()
@@ -457,7 +473,7 @@ fn walk(
     }
 
     for child in node.named_children() {
-        walk(&child, cx, locals, supported, assumed, stubbed, unsupported);
+        walk(&child, cx, locals, buckets);
     }
 }
 
@@ -509,6 +525,35 @@ Output = i;
         // Without a project, coverage cannot prove that Demo.Map is a table.
         let unsupported: Vec<&str> = report.unsupported.iter().map(|i| i.name.as_str()).collect();
         assert!(unsupported.contains(&"Demo.Map.Lookup"), "{unsupported:?}");
+    }
+
+    #[test]
+    fn system_model_metadata_and_generic_stubs_use_distinct_buckets() {
+        let scripts = scripts_from(
+            "local elapsed = System.ElapsedTime();\nlocal flash = System.FlashSize();\nlocal can = CanComms.GetFloat(1u, 2);\n",
+        );
+        let report = CoverageReport::analyse(&scripts);
+        assert!(
+            report
+                .assumed
+                .iter()
+                .any(|item| item.name == "System.ElapsedTime"),
+            "{report:?}"
+        );
+        assert!(
+            report
+                .adapter_backed
+                .iter()
+                .any(|item| item.name == "System.FlashSize"),
+            "{report:?}"
+        );
+        assert!(
+            report
+                .stubbed
+                .iter()
+                .any(|item| item.name == "CanComms.GetFloat"),
+            "{report:?}"
+        );
     }
 
     #[test]
@@ -779,7 +824,8 @@ Output = i;
             group: Some("Root.Caller"),
             fn_symbol: Some("Root.Caller.Update"),
             script_name: "Caller.Update.m1scr",
-            dt: 0.01,
+            time: crate::hardware::EvalTime::at_start(0.01),
+            hardware: None,
             scripts: &scripts,
             signature_m1_types: Some(&loaded.signature_m1_types),
             object_rules: Some(&loaded.object_rules),
