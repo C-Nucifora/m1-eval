@@ -84,54 +84,40 @@ pub fn dispatch(
         CallRoute::PureLibrary(library_object) => {
             validate_arity(&library_object, object, method, args.len())?;
             match library_object.as_str() {
-                // Issue #38 migrated Calculate and Convert onto M1 scalars.
                 "Calculate" => {
                     calculate::call(method, args)?.ok_or_else(|| unsupported(object, method))
                 }
                 "Convert" => {
                     convert::call(method, args)?.ok_or_else(|| unsupported(object, method))
                 }
-                // Limit remains on the named legacy compatibility boundary
-                // until its own migration slice.
-                "Limit" => {
-                    let legacy_args = legacy_builtin_arguments(args);
-                    match limit::call(method, &legacy_args)? {
-                        Some(value) => value.restore_legacy_builtin_result(),
-                        None => Err(unsupported(object, method)),
-                    }
-                }
+                "Limit" => limit::call(method, args)?.ok_or_else(|| unsupported(object, method)),
                 _ => unreachable!(),
             }
         }
         CallRoute::StatefulLibrary(library_object) => {
             validate_arity(&library_object, object, method, args.len())?;
-            let legacy_args = legacy_builtin_arguments(args);
-            match stateful::call(&library_object, method, &legacy_args, site, ctx)? {
-                Some(v) => v.restore_legacy_builtin_result(),
+            match stateful::call(&library_object, method, args, site, ctx)? {
+                Some(v) => Ok(v),
                 None => Err(unsupported(object, method)),
             }
         }
         CallRoute::IoLibrary(library_object) => {
-            let legacy_args = legacy_builtin_arguments(args);
-            io_stub::call(&library_object, object, method, &legacy_args, ctx)?
-                .restore_legacy_builtin_result()
+            io_stub::call(&library_object, object, method, args, ctx)
         }
         CallRoute::MathAssumption(library_object) => {
             validate_arity(&library_object, object, method, args.len())?;
-            let legacy_args = legacy_builtin_arguments(args);
-            let result = match method {
+            match method {
                 "atan2" => {
-                    let y = legacy_args[0].as_f64()?;
-                    let x = legacy_args[1].as_f64()?;
-                    Ok(Value::Float(y.atan2(x)))
+                    let y = args[0].m1_scalar()?.as_f32();
+                    let x = args[1].m1_scalar()?.as_f32();
+                    Ok(Value::m1_float(y.atan2(x)))
                 }
                 // `Math.fabs` also appears in real ECU scripts (AV-M1
                 // Control.Update): a plain absolute value, same routing
                 // rationale as `atan2`.
-                "fabs" => Ok(Value::Float(legacy_args[0].as_f64()?.abs())),
+                "fabs" => Ok(Value::m1_float(args[0].m1_scalar()?.as_f32().abs())),
                 _ => Err(unsupported(object, method)),
-            }?;
-            result.restore_legacy_builtin_result()
+            }
         }
         CallRoute::EnumAsInteger => {
             validate_object_arity(object, method, args.len())?;
@@ -166,29 +152,14 @@ pub fn dispatch(
         CallRoute::Timer => {
             validate_object_arity(object, method, args.len())?;
             let object_key = timer_object_key(object, ctx);
-            let legacy_args = legacy_builtin_arguments(args);
-            match stateful::timer(method, &legacy_args, object_key, ctx)? {
-                Some(value) => value.restore_legacy_builtin_result(),
+            match stateful::timer(method, args, object_key, ctx)? {
+                Some(value) => Ok(value),
                 None => Err(unsupported(object, method)),
             }
         }
-        CallRoute::ProjectIo => {
-            let legacy_args = legacy_builtin_arguments(args);
-            io_stub::project_object_call(object, method, &legacy_args, ctx)?
-                .restore_legacy_builtin_result()
-        }
+        CallRoute::ProjectIo => io_stub::project_object_call(object, method, args, ctx),
         CallRoute::Unsupported => Err(unsupported(object, method)),
     }
-}
-
-/// Widen M1 scalar arguments for builtin engines that have not migrated yet.
-/// Core expressions, Calculate, Convert, tables, project writes, and user
-/// functions do not use this compatibility path.
-fn legacy_builtin_arguments(args: &[Value]) -> Vec<Value> {
-    args.iter()
-        .cloned()
-        .map(Value::into_legacy_builtin_argument)
-        .collect()
 }
 
 /// Dispatch a bare user-function call such as `Update(...)`. Bare callees cannot
@@ -1167,7 +1138,7 @@ mod tests {
             h.call(
                 "Debounce",
                 "Filter",
-                &[Value::Bool(true), Value::Float(0.1)]
+                &[Value::Bool(true), Value::m1_float(0.1)]
             )
             .unwrap(),
             Value::Bool(true)
@@ -1356,7 +1327,7 @@ mod tests {
     #[test]
     fn set_on_a_table_is_unsupported() {
         let mut h = Harness::new();
-        match h.call("Map", "Set", &[Value::Int(1)]) {
+        match h.call("Map", "Set", &[Value::m1_integer(1)]) {
             Err(EvalError::UnsupportedBuiltin { object, method }) => {
                 assert_eq!(object, "Map");
                 assert_eq!(method, "Set");
@@ -2098,8 +2069,9 @@ mod tests {
         let remaining = h
             .call("Startup Delay", "Remaining", &[])
             .unwrap()
-            .as_f64()
-            .unwrap();
+            .m1_scalar()
+            .unwrap()
+            .as_f64();
         assert!((remaining - 0.02).abs() < 1e-7);
         match h.call("Precharge State", "Start", &[Value::m1_float(0.03)]) {
             Err(EvalError::UnsupportedBuiltin { .. }) => {}

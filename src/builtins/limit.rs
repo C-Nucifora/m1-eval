@@ -6,9 +6,9 @@
 //! - `Limit.Range(x, lo, hi)` — clamp into `[lo, hi]`.
 //!
 //! Each returns `Integer|FloatingPoint`: the result is integral when every
-//! operand is integral (signed/unsigned chosen by `numeric_join`) and float
-//! when any operand is float. Comparison is done in `f64`. Semantics are
-//! paraphrased from our understanding of the M1 library, not copied.
+//! operand is integral (signed/unsigned chosen by `numeric_join`) and binary32
+//! when any operand is floating. Comparisons and results stay in the selected M1
+//! family. Semantics are paraphrased from our understanding of the M1 library.
 
 use crate::error::EvalError;
 use crate::value::{M1Scalar, Value};
@@ -33,49 +33,93 @@ pub fn call(method: &str, args: &[Value]) -> Result<Option<Value>, EvalError> {
 /// `bound` (a lower bound); false ⇒ cap `x` down to at most `bound` (an upper
 /// bound). The result is retyped under the join of `x` and `bound`.
 fn clamp_one(x: &Value, bound: &Value, floor: bool) -> Result<Value, EvalError> {
-    let xf = x.as_f64()?;
-    let bf = bound.as_f64()?;
-    let target = numeric_join(value_type(x), value_type(bound));
-    let out = if floor { xf.max(bf) } else { xf.min(bf) };
-    retype_numeric(out, target)
+    match numeric_join(value_type(x), value_type(bound)) {
+        ValueType::Float => {
+            let x = x.m1_scalar()?.as_f32();
+            let bound = bound.m1_scalar()?.as_f32();
+            Ok(Value::m1_float(if floor {
+                x.max(bound)
+            } else {
+                x.min(bound)
+            }))
+        }
+        ValueType::Unsigned => {
+            let x = as_u32_bits(x)?;
+            let bound = as_u32_bits(bound)?;
+            Ok(Value::m1_unsigned(if floor {
+                x.max(bound)
+            } else {
+                x.min(bound)
+            }))
+        }
+        ValueType::Integer => {
+            let x = as_i32(x)?;
+            let bound = as_i32(bound)?;
+            Ok(Value::m1_integer(if floor {
+                x.max(bound)
+            } else {
+                x.min(bound)
+            }))
+        }
+        _ => Err(non_numeric()),
+    }
 }
 
 /// Clamp `x` into `[lo, hi]`. The result kind is the join of all three operands.
 /// A reversed range (`lo > hi`) clamps to `hi` (the upper bound wins), which is
 /// our documented choice for malformed ranges.
 fn clamp_range(x: &Value, lo: &Value, hi: &Value) -> Result<Value, EvalError> {
-    let xf = x.as_f64()?;
-    let lof = lo.as_f64()?;
-    let hif = hi.as_f64()?;
-    let clamped = xf.max(lof).min(hif);
     let target = numeric_join(numeric_join(value_type(x), value_type(lo)), value_type(hi));
-    retype_numeric(clamped, target)
-}
-
-/// Re-express a clamped `f64` under the target numeric kind so an all-integer
-/// clamp stays integral.
-fn retype_numeric(out: f64, target: ValueType) -> Result<Value, EvalError> {
     match target {
-        ValueType::Float => Ok(Value::Float(out)),
-        ValueType::Unsigned => Ok(Value::Uint(out as u64)),
-        ValueType::Integer => Ok(Value::Int(out as i64)),
-        _ => Err(EvalError::TypeError {
-            detail: "Limit on non-numeric operands".to_string(),
-        }),
+        ValueType::Float => Ok(Value::m1_float(
+            x.m1_scalar()?
+                .as_f32()
+                .max(lo.m1_scalar()?.as_f32())
+                .min(hi.m1_scalar()?.as_f32()),
+        )),
+        ValueType::Unsigned => Ok(Value::m1_unsigned(
+            as_u32_bits(x)?.max(as_u32_bits(lo)?).min(as_u32_bits(hi)?),
+        )),
+        ValueType::Integer => Ok(Value::m1_integer(
+            as_i32(x)?.max(as_i32(lo)?).min(as_i32(hi)?),
+        )),
+        _ => Err(non_numeric()),
     }
 }
 
 fn value_type(v: &Value) -> ValueType {
     match v {
         Value::Bool(_) => ValueType::Boolean,
-        Value::Int(_) => ValueType::Integer,
-        Value::Uint(_) => ValueType::Unsigned,
-        Value::Float(_) => ValueType::Float,
         Value::M1(M1Scalar::Integer(_)) => ValueType::Integer,
         Value::M1(M1Scalar::UnsignedInteger(_)) => ValueType::Unsigned,
         Value::M1(M1Scalar::FloatingPoint(_) | M1Scalar::FixedPoint7dps(_)) => ValueType::Float,
         Value::Enum { id, .. } => ValueType::Enum(*id),
         Value::Str(_) => ValueType::String,
+    }
+}
+
+fn as_i32(value: &Value) -> Result<i32, EvalError> {
+    match value.m1_scalar()? {
+        M1Scalar::Integer(value) => Ok(value),
+        other => Err(EvalError::TypeError {
+            detail: format!("{other:?} is not an M1 Integer"),
+        }),
+    }
+}
+
+fn as_u32_bits(value: &Value) -> Result<u32, EvalError> {
+    match value.m1_scalar()? {
+        M1Scalar::Integer(value) => Ok(value as u32),
+        M1Scalar::UnsignedInteger(value) => Ok(value),
+        other => Err(EvalError::TypeError {
+            detail: format!("{other:?} is not an integral M1 value"),
+        }),
+    }
+}
+
+fn non_numeric() -> EvalError {
+    EvalError::TypeError {
+        detail: "Limit on non-numeric operands".to_string(),
     }
 }
 
@@ -89,14 +133,26 @@ mod tests {
 
     #[test]
     fn limit_max_caps_above() {
-        assert_eq!(ok("Max", &[Value::Int(8), Value::Int(5)]), Value::Int(5));
-        assert_eq!(ok("Max", &[Value::Int(3), Value::Int(5)]), Value::Int(3));
+        assert_eq!(
+            ok("Max", &[Value::m1_integer(8), Value::m1_integer(5)]),
+            Value::m1_integer(5)
+        );
+        assert_eq!(
+            ok("Max", &[Value::m1_integer(3), Value::m1_integer(5)]),
+            Value::m1_integer(3)
+        );
     }
 
     #[test]
     fn limit_min_floors_below() {
-        assert_eq!(ok("Min", &[Value::Int(2), Value::Int(5)]), Value::Int(5));
-        assert_eq!(ok("Min", &[Value::Int(8), Value::Int(5)]), Value::Int(8));
+        assert_eq!(
+            ok("Min", &[Value::m1_integer(2), Value::m1_integer(5)]),
+            Value::m1_integer(5)
+        );
+        assert_eq!(
+            ok("Min", &[Value::m1_integer(8), Value::m1_integer(5)]),
+            Value::m1_integer(8)
+        );
     }
 
     #[test]
@@ -104,36 +160,55 @@ mod tests {
         assert_eq!(
             ok(
                 "Range",
-                &[Value::Float(7.0), Value::Float(0.0), Value::Float(5.0)]
+                &[
+                    Value::m1_float(7.0),
+                    Value::m1_float(0.0),
+                    Value::m1_float(5.0)
+                ]
             ),
-            Value::Float(5.0)
+            Value::m1_float(5.0)
         );
         assert_eq!(
             ok(
                 "Range",
-                &[Value::Float(-1.0), Value::Float(0.0), Value::Float(5.0)]
+                &[
+                    Value::m1_float(-1.0),
+                    Value::m1_float(0.0),
+                    Value::m1_float(5.0)
+                ]
             ),
-            Value::Float(0.0)
+            Value::m1_float(0.0)
         );
         assert_eq!(
             ok(
                 "Range",
-                &[Value::Float(3.0), Value::Float(0.0), Value::Float(5.0)]
+                &[
+                    Value::m1_float(3.0),
+                    Value::m1_float(0.0),
+                    Value::m1_float(5.0)
+                ]
             ),
-            Value::Float(3.0)
+            Value::m1_float(3.0)
         );
         // All-integer range stays integral.
         assert_eq!(
-            ok("Range", &[Value::Int(9), Value::Int(0), Value::Int(5)]),
-            Value::Int(5)
+            ok(
+                "Range",
+                &[
+                    Value::m1_integer(9),
+                    Value::m1_integer(0),
+                    Value::m1_integer(5)
+                ]
+            ),
+            Value::m1_integer(5)
         );
     }
 
     #[test]
     fn float_operand_promotes() {
         assert_eq!(
-            ok("Max", &[Value::Int(8), Value::Float(5.0)]),
-            Value::Float(5.0)
+            ok("Max", &[Value::m1_integer(8), Value::m1_float(5.0)]),
+            Value::m1_float(5.0)
         );
     }
 

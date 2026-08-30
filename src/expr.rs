@@ -113,9 +113,8 @@ fn eval_number(node: &Node) -> Result<Value, EvalError> {
     match type_of_number_literal(text) {
         ValueType::Unsigned => parse_uint(text).map(Value::m1_unsigned),
         ValueType::Float => {
-            let host = text.parse::<f64>().map_err(|_| bad_number(text))?;
-            let narrowed = host as f32;
-            if !host.is_finite() || narrowed.is_infinite() {
+            let narrowed = text.parse::<f32>().map_err(|_| bad_number(text))?;
+            if !narrowed.is_finite() {
                 Err(bad_number(text))
             } else {
                 Ok(Value::m1_float(narrowed))
@@ -531,28 +530,23 @@ fn project_constant_value(symbol: &Symbol, project: &Project) -> Result<Option<V
         let normalized = declared.to_ascii_lowercase();
         let value = match normalized.as_str() {
             "f32" | "f64" => {
-                let host = text.parse::<f64>().map_err(|_| invalid())?;
-                let narrowed = host as f32;
-                if !host.is_finite() || narrowed.is_infinite() {
+                let narrowed = text.parse::<f32>().map_err(|_| invalid())?;
+                if !narrowed.is_finite() {
                     return Err(invalid());
                 }
                 Value::m1_float(narrowed)
             }
             "s8" | "s16" | "s32" | "s64" => text
-                .parse::<i64>()
+                .parse::<i32>()
                 .ok()
-                .and_then(|value| i32::try_from(value).ok())
                 .map(Value::m1_integer)
                 .ok_or_else(invalid)?,
             "u8" | "u16" | "u32" | "u64" => parse_uint(text)
                 .map(Value::m1_unsigned)
                 .map_err(|_| invalid())?,
             "fixedpoint7dps" | "fixed7dps" => {
-                let host = text.parse::<f64>().map_err(|_| invalid())?;
-                let scalar = Value::Float(host)
-                    .try_as_m1_scalar_for(M1ScalarKind::FixedPoint7dps)
-                    .map_err(|_| invalid())?;
-                Value::M1(scalar)
+                let fixed = FixedPoint7dps::parse_decimal(text).ok_or_else(invalid)?;
+                Value::M1(M1Scalar::FixedPoint7dps(fixed))
             }
             "bool" => match text.to_ascii_lowercase().as_str() {
                 "true" => Value::Bool(true),
@@ -588,9 +582,8 @@ fn project_constant_value(symbol: &Symbol, project: &Project) -> Result<Option<V
     let value = match type_of_number_literal(text) {
         ValueType::Unsigned => parse_uint(text).map(Value::m1_unsigned),
         ValueType::Float => {
-            let host = text.parse::<f64>().map_err(|_| invalid())?;
-            let narrowed = host as f32;
-            if !host.is_finite() || narrowed.is_infinite() {
+            let narrowed = text.parse::<f32>().map_err(|_| invalid())?;
+            if !narrowed.is_finite() {
                 return Err(invalid());
             }
             Ok(Value::m1_float(narrowed))
@@ -710,9 +703,6 @@ pub(crate) fn coerce_for_declared_type(
 
     let scalar = match &value {
         Value::M1(scalar) => *scalar,
-        Value::Int(_) | Value::Uint(_) | Value::Float(_) => {
-            return Err(value.m1_scalar().unwrap_err());
-        }
         _ => {
             return Err(declared_type_error(
                 target,
@@ -727,13 +717,12 @@ pub(crate) fn coerce_for_declared_type(
         ValueType::Unsigned => coerce_for_scalar_kind(target, value, M1ScalarKind::UnsignedInteger),
         ValueType::Float => coerce_for_scalar_kind(target, value, M1ScalarKind::FloatingPoint),
         ValueType::Enum(id) => {
-            let n = scalar.as_f64();
             let member = project
                 .symbols()
                 .enum_type(id)
                 .members
                 .iter()
-                .find(|(_, declared)| (*declared as f64) == n)
+                .find(|(_, declared)| scalar_matches_enum_value(scalar, *declared))
                 .map(|(name, _)| name.clone());
             match member {
                 Some(member) => Ok(Value::Enum { id, member }),
@@ -749,6 +738,19 @@ pub(crate) fn coerce_for_declared_type(
             &value,
             declared_type_name(declared),
         )),
+    }
+}
+
+fn scalar_matches_enum_value(scalar: M1Scalar, declared: i64) -> bool {
+    match scalar {
+        M1Scalar::Integer(value) => i64::from(value) == declared,
+        M1Scalar::UnsignedInteger(value) => u32::try_from(declared) == Ok(value),
+        M1Scalar::FloatingPoint(value) => i32::try_from(declared)
+            .ok()
+            .is_some_and(|declared| f64::from(declared) == f64::from(value)),
+        M1Scalar::FixedPoint7dps(value) => declared
+            .checked_mul(FixedPoint7dps::SCALE)
+            .is_some_and(|raw| raw == i64::from(value.raw())),
     }
 }
 
@@ -840,7 +842,7 @@ fn eval_unary(node: &Node, ctx: &mut EvalCtx) -> Result<Value, EvalError> {
     if op.kind() == Kind::Minus
         && operand.kind() == Kind::Number
         && type_of_number_literal(operand.text().trim()) == ValueType::Integer
-        && operand.text().trim().parse::<i64>().ok() == Some(i64::from(i32::MAX) + 1)
+        && operand.text().trim().parse::<u32>().ok() == Some(i32::MAX as u32 + 1)
     {
         return Ok(Value::m1_integer(i32::MIN));
     }
@@ -1146,9 +1148,6 @@ fn bit_i32(op: Kind, a: i32, b: u32) -> i32 {
 fn value_type(v: &Value) -> ValueType {
     match v {
         Value::Bool(_) => ValueType::Boolean,
-        Value::Int(_) => ValueType::Integer,
-        Value::Uint(_) => ValueType::Unsigned,
-        Value::Float(_) => ValueType::Float,
         Value::M1(M1Scalar::Integer(_)) => ValueType::Integer,
         Value::M1(M1Scalar::UnsignedInteger(_)) => ValueType::Unsigned,
         Value::M1(M1Scalar::FloatingPoint(_) | M1Scalar::FixedPoint7dps(_)) => ValueType::Float,
@@ -1366,6 +1365,22 @@ mod tests {
     }
 
     #[test]
+    fn float_to_enum_coercion_requires_an_exact_integer_value() {
+        assert!(scalar_matches_enum_value(
+            M1Scalar::FloatingPoint(16_777_216.0),
+            16_777_216
+        ));
+        assert!(!scalar_matches_enum_value(
+            M1Scalar::FloatingPoint(16_777_216.0),
+            16_777_217
+        ));
+        assert!(!scalar_matches_enum_value(
+            M1Scalar::FloatingPoint(i32::MAX as f32),
+            i64::from(i32::MAX)
+        ));
+    }
+
+    #[test]
     fn project_target_metadata_distinguishes_float_and_fixed_point() {
         let h = Harness::new();
         let fixed = Value::M1(M1Scalar::FixedPoint7dps(FixedPoint7dps::from_raw(
@@ -1444,7 +1459,7 @@ mod tests {
             Value::M1(M1Scalar::FixedPoint7dps(FixedPoint7dps::ZERO))
         );
 
-        // A legacy-untyped calibration cell parses as binary32. It cannot
+        // An untyped calibration cell parses as binary32. It cannot
         // silently change an explicitly fixed parameter's storage family.
         h.calib
             .params

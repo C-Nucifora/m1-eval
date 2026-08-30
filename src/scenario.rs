@@ -380,9 +380,9 @@ pub(crate) fn parse_time_series_csv(
                 continue;
             }
             let explicit_non_finite = explicit_non_finite_float(trimmed);
-            let host = match explicit_non_finite {
+            let narrowed = match explicit_non_finite {
                 Some(value) => value,
-                None => trimmed.parse::<f64>().map_err(|_| EvalError::TypeError {
+                None => trimmed.parse::<f32>().map_err(|_| EvalError::TypeError {
                     detail: format!(
                         "CSV row {} column {:?} value {trimmed:?} is not numeric",
                         row_idx + 2,
@@ -390,8 +390,7 @@ pub(crate) fn parse_time_series_csv(
                     ),
                 })?,
             };
-            let narrowed = host as f32;
-            if explicit_non_finite.is_none() && (!host.is_finite() || narrowed.is_infinite()) {
+            if explicit_non_finite.is_none() && !narrowed.is_finite() {
                 return Err(EvalError::TypeError {
                     detail: format!(
                         "CSV row {} column {:?} value {trimmed:?} is outside M1 binary32 range",
@@ -412,11 +411,11 @@ pub(crate) fn parse_time_series_csv(
 /// Keeping this lexical check separate lets CSV preserve real binary32
 /// sentinels while still rejecting a finite decimal such as `1e9999` that
 /// overflowed during host parsing.
-fn explicit_non_finite_float(text: &str) -> Option<f64> {
+fn explicit_non_finite_float(text: &str) -> Option<f32> {
     match text.to_ascii_lowercase().as_str() {
-        "nan" | "+nan" | "-nan" => Some(f64::NAN),
-        "inf" | "+inf" | "infinity" | "+infinity" => Some(f64::INFINITY),
-        "-inf" | "-infinity" => Some(f64::NEG_INFINITY),
+        "nan" | "+nan" | "-nan" => Some(f32::NAN),
+        "inf" | "+inf" | "infinity" | "+infinity" => Some(f32::INFINITY),
+        "-inf" | "-infinity" => Some(f32::NEG_INFINITY),
         _ => None,
     }
 }
@@ -508,7 +507,7 @@ struct RawIo {
 
 /// A raw scalar value from the wire: a typed M1 object, number, boolean, or
 /// string. TOML/JSON numbers come through as either integer or float and use the
-/// legacy-compatible M1 narrowing rule.
+/// M1-width narrowing rule at the wire boundary.
 #[derive(Debug, Deserialize)]
 #[serde(untagged)]
 enum RawValue {
@@ -521,8 +520,8 @@ enum RawValue {
 }
 
 /// Explicit typed scenario syntax for callers that must distinguish all four
-/// M1 numeric families. Existing bare numbers remain the legacy-compatible
-/// syntax and narrow according to their JSON/TOML number family.
+/// M1 numeric families. Bare wire numbers narrow according to their JSON/TOML
+/// number family.
 #[derive(Debug, Deserialize)]
 #[serde(deny_unknown_fields)]
 struct RawM1Value {
@@ -1141,7 +1140,7 @@ const = { fixed_raw = 12345678 }
     }
 
     #[test]
-    fn legacy_scenario_numbers_narrow_or_return_clear_width_errors() {
+    fn bare_scenario_numbers_narrow_or_return_clear_width_errors() {
         let underflow = r#"{
             "mode": "whole-project",
             "duration_s": 0.1,

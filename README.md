@@ -68,9 +68,15 @@ dependency-cone runners.
   (`duration_s` + `base_rate_hz`), and input sources (constants or `(t, value)`
   time series), with an optional CSV time-series sidecar.
 
-### Pure numeric builtin behavior
+### Runtime numeric behavior
 
-Pure `Calculate` and `Convert` calls use the M1-width scalar model throughout.
+Script execution has four numeric forms: binary32 `FloatingPoint`, signed
+32-bit `Integer`, unsigned 32-bit `UnsignedInteger`, and signed 32-bit
+`FixedPoint7dps` storage scaled by 10^-7. Expressions, builtins, stateful
+operator state, tables, IO defaults, and trace columns keep those forms. A
+scenario, log, or calibration parser may use a wider host type while reading its
+wire format, but it narrows or rejects the value before evaluation starts.
+
 The implemented behavior is still **Assumed** under the maturity contract above:
 
 - `Calculate.Bias(a, b, bias)` maps `-1` to the lower argument, `0` to their

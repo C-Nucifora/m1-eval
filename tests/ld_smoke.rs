@@ -156,7 +156,8 @@ fn real_ld_header_and_channels_decode() {
         let mut all_finite = true;
         for (_, v) in points {
             let x = v
-                .as_f64()
+                .m1_scalar()
+                .map(m1_eval::M1Scalar::as_f64)
                 .unwrap_or_else(|e| panic!("channel {:?} value not numeric: {e}", series.channel));
             total_values += 1;
             if !x.is_finite() {
@@ -202,7 +203,7 @@ fn real_ld_header_and_channels_decode() {
             continue;
         };
         for (t, v) in points {
-            if let Ok(x) = v.as_f64()
+            if let Ok(x) = v.m1_scalar().map(m1_eval::M1Scalar::as_f64)
                 && x.is_finite()
             {
                 sample_report = Some((series.channel.clone(), *t, x));

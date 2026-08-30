@@ -25,7 +25,7 @@
 //! fixed parse). The concrete per-operator state lives in [`OpState`], filled in
 //! by the M6 stateful-builtin milestone; this module provides the keyed slot.
 
-use crate::value::Value;
+use crate::value::{M1Scalar, Value};
 use m1_core::Node;
 use std::collections::HashMap;
 
@@ -79,18 +79,18 @@ pub enum OpState {
     Uninit,
     /// First-order filter family (`Filter.FirstOrder/Maximum/Minimum`): the
     /// previous filtered output `y[n-1]`.
-    Filter { y: f64 },
+    Filter { y: f32 },
     /// `Integral.Normal`: the running clamped accumulator and the previous input
     /// (for trapezoidal area).
-    Integral { acc: f64, prev_x: f64 },
+    Integral { acc: f32, prev_x: f32 },
     /// `Derivative.{Normal,Filtered}`: the previous input, plus the previous
     /// filtered-derivative output for the `Filtered` variant.
-    Derivative { prev_x: f64, prev_d: f64 },
+    Derivative { prev_x: f32, prev_d: f32 },
     /// `Derivative.Adaptive`: the input value at the last accepted update, the
     /// previous emitted derivative, and the time elapsed since the last update.
     DerivativeAdaptive {
-        last_x: f64,
-        prev_d: f64,
+        last_x: f32,
+        prev_d: f32,
         elapsed: f64,
     },
     /// Debounce/Delay timer family (`Delay.Rising/Falling`, `Debounce.*`,
@@ -102,10 +102,14 @@ pub enum OpState {
         candidate: bool,
         held: f64,
     },
-    /// `Change.{By,Up,Down}`: the previous numeric argument value, plus a timer
-    /// and pending flag for the filtered overloads.
+    /// `Debounce.Filter`: its binary32 filtered level and committed boolean.
+    /// This is separate from [`OpState::Timed`] so a script value never hides in
+    /// a host-width timing field.
+    DebounceFilter { output: bool, level: f32 },
+    /// `Change.{By,Up,Down}`, `Delay.Stable`, and `Calculate.Stable`: the exact
+    /// previous M1 scalar, plus a timer and pending/output flag.
     ChangeBy {
-        prev_x: f64,
+        prev_x: M1Scalar,
         held: f64,
         pending: bool,
     },
@@ -275,10 +279,10 @@ mod tests {
     fn set_get_roundtrip_on_spaced_path() {
         let mut env = Env::new();
         // M1 identifiers may contain spaces — the whole path is one key.
-        env.set("Root.A.Cooling Fan.Output", Value::Float(1.5));
+        env.set("Root.A.Cooling Fan.Output", Value::m1_float(1.5));
         assert_eq!(
             env.get("Root.A.Cooling Fan.Output"),
-            Some(&Value::Float(1.5))
+            Some(&Value::m1_float(1.5))
         );
         // A different spelling (split on space) must NOT collide.
         assert_eq!(env.get("Root.A.Cooling"), None);
@@ -288,9 +292,9 @@ mod tests {
     fn locals_clear_on_leave_function_but_statics_persist() {
         let mut env = Env::new();
         env.enter_function();
-        env.set_local("scaled", Value::Int(3));
-        env.set_static("Root.Demo.Update", "accum", Value::Float(10.0));
-        assert_eq!(env.get_local("scaled"), Some(&Value::Int(3)));
+        env.set_local("scaled", Value::m1_integer(3));
+        env.set_static("Root.Demo.Update", "accum", Value::m1_float(10.0));
+        assert_eq!(env.get_local("scaled"), Some(&Value::m1_integer(3)));
 
         env.leave_function();
         // Locals are gone.
@@ -298,7 +302,7 @@ mod tests {
         // The static survives.
         assert_eq!(
             env.get_static("Root.Demo.Update", "accum"),
-            Some(&Value::Float(10.0))
+            Some(&Value::m1_float(10.0))
         );
 
         // Re-entering keeps the static available, fresh locals.
@@ -306,7 +310,7 @@ mod tests {
         assert_eq!(env.get_local("scaled"), None);
         assert_eq!(
             env.get_static("Root.Demo.Update", "accum"),
-            Some(&Value::Float(10.0))
+            Some(&Value::m1_float(10.0))
         );
     }
 
@@ -316,10 +320,10 @@ mod tests {
         // Unassigned by default.
         assert_eq!(env.get_out(), None);
         // A body assigns Out; the slot holds it.
-        env.set_out(Value::Float(6.0));
-        assert_eq!(env.get_out(), Some(&Value::Float(6.0)));
+        env.set_out(Value::m1_float(6.0));
+        assert_eq!(env.get_out(), Some(&Value::m1_float(6.0)));
         // Clearing returns the prior value and empties the slot.
-        assert_eq!(env.clear_out(), Some(Value::Float(6.0)));
+        assert_eq!(env.clear_out(), Some(Value::m1_float(6.0)));
         assert_eq!(env.get_out(), None);
         // Clearing an empty slot returns None.
         assert_eq!(env.clear_out(), None);
@@ -328,27 +332,27 @@ mod tests {
     #[test]
     fn out_slot_is_independent_of_locals_and_statics() {
         let mut env = Env::new();
-        env.set_local("y", Value::Int(7));
-        env.set_out(Value::Int(99));
+        env.set_local("y", Value::m1_integer(7));
+        env.set_out(Value::m1_integer(99));
         // Leaving a function clears locals but does NOT touch the out slot — the
         // caller (`userfn::call`) owns save/restore of the out slot explicitly.
         env.leave_function();
         assert_eq!(env.get_local("y"), None);
-        assert_eq!(env.get_out(), Some(&Value::Int(99)));
+        assert_eq!(env.get_out(), Some(&Value::m1_integer(99)));
     }
 
     #[test]
     fn statics_of_different_functions_do_not_collide() {
         let mut env = Env::new();
-        env.set_static("Root.Demo.Update", "x", Value::Int(1));
-        env.set_static("Root.Other.Update", "x", Value::Int(2));
+        env.set_static("Root.Demo.Update", "x", Value::m1_integer(1));
+        env.set_static("Root.Other.Update", "x", Value::m1_integer(2));
         assert_eq!(
             env.get_static("Root.Demo.Update", "x"),
-            Some(&Value::Int(1))
+            Some(&Value::m1_integer(1))
         );
         assert_eq!(
             env.get_static("Root.Other.Update", "x"),
-            Some(&Value::Int(2))
+            Some(&Value::m1_integer(2))
         );
     }
 

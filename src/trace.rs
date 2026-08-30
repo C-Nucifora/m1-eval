@@ -218,9 +218,6 @@ fn m1_scalar_json(value: M1Scalar) -> String {
 fn value_json(v: &Value) -> String {
     match v {
         Value::Bool(b) => b.to_string(),
-        Value::Int(x) => x.to_string(),
-        Value::Uint(x) => x.to_string(),
-        Value::Float(x) => f64_json(*x),
         Value::M1(value) => m1_scalar_json(*value),
         Value::Enum { member, .. } => json_string(member),
         Value::Str(s) => json_string(s),
@@ -231,9 +228,6 @@ fn value_json(v: &Value) -> String {
 fn value_csv(v: &Value) -> String {
     match v {
         Value::Bool(b) => b.to_string(),
-        Value::Int(x) => x.to_string(),
-        Value::Uint(x) => x.to_string(),
-        Value::Float(x) => f64_text(*x),
         Value::M1(value) => m1_scalar_text(*value),
         Value::Enum { member, .. } => member.clone(),
         Value::Str(s) => s.clone(),
@@ -273,14 +267,14 @@ mod tests {
     fn push_ticks_and_record_channels_align_to_time() {
         let mut tr = Trace::new();
         tr.push_tick(0.0);
-        tr.record_channel("Root.Demo.Out", Value::Float(1.0));
+        tr.record_channel("Root.Demo.Out", Value::m1_float(1.0));
         tr.push_tick(0.1);
-        tr.record_channel("Root.Demo.Out", Value::Float(2.0));
+        tr.record_channel("Root.Demo.Out", Value::m1_float(2.0));
 
         assert_eq!(tr.time, vec![0.0, 0.1]);
         assert_eq!(
             tr.channels.get("Root.Demo.Out").unwrap(),
-            &vec![Value::Float(1.0), Value::Float(2.0)]
+            &vec![Value::m1_float(1.0), Value::m1_float(2.0)]
         );
         // Column length tracks the time axis.
         assert_eq!(tr.channels["Root.Demo.Out"].len(), tr.time.len());
@@ -291,10 +285,13 @@ mod tests {
         let mut tr = Trace::new();
         let site = ("Demo.Update.m1scr".to_string(), 42);
         tr.push_tick(0.0);
-        tr.record_expr(site.clone(), Value::Int(7));
+        tr.record_expr(site.clone(), Value::m1_integer(7));
         tr.push_tick(0.1);
-        tr.record_expr(site.clone(), Value::Int(8));
-        assert_eq!(tr.exprs[&site], vec![Value::Int(7), Value::Int(8)]);
+        tr.record_expr(site.clone(), Value::m1_integer(8));
+        assert_eq!(
+            tr.exprs[&site],
+            vec![Value::m1_integer(7), Value::m1_integer(8)]
+        );
     }
 
     #[test]
@@ -309,9 +306,9 @@ mod tests {
     fn to_csv_shape_has_header_and_rows() {
         let mut tr = Trace::new();
         tr.push_tick(0.0);
-        tr.record_channel("Out", Value::Float(1.0));
+        tr.record_channel("Out", Value::m1_float(1.0));
         tr.push_tick(0.1);
-        tr.record_channel("Out", Value::Float(2.0));
+        tr.record_channel("Out", Value::m1_float(2.0));
 
         let csv = tr.to_csv();
         let lines: Vec<&str> = csv.lines().collect();
@@ -326,7 +323,7 @@ mod tests {
     fn to_json_is_deterministic_and_well_formed() {
         let mut tr = Trace::new();
         tr.push_tick(0.0);
-        tr.record_channel("B", Value::Int(2));
+        tr.record_channel("B", Value::m1_integer(2));
         tr.record_channel("A", Value::Bool(true));
         tr.mark_external("A");
         let json = tr.to_json();
@@ -360,20 +357,19 @@ mod tests {
     #[test]
     fn non_finite_floats_serialize_as_valid_json_nulls() {
         let mut tr = Trace::new();
-        for (legacy, m1) in [
+        for (time, m1) in [
             (f64::NAN, f32::NAN),
             (f64::INFINITY, f32::INFINITY),
             (f64::NEG_INFINITY, f32::NEG_INFINITY),
         ] {
-            tr.push_tick(legacy);
-            tr.record_channel("Legacy", Value::Float(legacy));
-            tr.record_channel("M1", Value::M1(M1Scalar::FloatingPoint(m1)));
+            tr.push_tick(time);
+            tr.record_channel("M1", Value::m1_float(m1));
         }
 
         let json = tr.to_json();
         assert_eq!(
             json,
-            "{\"time\":[null,null,null],\"channels\":{\"Legacy\":[null,null,null],\"M1\":[null,null,null]},\"external\":[]}"
+            "{\"time\":[null,null,null],\"channels\":{\"M1\":[null,null,null]},\"external\":[]}"
         );
         let parsed: serde_json::Value =
             serde_json::from_str(&json).expect("trace output must be valid JSON");
