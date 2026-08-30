@@ -483,10 +483,21 @@ fn bound_scalar(
             M1Scalar::UnsignedInteger(value)
         }
         M1ScalarKind::FixedPoint7dps => {
-            let scaled = bound * FixedPoint7dps::SCALE as f64;
-            if !scaled.is_finite() {
-                return Err(invalid());
+            let family_min = FixedPoint7dps::from_raw(i32::MIN).as_f64();
+            let family_max = FixedPoint7dps::from_raw(i32::MAX).as_f64();
+            match side {
+                BoundSide::Lower if bound <= family_min => {
+                    return Ok(M1Scalar::FixedPoint7dps(FixedPoint7dps::from_raw(i32::MIN)));
+                }
+                BoundSide::Lower if bound > family_max => return Err(invalid()),
+                BoundSide::Upper if bound < family_min => return Err(invalid()),
+                BoundSide::Upper if bound >= family_max => {
+                    return Ok(M1Scalar::FixedPoint7dps(FixedPoint7dps::from_raw(i32::MAX)));
+                }
+                _ => {}
             }
+            let scaled = bound * FixedPoint7dps::SCALE as f64;
+            debug_assert!(scaled.is_finite(), "in-domain Fixed7 bound must scale");
             let min_raw = i64::from(i32::MIN);
             let max_raw = i64::from(i32::MAX);
             let mut raw = scaled.round().clamp(min_raw as f64, max_raw as f64) as i64;
@@ -674,8 +685,8 @@ mod tests {
             (
                 "fixed",
                 ValidationRule::MinMax {
-                    min: -1_000.0,
-                    max: 1_000.0,
+                    min: -1.0e308,
+                    max: 1.0e308,
                 },
                 M1Scalar::FixedPoint7dps(FixedPoint7dps::ZERO),
             ),
