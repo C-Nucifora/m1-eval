@@ -28,9 +28,9 @@ use std::path::{Path, PathBuf};
 
 use m1_core::{Field, Kind, Node};
 use m1_eval::{
-    AdapterReply, Engine, Env, EvalCtx, EvalError, EvalTime, FixedPoint7dps, HardwareAdapter,
-    HardwareCall, HardwareValueSource, InputKind, InputSeries, Loaded, M1Scalar, Scenario,
-    StateStore, Trace, Value, eval, io_sets, load,
+    AdapterReply, Engine, Env, EvalCtx, EvalError, FixedPoint7dps, HardwareAdapter, HardwareCall,
+    HardwareValueSource, InputKind, InputSeries, Loaded, M1Scalar, Scenario, StateStore, Trace,
+    Value, eval, io_sets, load,
 };
 use m1_typecheck::parsed::ParsedScript;
 use m1_typecheck::symbols::{Symbol, SymbolKind};
@@ -569,8 +569,7 @@ fn evaluate_smoke_expression(
         group,
         fn_symbol,
         script_name: &script.name,
-        time: EvalTime::at_start(0.001),
-        hardware: None,
+        dt: 0.001,
         scripts: &loaded.scripts,
         signature_m1_types: Some(&loaded.signature_m1_types),
         object_rules: Some(&loaded.object_rules),
