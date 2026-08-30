@@ -116,7 +116,9 @@ pub enum OpState {
     /// `Change.{To,From,Either}`: the previous boolean condition, plus a timer
     /// for the filtered overloads.
     ChangeEdge { prev: bool, held: f64 },
-    /// A countdown `Timer` object: the remaining time and whether it is running.
+    /// A countdown `Timer` object. While running, `remaining` stores its
+    /// absolute evaluator-timeline deadline; while stopped, it stores the
+    /// frozen duration returned by `Remaining`.
     Timer { remaining: f64, running: bool },
     /// `System.ElapsedTime`: evaluator time when this exact call site last ran.
     /// Each execution returns the interval from this timestamp, then replaces it.

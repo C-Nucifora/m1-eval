@@ -31,9 +31,9 @@ do not compare computed channel values with captured M1 results.
 | Advertised area | State | Current contract |
 | --- | --- | --- |
 | Expressions, statements, enums, and inline user functions | **Assumed** | Covered by unit and synthetic-project tests. M1 evaluation results have not been captured for comparison. |
-| `.m1cfg` parameters and 1/2/3-D table lookup | **Assumed** | Parsing, interpolation, and edge clamping use synthetic fixtures. Use the matching calibration file for actual values. Without it, parameters use typed external defaults. Table `.Lookup()` and `.Get()` fail in strict modes; whole-project mode may opt in to an external `0.0` fallback. |
+| `.m1cfg` parameters and 1/2/3-D table lookup | **Assumed** | The reader honors explicit `Site="x,y,z"` coordinates with X changing fastest, enum axes, and each project's clamp or extrapolation flags. Synthetic vectors cover exact sites, interpolation, every boundary, and malformed tables. No M1 Sim table capture is available yet. Use the matching calibration for actual values. Without it, parameters use typed external defaults. Table `.Lookup()` and `.Get()` fail in strict modes; whole-project mode may opt in to an external `0.0` fallback. |
 | `Calculate.*`, `Limit.*`, `Convert.*`, `UnixTime.*`, enum conversions, core value-object methods, and table methods | **Assumed** | Implemented methods have hand-derived or independent-reference tests. `UnixTime` uses deterministic Gregorian/POSIX arithmetic and evaluator-local timezone state; it never reads the host clock or timezone. `AsString`, `Validate`, `Constrain`, `GetUnscheduled`, and `Set` resolve against eligible receiver classes; channel `Set` applies its project validation range before writing. `--coverage` remains authoritative for the methods a project uses. |
-| Filters, integrals, derivatives, debounce, delay, change detection, timers, and `static local` state | **Assumed** | Update laws and startup behavior are explicit implementation assumptions with hand-derived tests, not M1 value comparisons. |
+| Filters, integrals, derivatives, debounce, delay, change detection, timers, and `static local` state | **Assumed** | Update laws and startup behavior are explicit implementation assumptions with hand-derived tests, not M1 value comparisons. Timer countdowns use absolute evaluator time: `Remaining` is a read-only observation, while `Start`, `Stop`, and `Reset` are the only state transitions. |
 | `CanComms.*`, `Serial.*`, `System.*`, `Logging.*`, DBC objects, and other hardware-backed calls | **Assumed / Stubbed** | Each call crosses a typed adapter boundary with its resolved receiver, source call site, arguments, and evaluator time. Exact-site scenario values take precedence over wildcard values and an attached adapter. `System.ElapsedTime` reports the interval since that call site last ran. Its first tick-zero call returns zero, while a site first reached later uses its function step. Tick calls use the deterministic base timeline. `System.FlashSize` and `System.FlashFree` require scenario or adapter data; they never become a dangerous zero. Remaining unhandled calls use documented typed stubs or fail loud. |
 | Scenario parsing, tick grids, trace output, and `--coverage` | **Assumed** | These are deterministic m1-eval contracts tested with synthetic data. A `Supported` coverage entry means implemented, not M1-verified. |
 | Typed conformance fixture parser and runner | **Assumed** | Synthetic fixtures cover typed values, project hashes, initial-state reset, tolerances, and mismatch reporting. No genuine M1 Sim capture is committed yet, so this runner does not make another area Verified by itself. |
@@ -52,7 +52,9 @@ dependency-cone runners.
   logical, bitwise), ternary, member access, enums, `if/else`, `when/is`,
   `expand/to`, `local` / `static local`.
 - **Table lookup** — 1/2/3-D linear interpolation over `.m1cfg` calibration
-  cells, with clamping at the axis edges.
+  cells. Body sites use X-fastest M1 coordinates. Numeric boundaries clamp by
+  default and extrapolate only when the project enables that end. Enum axes
+  select calibrated values exactly.
 - **Tier-1 direct builtins** — `Calculate.*`, `Limit.*`, `Convert.*`,
   deterministic `UnixTime.*`, and table `.Lookup()`.
 - **Tier-2 stateful builtins** (the hard core) — `Filter.FirstOrder`,
@@ -134,10 +136,15 @@ The multi-rate model:
   the fastest rate) is **rejected loudly** rather than rounded. Each function
   then runs every `base_rate_hz / rate_hz` ticks: a 100 Hz function on a 100 Hz
   base runs every tick, a 50 Hz function every other tick.
-- **Rate-correct `dt`.** A function's stateful operators (`Integral.Normal`,
-  filters, derivatives, timers) are stepped by *its own* period
+- **Rate-correct `dt`.** A function's sampled stateful operators
+  (`Integral.Normal`, filters, derivatives) are stepped by *its own* period
   (`1 / rate_hz`) — a 50 Hz integrator accumulates with `dt = 0.02`, not the
-  base `dt`, so time-domain operators use the configured function period.
+  base `dt`. Timer objects instead retain an absolute deadline on the same
+  evaluator timeline, so `Remaining` observes elapsed time without advancing
+  the timer merely because it was read. Direct library users can carry that
+  timeline through `eval_at_time`, `exec_at_time`, `exec_script_at_time`,
+  `builtins::dispatch_at_time`, or `builtins::userfn::call_at_time`; the older
+  entry points remain tick-zero compatibility wrappers.
 - **Zero-order hold between ticks.** A channel a function did not write this
   tick keeps its last value (the shared value store carries it forward), so a
   slow channel holds steady between its updates while fast channels move every
@@ -259,13 +266,16 @@ m1-eval --project Project.m1prj --coverage
 # synthetic runner tests, not M1 compatibility evidence.
 m1-eval \
   --conformance tests/fixtures/conformance/synthetic-mini.toml \
-  --conformance tests/fixtures/conformance/synthetic-initial-state.toml
+  --conformance tests/fixtures/conformance/synthetic-initial-state.toml \
+  --conformance tests/fixtures/conformance/synthetic-tables.toml
 ```
 
 `--project` defaults to the nearest `Project.m1prj` upward (or `$M1_PROJECT`).
 See [`docs/cli.md`](docs/cli.md) for the full flag list, scenario format, and
 exit-code contract. [`docs/conformance.md`](docs/conformance.md) defines the
 golden-vector schema and the M1 Sim capture procedure.
+[`docs/table-conformance.md`](docs/table-conformance.md) records the table
+layout, boundary, malformed-data, and table-specific evidence contracts.
 
 The real-project smoke tests remain read-only and keep proprietary files out of
 the repository. Point each variable at a corpus repository root, version

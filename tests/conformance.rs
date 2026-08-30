@@ -82,11 +82,12 @@ fn committed_synthetic_fixtures_pass_without_claiming_capture_evidence() {
     let paths = vec![
         fixture("synthetic-mini.toml"),
         fixture("synthetic-initial-state.toml"),
+        fixture("synthetic-tables.toml"),
         fixture("synthetic-types.toml"),
     ];
     let reports = run_conformance_suite(&paths, ConformanceOptions::default())
         .expect("synthetic conformance fixtures pass");
-    assert_eq!(reports.len(), 3);
+    assert_eq!(reports.len(), 4);
     assert!(
         reports
             .iter()

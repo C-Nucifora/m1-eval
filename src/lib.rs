@@ -7,9 +7,10 @@ pub mod value;
 pub use value::{FixedPoint7dps, M1Scalar, M1ScalarKind, Value};
 
 pub mod calib;
-pub use calib::{CalTable, Calibration};
+pub use calib::{AxisExtrapolation, CalAxis, CalAxisValues, CalTable, Calibration};
 
 pub mod table;
+pub use table::TableInput;
 
 pub mod loader;
 pub use loader::{Loaded, load};
@@ -33,12 +34,12 @@ pub mod trace;
 pub use trace::Trace;
 
 pub mod expr;
-pub use expr::{EvalCtx, eval};
+pub use expr::{EvalCtx, eval, eval_at_time};
 
 pub mod builtins;
 
 pub mod stmt;
-pub use stmt::{exec, exec_script};
+pub use stmt::{exec, exec_at_time, exec_script, exec_script_at_time};
 
 pub mod scenario;
 pub use scenario::{InitialValue, InputKind, InputSeries, IoSeries, RunMode, Scenario};

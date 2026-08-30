@@ -1,0 +1,7 @@
+// Synthetic table conformance fixture. No proprietary content.
+Curve Out = Curve.Lookup(Curve X);
+Grid Out = Grid.Lookup(Grid X, Grid Y);
+Cube Out = Cube.Lookup(Cube X, Cube Y, Cube Z);
+Single Out = Single.Lookup(Single X);
+Extend Out = Extend.Lookup(Extend X, Extend Y);
+Enum Out = Enum Map.Lookup(Mode In);

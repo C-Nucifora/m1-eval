@@ -45,6 +45,19 @@ pub fn exec(node: &Node, ctx: &mut EvalCtx) -> Result<(), EvalError> {
     exec_with_runtime(node, ctx, &mut runtime)
 }
 
+/// Execute one statement at an explicit deterministic evaluator time.
+///
+/// This is the direct-call counterpart of the runner's timed execution path.
+/// Stateful calls in `node` observe `time`; no hardware adapter is installed.
+pub fn exec_at_time(
+    node: &Node,
+    ctx: &mut EvalCtx,
+    time: crate::hardware::EvalTime,
+) -> Result<(), EvalError> {
+    let mut runtime = EvalRuntime::from_time(time);
+    exec_with_runtime(node, ctx, &mut runtime)
+}
+
 pub(crate) fn exec_with_runtime(
     node: &Node,
     ctx: &mut EvalCtx,
@@ -75,6 +88,18 @@ pub(crate) fn exec_with_runtime(
 /// statement is executed. A failure in any statement aborts the script fail-loud.
 pub fn exec_script(root: &Node, ctx: &mut EvalCtx) -> Result<(), EvalError> {
     let mut runtime = EvalRuntime::from_public(ctx.dt);
+    exec_script_with_runtime(root, ctx, &mut runtime)
+}
+
+/// Execute a parsed script at an explicit deterministic evaluator time.
+///
+/// One runtime is shared by every statement and nested call in the script.
+pub fn exec_script_at_time(
+    root: &Node,
+    ctx: &mut EvalCtx,
+    time: crate::hardware::EvalTime,
+) -> Result<(), EvalError> {
+    let mut runtime = EvalRuntime::from_time(time);
     exec_script_with_runtime(root, ctx, &mut runtime)
 }
 

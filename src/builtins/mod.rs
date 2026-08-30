@@ -61,6 +61,22 @@ pub fn dispatch(
     dispatch_with_runtime(object, method, args, site, ctx, &mut runtime)
 }
 
+/// Dispatch one builtin call at an explicit deterministic evaluator time.
+///
+/// This preserves the public [`dispatch`] API while giving direct callers a
+/// way to advance timer and hardware-model time without using the runner.
+pub fn dispatch_at_time(
+    object: &str,
+    method: &str,
+    args: &[Value],
+    site: CallSite,
+    ctx: &mut EvalCtx,
+    time: crate::hardware::EvalTime,
+) -> Result<Value, EvalError> {
+    let mut runtime = EvalRuntime::from_time(time);
+    dispatch_with_runtime(object, method, args, site, ctx, &mut runtime)
+}
+
 /// Internal dispatch path carrying the runner's evaluator timeline and adapter.
 pub(crate) fn dispatch_with_runtime(
     object: &str,
@@ -177,7 +193,7 @@ pub(crate) fn dispatch_with_runtime(
         CallRoute::Timer => {
             validate_object_arity(object, method, args.len())?;
             let object_key = timer_object_key(object, ctx);
-            match stateful::timer(method, args, object_key, ctx)? {
+            match stateful::timer_at(method, args, object_key, runtime.time, ctx)? {
                 Some(value) => Ok(value),
                 None => Err(unsupported(object, method)),
             }
@@ -310,19 +326,14 @@ fn try_table_lookup(
         }
     };
 
-    // Each lookup coordinate must be numeric; collect them then interpolate.
-    let inputs = args
-        .iter()
-        .map(Value::m1_scalar)
-        .collect::<Result<Vec<_>, _>>()?;
-    // `table::lookup` validates arity (inputs vs axes) and clamps out-of-range
-    // coordinates, returning a BadCall on a mismatch.
-    let value = crate::table::lookup(table, &inputs)?;
+    // `table::lookup` validates arity and the coordinate family for every
+    // axis. Numeric axes interpolate; enum axes select an exact member site.
+    let value = crate::table::lookup_values(table, args, ctx.project)?;
     Ok(Some(Value::M1(value)))
 }
 
 /// Attempt a table `.Get(site)` — a raw read of one body cell by flat site
-/// index (row-major, matching [`crate::calib::CalTable`]'s documented layout),
+/// index (X-fastest, matching [`crate::calib::CalTable`]'s documented layout),
 /// with no interpolation. Returns `Ok(Some(value))` when `object` resolves to a
 /// project table with calibration cells; `Ok(None)` when `object` is not a
 /// table (so the caller continues to library-object dispatch). The site must be
@@ -1401,8 +1412,8 @@ mod tests {
     #[test]
     fn table_lookup_interpolates_over_calibration() {
         let mut h = Harness::new();
-        // The mini fixture's Demo.Map is 2-D: x in {0,100}, y in {0,1}, body
-        // (10,20,30,40). Corner and midpoint values come straight from table.rs.
+        // The mini fixture's Demo.Map is 2-D: x in {0,100}, y in {0,1}.
+        // Its M1 body order is (10,30,20,40), with X changing fastest.
         assert_eq!(
             h.call(
                 "Map",
@@ -1495,15 +1506,15 @@ mod tests {
     #[test]
     fn table_get_reads_flat_site() {
         let mut h = Harness::new();
-        // `.Get(i)` is a raw read of body cell i (row-major, no interpolation).
-        // Demo.Map's body is (10,20,30,40).
+        // `.Get(i)` is a raw read of body cell i (X-fastest, no interpolation).
+        // Demo.Map's flat body is (10,30,20,40).
         assert_eq!(
             h.call("Map", "Get", &[Value::m1_integer(0)]).unwrap(),
             Value::m1_float(10.0)
         );
         assert_eq!(
             h.call("Map", "Get", &[Value::m1_integer(2)]).unwrap(),
-            Value::m1_float(30.0)
+            Value::m1_float(20.0)
         );
         assert_eq!(
             h.call("Map", "Get", &[Value::m1_unsigned(3)]).unwrap(),
@@ -1852,6 +1863,32 @@ mod tests {
 
         fn call(&mut self, object: &str, method: &str, args: &[Value]) -> Result<Value, EvalError> {
             self.call_with_adapter(object, method, args, None)
+        }
+
+        fn call_at_time(
+            &mut self,
+            object: &str,
+            method: &str,
+            args: &[Value],
+            time: crate::hardware::EvalTime,
+        ) -> Result<Value, EvalError> {
+            let site = CallSite::new("Demo.Update.m1scr", 0);
+            let mut ctx = EvalCtx {
+                project: &self.project,
+                calib: &self.calib,
+                env: &mut self.env,
+                state: &mut self.state,
+                group: Some("Root.Demo"),
+                fn_symbol: Some("Root.Demo.Update"),
+                script_name: "Demo.Update.m1scr",
+                dt: 0.01,
+                scripts: &[],
+                signature_m1_types: None,
+                object_rules: Some(&self.object_rules),
+                depth: 0,
+                trace: Some(&mut self.trace),
+            };
+            dispatch_at_time(object, method, args, site, &mut ctx, time)
         }
 
         fn call_with_adapter(
@@ -2274,11 +2311,36 @@ mod tests {
             .m1_scalar()
             .unwrap()
             .as_f64();
-        assert!((remaining - 0.02).abs() < 1e-7);
+        assert!((remaining - 0.03).abs() < 1e-7);
         match h.call("Precharge State", "Start", &[Value::m1_float(0.03)]) {
             Err(EvalError::UnsupportedBuiltin { .. }) => {}
             other => panic!("expected channel.Start to be unsupported, got {other:?}"),
         }
+    }
+
+    #[test]
+    fn public_timed_dispatch_advances_a_timer_on_the_supplied_timeline() {
+        let mut h = ProjectObjHarness::new();
+        h.call_at_time(
+            "Startup Delay",
+            "Start",
+            &[Value::m1_float(0.25)],
+            crate::hardware::EvalTime::periodic(500, 5.0, 0.01, 0.01),
+        )
+        .unwrap();
+
+        let remaining = h
+            .call_at_time(
+                "Startup Delay",
+                "Remaining",
+                &[],
+                crate::hardware::EvalTime::periodic(510, 5.1, 0.01, 0.01),
+            )
+            .unwrap()
+            .m1_scalar()
+            .unwrap()
+            .as_f64();
+        assert!((remaining - 0.15).abs() < 1e-6);
     }
 
     #[test]
