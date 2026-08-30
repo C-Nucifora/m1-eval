@@ -1,0 +1,9 @@
+// Synthetic virtual-serial fixture. No proprietary or captured data.
+// A counterfactual can reach this function without running On Startup. It
+// configures the port in-cone, then proves that a logged handle is not a handle
+// allocated by the fresh virtual adapter.
+if (Counterfactual Gate > 0)
+{
+ Serial.PortInit(0, 115200, 0);
+ Counterfactual Available = Serial.Receive(Handle A, 0);
+}

@@ -1043,7 +1043,7 @@ mod tests {
             )
             .unwrap(),
             Value::m1_float(0.02),
-            "the deterministic model measures from the adapter-backed execution"
+            "the deterministic model measures from the external-adapter execution"
         );
         assert!(h.trace.hardware.iter().any(|record| {
             record.site == site && record.source == HardwareValueSource::SystemModel

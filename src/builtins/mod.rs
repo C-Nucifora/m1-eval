@@ -501,7 +501,9 @@ pub enum BuiltinSupport {
     Modeled,
     /// A hardware call with a documented generic offline fallback.
     Stubbed,
-    /// Hardware metadata which must come from a scenario or typed adapter.
+    /// Runs through a typed hardware-adapter route. The route may use a user
+    /// adapter or an evaluator-owned adapter such as virtual serial. Only some
+    /// calls in this category require external metadata.
     AdapterBacked,
     /// Not implemented — fails loud at runtime.
     Unsupported,

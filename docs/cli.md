@@ -40,10 +40,12 @@ declared in the scenario file; at most one may be given (combining two is a usag
 error, exit `2`). `--override` and `--diff` require `--log`.
 
 The `Supported`, `Assumed`, `Adapter-backed`, and `Stubbed` buckets distinguish a
-direct implementation, an explicit offline model, required external hardware
-metadata, and a typed offline fallback. They are execution-route labels, not
-evidence maturity. `Supported` and `Assumed` remain **Assumed** maturity until
-compared with captured M1 output. See the
+direct implementation, an explicit offline model, a typed adapter route, and a
+typed offline fallback. An adapter route may use a user `HardwareAdapter` or an
+evaluator-owned adapter such as virtual serial. Required external hardware
+metadata is only a subset of `Adapter-backed`. These are execution-route labels,
+not evidence maturity. `Supported` and `Assumed` remain **Assumed** maturity
+until compared with captured M1 output. See the
 [README maturity contract](../README.md#maturity-contract) for the evidence
 labels and current status of each evaluator area.
 
@@ -113,6 +115,14 @@ time_s = 0.125
 port = 0
 bytes = [0x1b, 0x30, 0x35, 0x0d]
 ```
+
+Whole-project mode shares one virtual adapter between `On Startup` and periodic
+functions. Function and cone modes skip startup, so their selected call chain
+must initialize the port before virtual receive or transmit calls. A serial RX
+declaration schedules bytes but does not initialize a port. Counterfactual
+replay has neither scenario RX declarations nor a startup pass. See
+[`virtual-serial.md`](virtual-serial.md) for state ownership and mixed-route
+failure rules.
 
 Identifiers may contain spaces (e.g. `Cooling Fan.Output`); channel names are
 used verbatim and never split on whitespace, only on `.` for path segments.

@@ -19,6 +19,8 @@
    <Component Classname="BuiltIn.Channel" Name="Root.Serial Test.Byte B"><Props Type="i32"/></Component>
    <Component Classname="BuiltIn.Channel" Name="Root.Serial Test.Nested Byte"><Props Type="i32"/></Component>
    <Component Classname="BuiltIn.Channel" Name="Root.Serial Test.Tx Offset"><Props Type="i32"/></Component>
+   <Component Classname="BuiltIn.Channel" Name="Root.Serial Test.Counterfactual Gate"><Props Type="i32"/></Component>
+   <Component Classname="BuiltIn.Channel" Name="Root.Serial Test.Counterfactual Available"><Props Type="bool"/></Component>
    <Component Classname="BuiltIn.FuncUser" Filename="Serial Test.Init.m1scr" Name="Root.Serial Test.Init">
     <Props SelectedTrigger="Root.Events.On Startup"/>
    </Component>
@@ -36,6 +38,9 @@
    </Component>
    <Component Classname="BuiltIn.FuncUser" Filename="Serial Test.Transmit.m1scr" Name="Root.Serial Test.Transmit">
     <Props SelectedTrigger="Root.Events.On 50Hz"/>
+   </Component>
+   <Component Classname="BuiltIn.FuncUser" Filename="Serial Test.Counterfactual Receive.m1scr" Name="Root.Serial Test.Counterfactual Receive">
+    <Props SelectedTrigger="Root.Events.On 100Hz"/>
    </Component>
    <Component Classname="BuiltIn.FuncUserParam" Filename="Serial Test.Read Helper.m1scr" Name="Root.Serial Test.Read Helper">
     <Signature ReturnType="i32"><Params/></Signature>

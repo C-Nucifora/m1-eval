@@ -51,6 +51,13 @@ fn unsigned(value: &Value) -> u32 {
     }
 }
 
+fn assert_serial_bad_call(error: &EvalError, expected: &str) {
+    match error.root_cause() {
+        EvalError::BadCall { detail } => assert_eq!(detail, expected),
+        other => panic!("expected serial BadCall, got {other:?}"),
+    }
+}
+
 #[test]
 fn whole_project_serial_is_timed_rate_gated_nested_and_fresh_per_run() {
     let engine = engine();
@@ -186,6 +193,69 @@ fn whole_project_serial_is_timed_rate_gated_nested_and_fresh_per_run() {
     assert!(
         !first.to_csv().contains("serial"),
         "CSV remains channel-only"
+    );
+}
+
+#[test]
+fn function_mode_does_not_run_startup_serial_initialization() {
+    let scenario = Scenario::from_toml_str(
+        r#"
+mode = "function"
+target = "Serial Test.Receive A"
+duration_s = 0.01
+base_rate_hz = 100.0
+
+[[serial.rx]]
+time_s = 0.0
+port = 0
+bytes = [0x11]
+"#,
+    )
+    .expect("function-mode serial scenario parses");
+    let error = engine()
+        .run(&scenario)
+        .expect_err("function mode must not borrow whole-project startup state");
+
+    assert_serial_bad_call(
+        &error,
+        "Serial.Receive: port 0 is not initialized; call Serial.PortInit first",
+    );
+    assert_eq!(
+        error.to_string(),
+        "in Serial Test.Receive A.m1scr at t = 0.000 s: bad call: Serial.Receive: port 0 is not initialized; call Serial.PortInit first"
+    );
+}
+
+#[test]
+fn overriding_port_init_does_not_mutate_virtual_serial_state() {
+    let scenario = Scenario::from_toml_str(
+        r#"
+mode = "whole-project"
+duration_s = 0.01
+base_rate_hz = 100.0
+
+[[io]]
+call = "Serial.PortInit"
+const = true
+
+[[serial.rx]]
+time_s = 0.0
+port = 0
+bytes = [0x11]
+"#,
+    )
+    .expect("mixed-route serial scenario parses");
+    let error = engine()
+        .run(&scenario)
+        .expect_err("a higher-priority PortInit result does not configure virtual serial");
+
+    assert_serial_bad_call(
+        &error,
+        "Serial.Receive: port 0 is not initialized; call Serial.PortInit first",
+    );
+    assert_eq!(
+        error.to_string(),
+        "in Serial Test.Startup Receive.m1scr at startup: bad call: Serial.Receive: port 0 is not initialized; call Serial.PortInit first"
     );
 }
 

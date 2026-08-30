@@ -167,12 +167,15 @@ The multi-rate model:
 
 Before running, `m1-eval --coverage` reports, per project, which builtins and
 constructs each script uses and whether the engine dispatches them through a
-**direct implementation**, an explicit offline **model**, required
-**adapter-backed** metadata, a hardware **stub**, or no implementation. The
-rendered labels are `Supported`, `Assumed`, `Adapter-backed`, `Stubbed`, and
-`Unsupported`. These are execution-route labels, separate from the evidence
-maturity contract above. Both `Supported` and `Assumed` coverage entries remain
-**Assumed** maturity until captured M1 output verifies them.
+**direct implementation**, an explicit offline **model**, a typed
+**adapter-backed** route, a hardware **stub**, or no implementation. An adapter
+route may use a user `HardwareAdapter` or an evaluator-owned adapter such as
+virtual serial. Required external metadata, including `System.FlashSize` and
+`System.FlashFree`, is only one subset of this bucket. The rendered labels are
+`Supported`, `Assumed`, `Adapter-backed`, `Stubbed`, and `Unsupported`. These are
+execution-route labels, separate from the evidence maturity contract above.
+Both `Supported` and `Assumed` coverage entries remain **Assumed** maturity until
+captured M1 output verifies them.
 
 The report also prints a **`Schedule:`** section: every script-backed function
 with its execution rate (`@ 500 Hz`, `@ 50 Hz`, …), `startup, runs once`, or
@@ -217,7 +220,10 @@ adapter-backed, stubbed, and unsupported calls in a project.
 Inject virtual RS232 bytes with `[[serial.rx]]`. The runner releases each chunk
 according to evaluator time, and JSON traces retain ordered RX/TX byte events;
 CSV remains channel-only. See [`docs/virtual-serial.md`](docs/virtual-serial.md)
-for the schema, supported methods, routing order, and explicit assumptions.
+for the schema, supported methods, routing order, run-mode boundaries, source
+migration, and explicit assumptions. Only whole-project mode runs `On Startup`;
+function and cone selections must initialize serial in their own call chain.
+Counterfactual replay has no serial scenario or startup pass.
 
 Whole-project mode is strict about ordinary missing channels unless
 `allow_default_inputs = true` or `--allow-default-inputs` is set. The CLI then

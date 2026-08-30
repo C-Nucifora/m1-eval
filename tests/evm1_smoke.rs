@@ -403,7 +403,7 @@ const = {{ unsigned = 2097152 }}
         "{label}: the offline bus supplied no receive calls"
     );
     eprintln!(
-        "{label}: {} adapter-backed receive substitution(s)",
+        "{label}: {} external-adapter receive substitution(s)",
         bus_substitutions.len()
     );
     for item in bus_substitutions {
