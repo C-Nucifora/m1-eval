@@ -36,6 +36,7 @@ do not compare computed channel values with captured M1 results.
 | Filters, integrals, derivatives, debounce, delay, change detection, timers, and `static local` state | **Assumed** | Update laws and startup behavior are explicit implementation assumptions with hand-derived tests, not M1 value comparisons. |
 | `CanComms.*`, `Serial.*`, `System.*`, `Logging.*`, DBC objects, and other hardware-backed calls | **Assumed / Stubbed** | Each call crosses a typed adapter boundary with its resolved receiver, source call site, arguments, and evaluator time. Exact-site scenario values take precedence over wildcard values and an attached adapter. `System.ElapsedTime` reports the interval since that call site last ran. Its first tick-zero call returns zero, while a site first reached later uses its function step. Tick calls use the deterministic base timeline. `System.FlashSize` and `System.FlashFree` require scenario or adapter data; they never become a dangerous zero. Remaining unhandled calls use documented typed stubs or fail loud. |
 | Scenario parsing, tick grids, trace output, and `--coverage` | **Assumed** | These are deterministic m1-eval contracts tested with synthetic data. A `Supported` coverage entry means implemented, not M1-verified. |
+| Typed conformance fixture parser and runner | **Assumed** | Synthetic fixtures cover typed values, project hashes, initial-state reset, tolerances, and mismatch reporting. No genuine M1 Sim capture is committed yet, so this runner does not make another area Verified by itself. |
 | Single-function and upstream dependency-cone runners | **Assumed** | Selection, ordering, and zero-order hold are tested on synthetic projects. |
 | Whole-project multi-rate scheduling | **Assumed** | Trigger rates come from `Project.m1prj`; same-rate dependency order, fastest-first rate groups, startup order, and cross-rate stale reads are the evaluator's model. |
 | CSV log replay, overrides, downstream-cone recomputation, and diffs | **Assumed** | Synthetic tests cover import, resampling, source precedence, recomputation, and the no-op invariant. They do not establish M1 execution fidelity. |
@@ -246,11 +247,18 @@ cargo run --features ld -- --project Project.m1prj --log run.ld --out trace.csv
 # Static coverage report — what the engine can and cannot evaluate, plus the
 # per-function execution schedule.
 m1-eval --project Project.m1prj --coverage
+
+# Run one or more typed golden-vector fixtures. The committed examples are
+# synthetic runner tests, not M1 compatibility evidence.
+m1-eval \
+  --conformance tests/fixtures/conformance/synthetic-mini.toml \
+  --conformance tests/fixtures/conformance/synthetic-initial-state.toml
 ```
 
 `--project` defaults to the nearest `Project.m1prj` upward (or `$M1_PROJECT`).
-See [`docs/cli.md`](docs/cli.md) for the full flag list, the scenario file
-format, and the exit-code contract.
+See [`docs/cli.md`](docs/cli.md) for the full flag list, scenario format, and
+exit-code contract. [`docs/conformance.md`](docs/conformance.md) defines the
+golden-vector schema and the M1 Sim capture procedure.
 
 The real-project smoke tests remain read-only and keep proprietary files out of
 the repository. Point each variable at a corpus repository root, version

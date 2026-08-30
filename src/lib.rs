@@ -41,7 +41,7 @@ pub mod stmt;
 pub use stmt::{exec, exec_script};
 
 pub mod scenario;
-pub use scenario::{InputKind, InputSeries, IoSeries, RunMode, Scenario};
+pub use scenario::{InitialValue, InputKind, InputSeries, IoSeries, RunMode, Scenario};
 
 pub mod log;
 pub use log::{Log, LogMeta};
@@ -65,3 +65,11 @@ pub use coverage::{CoverageItem, CoverageReport, ItemKind, UnresolvedTrigger};
 
 pub mod engine;
 pub use engine::Engine;
+
+pub mod conformance;
+pub use conformance::{
+    CONFORMANCE_SCHEMA_VERSION, ConformanceError, ConformanceFixture, ConformanceMismatch,
+    ConformanceOptions, ConformanceReport, ExpectedChannelValue, FixtureChannelValue,
+    FixtureProvenance, FixtureRun, FixtureRunMode, FixtureStep, ProjectBundle, ProjectFileHash,
+    ProvenanceKind, ValueTolerance, WireValue, run_conformance_fixture, run_conformance_suite,
+};

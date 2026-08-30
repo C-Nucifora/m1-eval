@@ -1,0 +1,5 @@
+# Keep synthetic evaluator fixtures byte-stable for SHA-256 manifests.
+tests/fixtures/**/*.m1prj text eol=lf
+tests/fixtures/**/*.m1scr text eol=lf
+tests/fixtures/**/*.m1cfg text eol=lf
+tests/fixtures/conformance/*.toml text eol=lf

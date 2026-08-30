@@ -1,0 +1,30 @@
+<?xml version="1.0"?>
+<!-- Synthetic type-preservation project for conformance runner tests. -->
+<MoTeCM1BuildSession>
+ <Project Name="ConformanceTypes" TargetHardware="ecu120">
+  <DataTypes>
+   <Type Storage="enum" Name="Test State" Default="Idle">
+    <Enum Name="Idle" ContainerOrder="0"/>
+    <Enum Name="Active" ContainerOrder="1"/>
+   </Type>
+  </DataTypes>
+  <ComponentStream><List>
+   <Component Classname="BuiltIn.GroupCompound" Name="Root.Types"/>
+   <Component Classname="BuiltIn.Channel" Name="Root.Types.Bool In"><Props Type="bool"/></Component>
+   <Component Classname="BuiltIn.Channel" Name="Root.Types.Bool Out"><Props Type="bool"/></Component>
+   <Component Classname="BuiltIn.Channel" Name="Root.Types.Signed In"><Props Type="s32"/></Component>
+   <Component Classname="BuiltIn.Channel" Name="Root.Types.Signed Out"><Props Type="s32"/></Component>
+   <Component Classname="BuiltIn.Channel" Name="Root.Types.Unsigned In"><Props Type="u32"/></Component>
+   <Component Classname="BuiltIn.Channel" Name="Root.Types.Unsigned Out"><Props Type="u32"/></Component>
+   <Component Classname="BuiltIn.Channel" Name="Root.Types.Float In"><Props Type="f32"/></Component>
+   <Component Classname="BuiltIn.Channel" Name="Root.Types.Float Out"><Props Type="f32"/></Component>
+   <Component Classname="BuiltIn.Channel" Name="Root.Types.Fixed In"><Props Type="FixedPoint7dps"/></Component>
+   <Component Classname="BuiltIn.Channel" Name="Root.Types.Fixed Out"><Props Type="FixedPoint7dps"/></Component>
+   <Component Classname="BuiltIn.Channel" Name="Root.Types.Enum In"><Props Type="::This.Test State"/></Component>
+   <Component Classname="BuiltIn.Channel" Name="Root.Types.Enum Out"><Props Type="::This.Test State"/></Component>
+   <Component Classname="BuiltIn.Channel" Name="Root.Types.String In"><Props Type="string"/></Component>
+   <Component Classname="BuiltIn.Channel" Name="Root.Types.String Out"><Props Type="string"/></Component>
+   <Component Classname="BuiltIn.FuncUser" Filename="Types.Update.m1scr" Name="Root.Types.Update"/>
+  </List></ComponentStream>
+ </Project>
+</MoTeCM1BuildSession>
