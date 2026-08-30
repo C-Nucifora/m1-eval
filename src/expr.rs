@@ -419,6 +419,9 @@ fn read_symbol_inner(
                 return coerce_for_channel(canon, v, ctx.project);
             }
             let symbol = symbol.expect("a matched symbol kind has a symbol");
+            if let Some(value) = configured_enum_parameter_value(symbol, ctx.project)? {
+                return Ok(value);
+            }
             let default = typed_io_input_default(
                 symbol.value_type,
                 symbol.declared_type.as_deref(),
@@ -529,6 +532,41 @@ fn read_symbol_inner(
             name: canon.to_string(),
         }),
     }
+}
+
+/// Recover a named enum calibration cell retained by `m1-typecheck` on its
+/// parameter symbol. [`Calibration`] stores numeric M1 scalars and table cells;
+/// a named enum member instead needs the project's concrete enum id. The loaded
+/// symbol model has already associated that member with its declared enum, so
+/// restore the runtime [`Value::Enum`] here and reject corrupt membership.
+fn configured_enum_parameter_value(
+    symbol: &Symbol,
+    project: &Project,
+) -> Result<Option<Value>, EvalError> {
+    let ValueType::Enum(id) = symbol.value_type else {
+        return Ok(None);
+    };
+    let Some(member) = symbol
+        .static_value
+        .as_deref()
+        .map(str::trim)
+        .filter(|member| !member.is_empty())
+    else {
+        return Ok(None);
+    };
+    if project.symbols().enum_has_member(id, member) {
+        return Ok(Some(Value::Enum {
+            id,
+            member: member.to_string(),
+        }));
+    }
+    Err(EvalError::TypeError {
+        detail: format!(
+            "configured member {member:?} for {:?} does not belong to enum {:?}",
+            symbol.path,
+            project.symbols().enum_type(id).name
+        ),
+    })
 }
 
 /// Parse a constant's project-owned `<Props Value>` directly against its target
@@ -1367,6 +1405,21 @@ mod tests {
             }
         }
 
+        fn configured_enums() -> Harness {
+            let dir = Path::new(env!("CARGO_MANIFEST_DIR")).join("tests/fixtures/enums");
+            let loaded = crate::loader::load(
+                &dir.join("Project.m1prj"),
+                Some(&dir.join("parameters.m1cfg")),
+            )
+            .expect("configured enums fixture loads");
+            Harness {
+                project: loaded.project,
+                calib: loaded.calib,
+                env: Env::new(),
+                state: StateStore::new(),
+            }
+        }
+
         fn ctx(&mut self) -> EvalCtx<'_> {
             EvalCtx {
                 project: &self.project,
@@ -1506,6 +1559,19 @@ mod tests {
             .params
             .insert("Demo.Gain".to_string(), M1Scalar::FloatingPoint(2.5));
         assert_eq!(rhs_value("Gain", &mut h).unwrap(), Value::m1_float(2.5));
+    }
+
+    #[test]
+    fn named_enum_parameter_reads_configured_member() {
+        let mut h = Harness::configured_enums();
+        let enum_id = h.project.symbols().enum_by_name("Drive State").unwrap();
+        assert_eq!(
+            rhs_value("Configured Mode", &mut h).unwrap(),
+            Value::Enum {
+                id: enum_id,
+                member: "Precharging".to_string(),
+            }
+        );
     }
 
     #[test]

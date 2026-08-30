@@ -5,8 +5,8 @@
 <!-- opens a CAN receive handle and reads a float and an unsigned from  -->
 <!-- the bus, then writes the float to an output channel. Offline there -->
 <!-- is no CAN bus, so each `CanComms.*` call returns its documented,    -->
-<!-- type-correct externally-driven default (a Handle -> the benign      -->
-<!-- unit, a FloatingPoint read -> 0.0, an Integer read -> 0) instead of -->
+<!-- type-correct externally-driven default (a Handle -> unsigned zero,  -->
+<!-- a FloatingPoint read -> 0.0, an Integer read -> 0) instead of       -->
 <!-- failing loud. This is the CI-safe guard for the gated EV-M1 whole-  -->
 <!-- project test: it proves a run whose script reads CAN completes.     -->
 <MoTeCM1BuildSession>

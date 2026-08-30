@@ -1,0 +1,2 @@
+// Synthetic zero-denominator calibration fixture. No proprietary content.
+Ratio = Left Coefficient / (Left Coefficient + Right Coefficient);

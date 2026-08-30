@@ -133,11 +133,12 @@ fn library_return_type(object: &str, method: &str) -> Option<&'static str> {
 /// - `Integer` → `0`,
 /// - `UnsignedInteger` → `0`,
 /// - `String` → `""`,
+/// - `Handle` → an opaque unsigned-zero handle, matching the M1 storage family
+///   used when scripts pass handles between calls,
 /// - `Void` → the benign unit (`Bool(true)`) the void side-effect writers use,
-/// - anything else (`Handle`, `Bit`, `Enumeration`, an `Integer|FloatingPoint`
-///   union) → the benign unit `Bool(true)`: a transmit/receive handle or a single
-///   bus bit has no determinate numeric offline value, so we return the unit
-///   rather than invent one.
+/// - anything else (`Bit`, `Enumeration`, an `Integer|FloatingPoint` union) →
+///   the benign unit `Bool(true)` because the catalogue does not expose a runtime
+///   representation for it.
 ///
 /// All overloads of a method declare the same return type in the IO objects, so
 /// the first overload's `returns` fixes the default. An empty overload set means
@@ -152,9 +153,13 @@ fn typed_io_default(object: &str, method: &str) -> Option<Value> {
         "Integer" => Value::m1_integer(0),
         "UnsignedInteger" => Value::m1_unsigned(0),
         "String" => Value::Str(String::new()),
-        // `Void` writers and any unmappable return (`Handle`, `Bit`,
-        // `Enumeration`, the `Integer|FloatingPoint` union) collapse to the benign
-        // unit value, matching the void side-effect convention used elsewhere.
+        // Handles are opaque, but M1 scripts store and pass them as unsigned
+        // integers. Zero is the deterministic offline handle and cannot be
+        // mistaken for a live bus resource.
+        "Handle" => Value::m1_unsigned(0),
+        // `Void` writers and any other unmappable return (`Bit`, `Enumeration`,
+        // the `Integer|FloatingPoint` union) collapse to the benign unit value,
+        // matching the void side-effect convention used elsewhere.
         _ => Value::Bool(true),
     })
 }
@@ -172,11 +177,15 @@ fn coerce_hardware_value(
         Some("UnsignedInteger") => {
             coerce_for_scalar_kind(&key, value, M1ScalarKind::UnsignedInteger)
         }
+        // Handles are opaque tokens, represented by the unsigned storage
+        // family at script boundaries. Apply the same rule to adapter/scenario
+        // replies as to the deterministic offline handle.
+        Some("Handle") => coerce_for_scalar_kind(&key, value, M1ScalarKind::UnsignedInteger),
         Some("FloatingPoint") => coerce_for_scalar_kind(&key, value, M1ScalarKind::FloatingPoint),
         Some("FixedPoint7dps") => coerce_for_scalar_kind(&key, value, M1ScalarKind::FixedPoint7dps),
         Some("Boolean") => coerce_for_declared_type(&key, value, ValueType::Boolean, ctx.project),
         Some("String") => coerce_for_declared_type(&key, value, ValueType::String, ctx.project),
-        // Void and opaque handles do not have an M1 scalar family to restore.
+        // Void and remaining catalogue-only types have no scalar family to restore.
         _ => Ok(value),
     }
 }
@@ -716,6 +725,23 @@ mod tests {
                 .unwrap(),
             Value::m1_unsigned(u32::MAX - 1)
         );
+
+        h.env
+            .set_io_override("CanComms.RxOpenStandard", Value::m1_integer(-1));
+        assert_eq!(
+            h.io(
+                "CanComms",
+                "RxOpenStandard",
+                &[
+                    Value::m1_unsigned(0),
+                    Value::m1_unsigned(0),
+                    Value::m1_unsigned(0),
+                    Value::m1_unsigned(0),
+                ],
+            )
+            .unwrap(),
+            Value::m1_unsigned(u32::MAX)
+        );
     }
 
     #[test]
@@ -752,11 +778,11 @@ mod tests {
     }
 
     #[test]
-    fn can_open_handle_returns_unit_external_stub() {
+    fn can_open_handle_returns_unsigned_zero_external_stub() {
         let mut h = Harness::new();
         // `CanComms.RxOpenStandard` declares a `Handle` return — an opaque
-        // receive handle with no determinate offline value — so the typed stub is
-        // the benign unit (`Bool(true)`), externally driven, not a fail-loud abort.
+        // receive handle with no live offline resource. M1 scripts store handles
+        // in unsigned locals, so the typed stub is the opaque zero handle.
         assert_eq!(
             h.io(
                 "CanComms",
@@ -769,7 +795,7 @@ mod tests {
                 ],
             )
             .unwrap(),
-            Value::Bool(true)
+            Value::m1_unsigned(0)
         );
         assert!(h.trace.is_external("CanComms.RxOpenStandard"));
     }
@@ -1245,7 +1271,7 @@ mod tests {
         // The generic fallback maps each registry return type to its zero/unit.
         // `GetFloat` → FloatingPoint, `GetID` → Integer, `BusRxTotal` →
         // UnsignedInteger, `RxMessage` → Boolean, `SetFloat` → Void,
-        // `RxOpenStandard` → Handle (unmappable → unit).
+        // `RxOpenStandard` → Handle (opaque unsigned zero).
         assert_eq!(
             typed_io_default("CanComms", "GetFloat"),
             Some(Value::m1_float(0.0))
@@ -1272,7 +1298,7 @@ mod tests {
         );
         assert_eq!(
             typed_io_default("CanComms", "RxOpenStandard"),
-            Some(Value::Bool(true))
+            Some(Value::m1_unsigned(0))
         );
         // A method not in the registry → None (the caller fails loud).
         assert_eq!(typed_io_default("CanComms", "NotARealMethod"), None);
