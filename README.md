@@ -31,7 +31,7 @@ do not compare computed channel values with captured M1 results.
 | Advertised area | State | Current contract |
 | --- | --- | --- |
 | Expressions, statements, enums, and inline user functions | **Assumed** | Covered by unit and synthetic-project tests. M1 evaluation results have not been captured for comparison. |
-| `.m1cfg` parameters and 1/2/3-D table lookup | **Assumed** | Parsing, interpolation, and edge clamping use synthetic fixtures. Use the matching calibration file for actual parameter and table values. |
+| `.m1cfg` parameters and 1/2/3-D table lookup | **Assumed** | Parsing, interpolation, and edge clamping use synthetic fixtures. Use the matching calibration file for actual values. Without it, parameters use typed external defaults. Table `.Lookup()` and `.Get()` fail in strict modes; whole-project mode may opt in to an external `0.0` fallback. |
 | `Calculate.*`, `Limit.*`, `Convert.*`, enum conversions, and table methods | **Assumed** | Implemented methods have hand-derived tests. `--coverage` remains authoritative for the methods a project uses. |
 | Filters, integrals, derivatives, debounce, delay, change detection, timers, and `static local` state | **Assumed** | Update laws and startup behavior are explicit implementation assumptions with hand-derived tests, not M1 value comparisons. |
 | `CanComms.*`, `Serial.*`, `System.*`, `Logging.*`, DBC objects, and other hardware-backed calls | **Stubbed** | Scenario `[[io]]` values take precedence. Otherwise calls use documented or generic typed stubs; writes are offline no-ops. |
@@ -148,9 +148,11 @@ are excluded — before you run it.
 `m1-eval` runs offline. It does not connect to an ECU, sample sensors, emulate a
 CAN or serial bus, or reproduce firmware timing. A `Project.m1prj` is always
 required because it supplies symbols, types, and trigger rates. Pass the matching
-`.m1cfg` when a run needs real parameter values or table cells. Table lookup
-without its calibration fails; an unseeded parameter instead uses a type-correct
-externally-driven default. The evaluator does not load `.m1dbc` files.
+`.m1cfg` when a run needs real parameter values or table cells. Without it, an
+unseeded parameter uses a type-correct externally-driven default. Table
+`.Lookup()` and `.Get()` fail in strict modes. In whole-project mode,
+`allow_default_inputs` also permits an externally-driven `0.0` table fallback.
+The evaluator does not load `.m1dbc` files.
 
 Seed an ordinary hardware channel with scenario `[[inputs]]`. Seed a
 hardware-backed builtin call with `[[io]]`, using its exact `Object.Method` name.
@@ -160,11 +162,12 @@ implemented, stubbed, and unsupported calls in a project.
 
 Whole-project mode is strict about ordinary missing channels unless
 `allow_default_inputs = true` or `--allow-default-inputs` is set. The CLI then
-prints every substituted channel, value, and first-reading script to stderr.
-Library callers receive the same records in `Trace::defaulted`; the trace also
-marks those channels externally driven. Tier-3 stubs and absent-calibration
-parameter defaults are marked externally driven, but they are not part of that
-`allow_default_inputs` stderr summary.
+prints every substituted ordinary channel, value, and first-reading script to
+stderr. Library callers receive the same records in `Trace::defaulted`; the
+trace also marks those channels externally driven. Tier-3 stubs,
+absent-calibration parameter defaults, and the opt-in table fallback are marked
+externally driven, but they are not part of that `allow_default_inputs` stderr
+summary.
 
 ```sh
 # Evaluate a scenario and write the trace as JSON (or .csv — format follows the

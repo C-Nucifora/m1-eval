@@ -61,7 +61,7 @@ From surveying the grammar, `m1-typecheck`, the M1 manuals, and ~80 real EV-M1 s
   require that file as an input.
 - **Scripts run as scheduled functions at fixed rates** (500/200/50/10/2 Hz); rate
   determines `dt` and cross-function ordering.
-- Rough size of a faithful engine: **~3–5k lines of Rust**, medium-large, with correctness
+- Rough size of the intended engine: **~3–5k lines of Rust**, medium-large, with correctness
   risk concentrated in the time-domain math.
 
 The language itself (operators, `if/else`, `when/is`, `expand/to`, `local/static local`,
@@ -72,7 +72,7 @@ and scripts have side effects (channel writes, `Output.SetState(...)`).
 ## Goals / Non-goals
 
 ### Goals
-- Real numeric evaluation of M1 scripts, faithful enough to be trusted for analysis.
+- Real numeric evaluation of M1 scripts, with evidence labels that identify what users can trust for analysis.
 - Three execution granularities sharing one core: single-function, dependency-cone,
   whole-project ECU sim.
 - Scenario-driven inputs (constants + time series) and **log-driven counterfactual replay**
@@ -84,7 +84,7 @@ and scripts have side effects (channel writes, `Output.SetState(...)`).
 
 ### Non-goals (v1, YAGNI)
 - A real-time / hardware-in-the-loop simulator. This is offline, deterministic evaluation.
-- Faithful CAN bus / Serial IO emulation. Those are stubbed or scenario-fed.
+- CAN bus / Serial IO emulation. Those are stubbed or scenario-fed.
 - Re-implementing or driving MoTeC's GUI tools. (M1 Sim is used only as a validation
   oracle, see Fidelity.)
 - Editing/writing `.m1cfg` or `.m1prj`. The engine reads; it does not mutate the project.
@@ -190,8 +190,8 @@ silently-wrong number):
   real EV-M1 scripts, using tolerance-based floating-point comparison; divergences
   documented.
 - **`m1-eval --coverage <project>`** reports, before running, which builtins/constructs
-  each script uses and whether the engine supports them faithfully or stubs them — so the
-  user knows what is trustworthy versus externally driven.
+  each script uses and whether the engine implements or stubs them — so the user knows
+  what is implemented versus externally driven.
 
 ## Interfaces & ecosystem integration
 
@@ -228,7 +228,7 @@ Each phase is independently useful and shippable.
 1. **Core + single-function/cone runner + CLI + library API.** Expression/statement eval,
    Tier-1 + Tier-2 builtins, table lookup from `.m1cfg`, scenario input (constants + time
    series). Tier-3 IO stubbed/scenario-fed. *This is what `m1-visualiser` hooks into first.*
-2. **Whole-project multi-rate scheduler** — the faithful mini-ECU.
+2. **Whole-project multi-rate scheduler** — the deterministic evaluator model.
 3. **Log-driven counterfactual** — CSV + `.ld` import, logged channels as ground truth,
    channel overrides, downstream re-evaluation, diff vs log. The headline feature.
 4. **LSP integration** — hover-to-evaluate + inline value hints via `m1-lsp`, reusing the
