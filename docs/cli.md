@@ -101,7 +101,9 @@ used verbatim and never split on whitespace, only on `.` for path segments.
   `{ "time": [...], "channels": { path: [...] }, "external": [...] }`. The
   `external` list names channels whose values were externally driven rather than
   computed, including scenario inputs, Tier-3 stubs, parameter defaults, opt-in
-  table fallbacks, and opt-in defaults for unseeded channels.
+  table fallbacks, and opt-in defaults for unseeded channels. JSON has no
+  non-finite numeric values, so NaN and positive or negative infinity are written
+  as `null`.
 - **CSV** (`--out trace.csv`): a `time` header column followed by one column per
   channel in sorted-name order, one row per tick.
 

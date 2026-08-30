@@ -26,7 +26,7 @@
 //! `time` column followed by one column per channel in sorted-name order so the
 //! output is reproducible across runs.
 
-use crate::value::Value;
+use crate::value::{M1Scalar, Value};
 use std::collections::{BTreeMap, BTreeSet};
 
 /// A column-oriented record of an evaluation run.
@@ -110,10 +110,12 @@ impl Trace {
 
     /// Serialise the channel columns + time axis to JSON. The shape is
     /// `{ "time": [...], "channels": { path: [...] }, "external": [...] }`,
-    /// values rendered by `value_json`. Deterministic ordering (BTree maps).
+    /// values rendered by `value_json`. JSON has no non-finite number syntax, so
+    /// NaN and positive or negative infinity are written as `null`. Deterministic
+    /// ordering comes from the `BTreeMap` and `BTreeSet` fields.
     pub fn to_json(&self) -> String {
         let mut out = String::from("{\"time\":[");
-        out.push_str(&join(self.time.iter().map(|t| fmt_f64(*t))));
+        out.push_str(&join(self.time.iter().map(|t| f64_json(*t))));
         out.push_str("],\"channels\":{");
         let mut first = true;
         for (path, col) in &self.channels {
@@ -145,7 +147,7 @@ impl Trace {
         }
         out.push('\n');
         for (i, t) in self.time.iter().enumerate() {
-            out.push_str(&fmt_f64(*t));
+            out.push_str(&f64_text(*t));
             for p in &paths {
                 out.push(',');
                 if let Some(v) = self.channels.get(*p).and_then(|c| c.get(i)) {
@@ -165,7 +167,7 @@ fn join(items: impl Iterator<Item = String>) -> String {
 
 /// Format an `f64` without a trailing `.0`-less ambiguity but deterministically.
 /// Integers print without a decimal point; others use the shortest round-trip.
-fn fmt_f64(x: f64) -> String {
+fn f64_text(x: f64) -> String {
     if x.is_nan() {
         "NaN".to_string()
     } else if x.is_infinite() {
@@ -176,6 +178,37 @@ fn fmt_f64(x: f64) -> String {
     }
 }
 
+/// Render an `f64` as a JSON number, or `null` when JSON cannot represent it.
+fn f64_json(value: f64) -> String {
+    if value.is_finite() {
+        value.to_string()
+    } else {
+        "null".to_string()
+    }
+}
+
+/// Render an M1-width scalar without widening binary32 before formatting.
+fn m1_scalar_text(value: M1Scalar) -> String {
+    match value {
+        M1Scalar::FloatingPoint(value) if value.is_nan() => "NaN".to_string(),
+        M1Scalar::FloatingPoint(value) if value.is_infinite() => {
+            if value > 0.0 { "Infinity" } else { "-Infinity" }.to_string()
+        }
+        M1Scalar::FloatingPoint(value) => value.to_string(),
+        M1Scalar::Integer(value) => value.to_string(),
+        M1Scalar::UnsignedInteger(value) => value.to_string(),
+        M1Scalar::FixedPoint7dps(value) => value.to_string(),
+    }
+}
+
+/// Render an M1 scalar as JSON. JSON cannot represent non-finite binary32 values.
+fn m1_scalar_json(value: M1Scalar) -> String {
+    match value {
+        M1Scalar::FloatingPoint(value) if !value.is_finite() => "null".to_string(),
+        _ => m1_scalar_text(value),
+    }
+}
+
 /// Render a [`Value`] as a JSON scalar. Numbers are bare; booleans `true`/`false`;
 /// enums and strings are JSON strings.
 fn value_json(v: &Value) -> String {
@@ -183,7 +216,8 @@ fn value_json(v: &Value) -> String {
         Value::Bool(b) => b.to_string(),
         Value::Int(x) => x.to_string(),
         Value::Uint(x) => x.to_string(),
-        Value::Float(x) => fmt_f64(*x),
+        Value::Float(x) => f64_json(*x),
+        Value::M1(value) => m1_scalar_json(*value),
         Value::Enum { member, .. } => json_string(member),
         Value::Str(s) => json_string(s),
     }
@@ -195,7 +229,8 @@ fn value_csv(v: &Value) -> String {
         Value::Bool(b) => b.to_string(),
         Value::Int(x) => x.to_string(),
         Value::Uint(x) => x.to_string(),
-        Value::Float(x) => fmt_f64(*x),
+        Value::Float(x) => f64_text(*x),
+        Value::M1(value) => m1_scalar_text(*value),
         Value::Enum { member, .. } => member.clone(),
         Value::Str(s) => s.clone(),
     }
@@ -295,6 +330,53 @@ mod tests {
         assert_eq!(
             json,
             "{\"time\":[0],\"channels\":{\"A\":[true],\"B\":[2]},\"external\":[\"A\"]}"
+        );
+    }
+
+    #[test]
+    fn m1_width_scalars_serialize_without_host_width_artifacts() {
+        let mut tr = Trace::new();
+        tr.push_tick(0.0);
+        tr.record_channel("Float", Value::M1(M1Scalar::FloatingPoint(0.1)));
+        tr.record_channel(
+            "Fixed",
+            Value::M1(M1Scalar::FixedPoint7dps(
+                crate::value::FixedPoint7dps::from_raw(1_000_001),
+            )),
+        );
+        tr.record_channel("Int", Value::M1(M1Scalar::Integer(i32::MIN)));
+        tr.record_channel("Uint", Value::M1(M1Scalar::UnsignedInteger(u32::MAX)));
+
+        assert_eq!(
+            tr.to_json(),
+            "{\"time\":[0],\"channels\":{\"Fixed\":[0.1000001],\"Float\":[0.1],\"Int\":[-2147483648],\"Uint\":[4294967295]},\"external\":[]}"
+        );
+    }
+
+    #[test]
+    fn non_finite_floats_serialize_as_valid_json_nulls() {
+        let mut tr = Trace::new();
+        for (legacy, m1) in [
+            (f64::NAN, f32::NAN),
+            (f64::INFINITY, f32::INFINITY),
+            (f64::NEG_INFINITY, f32::NEG_INFINITY),
+        ] {
+            tr.push_tick(legacy);
+            tr.record_channel("Legacy", Value::Float(legacy));
+            tr.record_channel("M1", Value::M1(M1Scalar::FloatingPoint(m1)));
+        }
+
+        let json = tr.to_json();
+        assert_eq!(
+            json,
+            "{\"time\":[null,null,null],\"channels\":{\"Legacy\":[null,null,null],\"M1\":[null,null,null]},\"external\":[]}"
+        );
+        let parsed: serde_json::Value =
+            serde_json::from_str(&json).expect("trace output must be valid JSON");
+        assert_eq!(parsed["time"], serde_json::json!([null, null, null]));
+        assert_eq!(
+            parsed["channels"]["M1"],
+            serde_json::json!([null, null, null])
         );
     }
 

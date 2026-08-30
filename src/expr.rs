@@ -27,7 +27,7 @@ use crate::calib::Calibration;
 use crate::env::{CallSite, Env, StateStore};
 use crate::error::EvalError;
 use crate::ident::{Target, classify};
-use crate::value::Value;
+use crate::value::{M1Scalar, Value};
 use m1_core::{Field, Kind, Node};
 use m1_typecheck::Project;
 use m1_typecheck::symbols::SymbolKind;
@@ -840,6 +840,9 @@ fn value_type(v: &Value) -> ValueType {
         Value::Int(_) => ValueType::Integer,
         Value::Uint(_) => ValueType::Unsigned,
         Value::Float(_) => ValueType::Float,
+        Value::M1(M1Scalar::Integer(_)) => ValueType::Integer,
+        Value::M1(M1Scalar::UnsignedInteger(_)) => ValueType::Unsigned,
+        Value::M1(M1Scalar::FloatingPoint(_) | M1Scalar::FixedPoint7dps(_)) => ValueType::Float,
         Value::Enum { id, .. } => ValueType::Enum(*id),
         Value::Str(_) => ValueType::String,
     }
