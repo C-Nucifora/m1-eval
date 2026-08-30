@@ -14,6 +14,9 @@ pub mod table;
 pub mod loader;
 pub use loader::{Loaded, load};
 
+pub mod triggers;
+pub use triggers::{TriggerMap, TriggerStatus};
+
 pub mod env;
 pub use env::{CallSite, Env, OpState, StateStore};
 
@@ -50,7 +53,7 @@ pub mod runner;
 pub use runner::{CounterfactualCfg, run_counterfactual};
 
 pub mod coverage;
-pub use coverage::{CoverageItem, CoverageReport, ItemKind};
+pub use coverage::{CoverageItem, CoverageReport, ItemKind, UnresolvedTrigger};
 
 pub mod engine;
 pub use engine::Engine;

@@ -18,6 +18,7 @@
 
 use crate::builtins::{BuiltinSupport, CapabilityScope, classify_bare_call, classify_member_call};
 use crate::loader::Loaded;
+use crate::triggers::{TriggerMap, TriggerStatus};
 use m1_core::{Field, Kind, Node};
 use m1_typecheck::Project;
 use m1_typecheck::parsed::ParsedScript;
@@ -42,6 +43,17 @@ pub enum ItemKind {
     Construct,
 }
 
+/// A function whose selected project trigger could not be resolved.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct UnresolvedTrigger {
+    /// Canonical function symbol.
+    pub function: String,
+    /// Original `SelectedTrigger` expression on that function.
+    pub trigger: String,
+    /// Concrete resolution failure suitable for diagnostics.
+    pub reason: String,
+}
+
 /// The coverage analysis result: which used items are supported, stubbed, or
 /// unsupported. Each list is de-duplicated and sorted for a deterministic report.
 #[derive(Debug, Clone, Default, PartialEq)]
@@ -57,15 +69,20 @@ pub struct CoverageReport {
     /// The whole-project execution schedule: one `(function symbol, rate)` entry
     /// per script-backed function. `Some(hz)` is the function's periodic rate (it
     /// runs that many times per second in whole-project mode); `None` flags a
-    /// function with no resolvable periodic trigger. Startup functions are
-    /// identified separately in [`CoverageReport::startup`]; other `None` entries
-    /// are not run by the whole-project scheduler. Sorted `(rate descending,
-    /// function symbol)` for a deterministic report; empty when the analysis had
-    /// no [`Project`] to resolve rates from.
+    /// function with no resolved periodic trigger. Companion fields distinguish
+    /// startup, helper, unscheduled, and unresolved cases. Sorted `(rate
+    /// descending, function symbol)` for a deterministic report; empty when the
+    /// analysis had no [`Project`] to resolve rates from.
     pub schedule: Vec<(String, Option<f64>)>,
     /// Functions the whole-project runner executes exactly once before the
     /// periodic loop. These also appear in `schedule` with no periodic rate.
     pub startup: Vec<String>,
+    /// Callable helper or calibration functions that are not scheduler roots.
+    pub helpers: Vec<String>,
+    /// Schedulable functions with no selected trigger.
+    pub unscheduled: Vec<String>,
+    /// Functions whose selected trigger is invalid or cannot be resolved.
+    pub unresolved: Vec<UnresolvedTrigger>,
 }
 
 impl CoverageReport {
@@ -76,7 +93,7 @@ impl CoverageReport {
     /// [`CoverageReport::analyse_in`] for project-accurate receiver and
     /// user-function coverage.
     pub fn analyse(scripts: &[ParsedScript]) -> CoverageReport {
-        Self::analyse_with_startup(scripts, None, &[])
+        Self::analyse_with_triggers(scripts, None, None)
     }
 
     /// Analyse every script with optional project context. When a [`Project`] is
@@ -86,23 +103,23 @@ impl CoverageReport {
     /// Bits.Update` vs `Slip Control.Update`). Runtime dispatch and coverage both
     /// use the same receiver-aware capability classifier.
     pub fn analyse_in(scripts: &[ParsedScript], project: Option<&Project>) -> CoverageReport {
-        Self::analyse_with_startup(scripts, project, &[])
+        Self::analyse_with_triggers(scripts, project, None)
     }
 
     /// Analyse a complete loaded project, including the loader's exact startup
     /// trigger set. This is the path used by [`crate::Engine::coverage`].
     pub fn analyse_loaded(loaded: &Loaded) -> CoverageReport {
-        Self::analyse_with_startup(
+        Self::analyse_with_triggers(
             &loaded.scripts,
             Some(&loaded.project),
-            &loaded.startup_fn_symbols,
+            Some(&loaded.triggers),
         )
     }
 
-    fn analyse_with_startup(
+    fn analyse_with_triggers(
         scripts: &[ParsedScript],
         project: Option<&Project>,
-        startup_fn_symbols: &[String],
+        triggers: Option<&TriggerMap>,
     ) -> CoverageReport {
         let mut supported = BTreeSet::new();
         let mut assumed = BTreeSet::new();
@@ -137,13 +154,17 @@ impl CoverageReport {
         assumed.retain(|i| !unsupported.contains(i) && !stubbed.contains(i));
         supported
             .retain(|i| !unsupported.contains(i) && !stubbed.contains(i) && !assumed.contains(i));
+        let roles = build_trigger_roles(triggers);
         CoverageReport {
             supported: supported.into_iter().collect(),
             assumed: assumed.into_iter().collect(),
             stubbed: stubbed.into_iter().collect(),
             unsupported: unsupported.into_iter().collect(),
-            schedule: build_schedule(scripts, project),
-            startup: build_startup(scripts, project, startup_fn_symbols),
+            schedule: build_schedule(scripts, project, triggers),
+            startup: roles.startup,
+            helpers: roles.helpers,
+            unscheduled: roles.unscheduled,
+            unresolved: roles.unresolved,
         }
     }
 
@@ -156,7 +177,14 @@ impl CoverageReport {
         render_section(&mut out, "Assumed", &self.assumed);
         render_section(&mut out, "Stubbed", &self.stubbed);
         render_section(&mut out, "Unsupported", &self.unsupported);
-        render_schedule(&mut out, &self.schedule, &self.startup);
+        render_schedule(
+            &mut out,
+            &self.schedule,
+            &self.startup,
+            &self.helpers,
+            &self.unscheduled,
+            &self.unresolved,
+        );
         out
     }
 }
@@ -164,7 +192,14 @@ impl CoverageReport {
 /// Append the `Schedule:` section: one line per function with its periodic rate,
 /// startup execution, or unscheduled status. An empty schedule still prints the
 /// label so the output shape is stable.
-fn render_schedule(out: &mut String, schedule: &[(String, Option<f64>)], startup: &[String]) {
+fn render_schedule(
+    out: &mut String,
+    schedule: &[(String, Option<f64>)],
+    startup: &[String],
+    helpers: &[String],
+    unscheduled: &[String],
+    unresolved: &[UnresolvedTrigger],
+) {
     out.push_str("Schedule:\n");
     if schedule.is_empty() {
         out.push_str("  (none)\n");
@@ -173,23 +208,49 @@ fn render_schedule(out: &mut String, schedule: &[(String, Option<f64>)], startup
     for (function, rate) in schedule {
         match rate {
             Some(hz) => out.push_str(&format!("  {function} @ {hz} Hz\n")),
-            None if startup.binary_search(function).is_ok() => {
-                out.push_str(&format!("  {function} (startup, runs once)\n"));
+            None => {
+                if startup.binary_search(function).is_ok() {
+                    out.push_str(&format!("  {function} (startup, runs once)\n"));
+                } else if helpers.binary_search(function).is_ok() {
+                    out.push_str(&format!("  {function} (helper, not scheduled directly)\n"));
+                } else if let Ok(index) = unresolved
+                    .binary_search_by(|entry| entry.function.as_str().cmp(function.as_str()))
+                {
+                    let entry = &unresolved[index];
+                    if entry.trigger.is_empty() {
+                        out.push_str(&format!(
+                            "  {function} (unresolved trigger: {})\n",
+                            entry.reason
+                        ));
+                    } else {
+                        out.push_str(&format!(
+                            "  {function} (unresolved trigger `{}`: {})\n",
+                            entry.trigger, entry.reason
+                        ));
+                    }
+                } else if unscheduled.binary_search(function).is_ok() {
+                    out.push_str(&format!(
+                        "  {function} (unscheduled, no trigger selected)\n"
+                    ));
+                } else {
+                    out.push_str(&format!("  {function} (unscheduled)\n"));
+                }
             }
-            None => out.push_str(&format!("  {function} (unscheduled)\n")),
         }
     }
 }
 
 /// Derive the whole-project execution schedule: one `(function symbol, rate)`
-/// entry per script-backed function. Mirrors `runner::enumerate_scheduled`'s rate
-/// derivation (`function_symbol_for_script` → `symbols().get(..).call_rate_hz`)
-/// but keeps the **unscheduled** (`None`) functions too, so the report can flag
-/// them. Sorted `(rate descending, function symbol)` for determinism; empty when
-/// no [`Project`] is available to resolve rates.
+/// entry per script-backed function. Loaded-project analysis reads the same
+/// effective trigger map as `runner::enumerate_scheduled` and keeps every
+/// nonperiodic function as `None`, so companion status fields can explain why
+/// it is excluded. Project-only analysis falls back to `call_rate_hz` because it
+/// has no raw `SelectedTrigger` attributes. Sorted `(rate descending, function
+/// symbol)` for determinism; empty when no [`Project`] is available.
 fn build_schedule(
     scripts: &[ParsedScript],
     project: Option<&Project>,
+    triggers: Option<&TriggerMap>,
 ) -> Vec<(String, Option<f64>)> {
     let Some(project) = project else {
         return Vec::new();
@@ -200,10 +261,13 @@ fn build_schedule(
             // A script without a backing function symbol is not a scheduled
             // function (e.g. a non-function script) — skip it entirely.
             let fn_symbol = project.function_symbol_for_script(&script.name)?;
-            let rate_hz = project
-                .symbols()
-                .get(&fn_symbol)
-                .and_then(|s| s.call_rate_hz);
+            let rate_hz = match triggers {
+                Some(map) => map.periodic_rate(&fn_symbol),
+                None => project
+                    .symbols()
+                    .get(&fn_symbol)
+                    .and_then(|symbol| symbol.call_rate_hz),
+            };
             Some((fn_symbol, rate_hz))
         })
         .collect();
@@ -218,29 +282,35 @@ fn build_schedule(
     schedule
 }
 
-/// Keep the loader's exact `On Startup` set, restricted to functions that have
-/// a discovered backing script. Sorted for deterministic rendering and binary
-/// lookup in [`render_schedule`].
-fn build_startup(
-    scripts: &[ParsedScript],
-    project: Option<&Project>,
-    startup_fn_symbols: &[String],
-) -> Vec<String> {
-    let Some(project) = project else {
-        return Vec::new();
+#[derive(Default)]
+struct TriggerRoles {
+    startup: Vec<String>,
+    helpers: Vec<String>,
+    unscheduled: Vec<String>,
+    unresolved: Vec<UnresolvedTrigger>,
+}
+
+fn build_trigger_roles(triggers: Option<&TriggerMap>) -> TriggerRoles {
+    let mut roles = TriggerRoles::default();
+    let Some(triggers) = triggers else {
+        return roles;
     };
-    let script_functions: BTreeSet<String> = scripts
-        .iter()
-        .filter_map(|script| project.function_symbol_for_script(&script.name))
-        .collect();
-    let mut startup: Vec<String> = startup_fn_symbols
-        .iter()
-        .filter(|function| script_functions.contains(*function))
-        .cloned()
-        .collect();
-    startup.sort();
-    startup.dedup();
-    startup
+    for (function, status) in triggers.iter() {
+        match status {
+            TriggerStatus::Periodic(_) => {}
+            TriggerStatus::Startup => roles.startup.push(function.to_string()),
+            TriggerStatus::Helper => roles.helpers.push(function.to_string()),
+            TriggerStatus::Unscheduled => roles.unscheduled.push(function.to_string()),
+            TriggerStatus::Unresolved { trigger, reason } => {
+                roles.unresolved.push(UnresolvedTrigger {
+                    function: function.to_string(),
+                    trigger: trigger.clone(),
+                    reason: reason.clone(),
+                });
+            }
+        }
+    }
+    roles
 }
 
 /// Sort key that places a periodic rate by its Hz (descending when compared
@@ -815,6 +885,37 @@ Output = i;
             text.contains("Root.MR.Init") && text.contains("startup, runs once"),
             "startup execution not rendered: {text}"
         );
+    }
+
+    #[test]
+    fn coverage_distinguishes_every_trigger_status() {
+        let dir = std::path::Path::new(env!("CARGO_MANIFEST_DIR")).join("tests/fixtures/triggers");
+        let loaded =
+            crate::loader::load(&dir.join("Project.m1prj"), None).expect("trigger fixture loads");
+        let report = CoverageReport::analyse_loaded(&loaded);
+        let by_fn: std::collections::HashMap<&str, Option<f64>> = report
+            .schedule
+            .iter()
+            .map(|(function, rate)| (function.as_str(), *rate))
+            .collect();
+
+        assert_eq!(by_fn.get("Root.T.Direct"), Some(&Some(100.0)));
+        assert_eq!(by_fn.get("Root.T.Grouped"), Some(&Some(50.0)));
+        assert_eq!(by_fn.get("Root.T.Parameterized"), Some(&Some(200.0)));
+        assert_eq!(report.startup, vec!["Root.T.Startup"]);
+        assert_eq!(report.helpers, vec!["Root.T.Helper"]);
+        assert_eq!(report.unscheduled, vec!["Root.T.Unscheduled"]);
+        assert_eq!(report.unresolved.len(), 1);
+        assert_eq!(report.unresolved[0].function, "Root.T.Invalid");
+        assert!(report.unresolved[0].reason.contains("missing component"));
+
+        let rendered = report.render();
+        assert!(rendered.contains("Root.T.Parameterized @ 200 Hz"));
+        assert!(rendered.contains("Root.T.Startup (startup, runs once)"));
+        assert!(rendered.contains("Root.T.Helper (helper, not scheduled directly)"));
+        assert!(rendered.contains("Root.T.Unscheduled (unscheduled, no trigger selected)"));
+        assert!(rendered.contains("Root.T.Invalid (unresolved trigger"));
+        assert!(rendered.contains("missing component `Root.Events.On 999Hz`"));
     }
 
     #[test]

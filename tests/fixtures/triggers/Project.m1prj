@@ -1,0 +1,42 @@
+<?xml version="1.0"?>
+<!-- Synthetic trigger-resolution fixture. No proprietary MoTeC content. -->
+<MoTeCM1BuildSession>
+ <Project Name="Triggers" TargetHardware="ecu120">
+  <ComponentStream><List>
+   <Component Classname="BuiltIn.GroupCompound" Name="Root.T"/>
+   <Component Classname="BuiltIn.GroupCompound" Name="Root.Events"/>
+   <Component Classname="BuiltIn.EventKernel" Name="Root.Events.On 50Hz"/>
+   <Component Classname="BuiltIn.EventKernel" Name="Root.Events.On 100Hz"/>
+   <Component Classname="BuiltIn.EventKernel" Name="Root.Events.On 200Hz"/>
+   <Component Classname="BuiltIn.EventKernel" Name="Root.Events.On Startup"/>
+
+   <Component Classname="BuiltIn.Channel" Name="Root.T.Direct Out"><Props Type="f32"/></Component>
+   <Component Classname="BuiltIn.Channel" Name="Root.T.Grouped Out"><Props Type="f32"/></Component>
+   <Component Classname="BuiltIn.Channel" Name="Root.T.Parameterized Out"><Props Type="f32"/></Component>
+   <Component Classname="BuiltIn.Channel" Name="Root.T.Started"><Props Type="f32"/></Component>
+   <Component Classname="BuiltIn.Channel" Name="Root.T.Unscheduled Out"><Props Type="f32"/></Component>
+   <Component Classname="BuiltIn.Channel" Name="Root.T.Invalid Out"><Props Type="f32"/></Component>
+
+   <Component Classname="BuiltIn.FuncUser" Filename="T.Direct.m1scr" Name="Root.T.Direct">
+    <Props SelectedTrigger="Root.Events.On 100Hz"/>
+   </Component>
+   <Component Classname="BuiltIn.FuncUser" Filename="T.Grouped.m1scr" Name="Root.T.Grouped">
+    <Props SelectedTrigger="Parent.Parent.Events.On 50Hz"/>
+   </Component>
+   <Component Classname="BuiltIn.MethodUser" Name="Root.T.Calculation">
+    <Props SelectedTrigger="Parent.Parent.Events.On 200Hz"/>
+   </Component>
+   <Component Classname="BuiltIn.FuncUser" Filename="T.Parameterized.m1scr" Name="Root.T.Parameterized">
+    <Props SelectedTrigger="$(Parent.Calculation:SelectedTrigger)"/>
+   </Component>
+   <Component Classname="BuiltIn.FuncUser" Filename="T.Startup.m1scr" Name="Root.T.Startup">
+    <Props SelectedTrigger="Parent.Parent.Events.On Startup"/>
+   </Component>
+   <Component Classname="BuiltIn.FuncUserParam" Filename="T.Helper.m1scr" Name="Root.T.Helper"/>
+   <Component Classname="BuiltIn.FuncUser" Filename="T.Unscheduled.m1scr" Name="Root.T.Unscheduled"/>
+   <Component Classname="BuiltIn.FuncUser" Filename="T.Invalid.m1scr" Name="Root.T.Invalid">
+    <Props SelectedTrigger="Root.Events.On 999Hz"/>
+   </Component>
+  </List></ComponentStream>
+ </Project>
+</MoTeCM1BuildSession>

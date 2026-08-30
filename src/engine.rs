@@ -214,11 +214,7 @@ impl Engine {
                 .loaded
                 .project
                 .function_symbol_for_script(&script.name)?;
-            self.loaded
-                .project
-                .symbols()
-                .get(&fn_symbol)
-                .and_then(|s| s.call_rate_hz)
+            self.loaded.triggers.periodic_rate(&fn_symbol)
         }))
         .unwrap_or(100.0)
     }

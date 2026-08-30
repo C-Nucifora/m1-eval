@@ -247,10 +247,8 @@ fn exact_divisor(
     Ok((base_mhz / rate_mhz) as usize)
 }
 
-/// One scheduled function together with its periodic execution rate in Hz, as
-/// derived from the function symbol's `call_rate_hz`. Only functions with a
-/// resolvable periodic trigger (a `BuiltIn.EventKernel` clock like `On 100Hz`)
-/// appear here; `On Startup` / untriggered functions (rate `None`) are excluded.
+/// One scheduled function together with its resolved periodic execution rate.
+/// Startup, helper, unscheduled, and unresolved functions never appear here.
 struct ScheduledRated<'a> {
     /// The scheduled function (script + resolved scope).
     sched: Scheduled<'a>,
@@ -261,12 +259,10 @@ struct ScheduledRated<'a> {
 /// Build the whole-project schedule: every periodically-scheduled function, in
 /// dependency-then-rate order.
 ///
-/// 1. **Enumerate + rate** (Task 11): for each script, the backing function
-///    symbol's `call_rate_hz` gives its periodic rate. Keep only the functions
-///    with `Some(rate)` — exactly the pattern `m1-typecheck`'s `schedule.rs`
-///    uses (`symbols().get(&fn_path).and_then(|s| s.call_rate_hz)`). Startup /
-///    untriggered functions (`None`) are not periodically scheduled, so they are
-///    excluded.
+/// 1. **Enumerate + rate** (Task 11): for each script, read the effective rate
+///    from [`Loaded::triggers`]. This includes direct, group-relative, and
+///    `$(…:SelectedTrigger)` attribute-reference forms. Keep only periodic
+///    functions.
 /// 2. **Dependency-then-rate order** (Task 12): within a single rate group,
 ///    writer-before-reader topological order (from [`io_sets`], reusing
 ///    [`topo_order`]); groups concatenated fastest-rate-first. There are no
@@ -281,21 +277,17 @@ fn build_whole_project_schedule(loaded: &Loaded) -> Vec<ScheduledRated<'_>> {
 
 /// Enumerate every periodically-scheduled function with its rate (Task 11).
 ///
-/// For each parsed script, resolve its backing function symbol and read that
-/// symbol's `call_rate_hz`; keep only functions with a periodic rate. The result
-/// is sorted by `(rate descending, fn_symbol)` as a deterministic baseline; the
-/// dependency layer (Task 12) refines order *within* each rate group.
+/// For each parsed script, resolve its backing function symbol and effective
+/// trigger; keep only periodic functions. The result is sorted by `(rate
+/// descending, fn_symbol)` as a deterministic baseline; the dependency layer
+/// refines order within each rate group.
 fn enumerate_scheduled(loaded: &Loaded) -> Vec<ScheduledRated<'_>> {
     let mut rated: Vec<ScheduledRated> = loaded
         .scripts
         .iter()
         .filter_map(|script| {
             let fn_symbol = loaded.project.function_symbol_for_script(&script.name)?;
-            let rate_hz = loaded
-                .project
-                .symbols()
-                .get(&fn_symbol)
-                .and_then(|s| s.call_rate_hz)?;
+            let rate_hz = loaded.triggers.periodic_rate(&fn_symbol)?;
             Some(ScheduledRated {
                 sched: scheduled_for(loaded, script),
                 rate_hz,
@@ -612,12 +604,12 @@ struct RunPlan {
 
 /// The On-Startup functions to run once before the periodic loop, in
 /// writer-before-reader order — whole-project mode only (function/cone modes
-/// pin a single explicit target and model no initialisation pass). Each
-/// `startup_fn_symbols` entry (from the loader's trigger scan) is matched back
-/// to its parsed script; ordering reuses the same single-group topological
-/// machinery as the periodic schedule (nominal rate, stripped after ordering).
+/// pin a single explicit target and model no initialisation pass). Each resolved
+/// startup entry is matched back to its parsed script; ordering
+/// reuses the same single-group topological machinery as the periodic schedule
+/// with a nominal rate that is stripped after ordering.
 fn startup_schedule<'a>(loaded: &'a Loaded, scenario: &Scenario) -> Vec<Scheduled<'a>> {
-    if !matches!(scenario.mode, RunMode::WholeProject) || loaded.startup_fn_symbols.is_empty() {
+    if !matches!(scenario.mode, RunMode::WholeProject) {
         return Vec::new();
     }
     let mut rated: Vec<ScheduledRated> = loaded
@@ -625,7 +617,10 @@ fn startup_schedule<'a>(loaded: &'a Loaded, scenario: &Scenario) -> Vec<Schedule
         .iter()
         .filter_map(|script| {
             let fn_symbol = loaded.project.function_symbol_for_script(&script.name)?;
-            if !loaded.startup_fn_symbols.contains(&fn_symbol) {
+            if !matches!(
+                loaded.triggers.get(&fn_symbol),
+                Some(crate::triggers::TriggerStatus::Startup)
+            ) {
                 return None;
             }
             Some(ScheduledRated {
@@ -1054,8 +1049,8 @@ pub fn run_counterfactual(
     // on a tick holds its last value (zero-order hold) — reusing the schedule-write
     // hold machinery the tick loop already relies on.
     //
-    // Each cone function keeps its **declared** project rate (its trigger's
-    // `call_rate_hz`): a 10 Hz state machine in the cone runs every 10th tick of
+    // Each cone function keeps its resolved project rate: a 10 Hz state machine
+    // in the cone runs every 10th tick of
     // a 100 Hz replay with dt = 0.1 s, exactly as scheduled on the ECU — not
     // once per base tick, which over-ran slow filters/integrators/debounce
     // logic 10x. A function without a resolvable periodic rate (no trigger)
@@ -1067,8 +1062,7 @@ pub fn run_counterfactual(
             let rate_hz = sched
                 .fn_symbol
                 .as_deref()
-                .and_then(|f| loaded.project.symbols().get(f))
-                .and_then(|s| s.call_rate_hz)
+                .and_then(|function| loaded.triggers.periodic_rate(function))
                 .unwrap_or(base_rate_hz);
             ScheduledRated { sched, rate_hz }
         })
@@ -1515,6 +1509,11 @@ const = "oops"
         load(&dir.join("Project.m1prj"), None).expect("ratemix fixture loads")
     }
 
+    fn trigger_fixture() -> Loaded {
+        let dir = Path::new(env!("CARGO_MANIFEST_DIR")).join("tests/fixtures/triggers");
+        load(&dir.join("Project.m1prj"), None).expect("trigger fixture loads")
+    }
+
     #[test]
     fn auto_base_is_lcm_of_scheduled_rates() {
         // 500 Hz and 200 Hz do not divide each other: neither rate can serve as
@@ -1750,6 +1749,59 @@ const = 3.0
             vec![100.0, 100.0, 50.0, 50.0],
             "fastest-first baseline"
         );
+    }
+
+    #[test]
+    fn parameterized_trigger_runs_at_its_effective_rate() {
+        let loaded = trigger_fixture();
+        let rated = enumerate_scheduled(&loaded);
+        let by_fn: std::collections::HashMap<String, f64> = rated
+            .iter()
+            .map(|entry| {
+                (
+                    entry
+                        .sched
+                        .fn_symbol
+                        .clone()
+                        .expect("scheduled function has a symbol"),
+                    entry.rate_hz,
+                )
+            })
+            .collect();
+        assert_eq!(by_fn.get("Root.T.Direct"), Some(&100.0));
+        assert_eq!(by_fn.get("Root.T.Grouped"), Some(&50.0));
+        assert_eq!(by_fn.get("Root.T.Parameterized"), Some(&200.0));
+        for excluded in [
+            "Root.T.Startup",
+            "Root.T.Helper",
+            "Root.T.Unscheduled",
+            "Root.T.Invalid",
+        ] {
+            assert!(
+                !by_fn.contains_key(excluded),
+                "{excluded} must not be periodic"
+            );
+        }
+
+        let scenario = Scenario::from_toml_str(
+            r#"
+mode = "whole-project"
+duration_s = 0.01
+"#,
+        )
+        .expect("scenario parses");
+        let trace = run(&loaded, &scenario).expect("resolved schedule executes");
+        assert_eq!(trace.time.len(), 2, "auto base is 200 Hz");
+        assert_eq!(
+            trace.channels.get("Root.T.Parameterized Out"),
+            Some(&vec![Value::m1_float(3.0), Value::m1_float(3.0)])
+        );
+        assert_eq!(
+            trace.channels.get("Root.T.Started"),
+            Some(&vec![Value::m1_float(4.0), Value::m1_float(4.0)])
+        );
+        assert!(!trace.channels.contains_key("Root.T.Unscheduled Out"));
+        assert!(!trace.channels.contains_key("Root.T.Invalid Out"));
     }
 
     #[test]

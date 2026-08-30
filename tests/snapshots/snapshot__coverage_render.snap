@@ -12,4 +12,4 @@ Stubbed:
 Unsupported:
   (none)
 Schedule:
-  Root.Demo.Update (unscheduled)
+  Root.Demo.Update (unscheduled, no trigger selected)

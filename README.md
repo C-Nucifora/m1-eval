@@ -82,13 +82,14 @@ mode and is mutually exclusive with `--function` / `--target`).
 The multi-rate model:
 
 - **Schedule from the project.** A function's execution rate is its
-  `.m1prj` trigger — a `BuiltIn.EventKernel` clock such as `On 500Hz` /
-  `On 50Hz` — surfaced by `m1-typecheck` as the symbol's `call_rate_hz`. Every
-  function with a resolvable periodic rate (500 / 200 / 50 / 10 / 2 Hz) is
-  scheduled. An `On Startup` function runs **exactly once**, before the first
-  periodic tick (its outputs hold from tick 0). Untriggered and
-  `$(…)`-parameterised-trigger functions are **not** run and are flagged
-  *unscheduled* in `--coverage`.
+  `.m1prj` `SelectedTrigger`, which must resolve to a `BuiltIn.EventKernel`
+  clock such as `On 500Hz` or `On 50Hz`. The resolver handles absolute paths,
+  group-relative `Parent.` paths, and `$(<component>:SelectedTrigger)` attribute
+  references. An `On Startup` function runs **exactly once** before the first
+  periodic tick, and its outputs hold from tick 0. Parameterised user functions
+  and calibration functions remain callable helpers. Functions with no trigger
+  stay unscheduled. Invalid or dangling trigger references are excluded and
+  reported with the failed path or attribute in `--coverage`.
 - **Base tick + exact rate divisors.** The run advances on one base tick grid.
   When `base_rate_hz` is unset it defaults to the **least common multiple** of
   the scheduled rates, so every function has an exact integer tick period —
@@ -144,9 +145,9 @@ remain **Assumed** maturity until captured M1 output verifies them.
 
 The report also prints a **`Schedule:`** section: every script-backed function
 with its execution rate (`@ 500 Hz`, `@ 50 Hz`, …), `startup, runs once`, or
-*unscheduled*. This makes a `whole-project` run transparent — you see exactly
-which functions the scheduler will run, at what rate, and which are excluded —
-before you run it.
+an explicit `helper`, `unscheduled`, or `unresolved trigger` status. The last
+status includes the failed path or attribute, so a project author can repair the
+selection instead of treating every excluded function as the same case.
 
 ## Quickstart
 
