@@ -1146,6 +1146,7 @@ fn fixture_scenario(
         base_rate_hz: fixture.calculation_rate_hz,
         overrides: Vec::new(),
         io: Vec::new(),
+        serial: Default::default(),
         allow_default_inputs: false,
     })
 }

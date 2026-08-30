@@ -7,14 +7,15 @@
 //! 1. An exact-call-site scenario override.
 //! 2. A wildcard scenario override for the call name.
 //! 3. An external [`HardwareAdapter`](crate::hardware::HardwareAdapter).
-//! 4. The deterministic `System` clock/tick model.
-//! 5. A generic typed stub. Every other method that the intrinsic registry
+//! 4. The deterministic virtual RS232 adapter.
+//! 5. The deterministic `System` clock/tick model.
+//! 6. A generic typed stub. Every other method that the intrinsic registry
 //!    lists for the object is a hardware-backed read/write with no meaningful
 //!    offline value, but a determinate *type*. Rather than abort a whole-project
 //!    run on the first CAN read, we return the type-correct zero/false/empty
 //!    default for the overload's declared return type (see `typed_io_default`).
 //!    This is the externally-driven default a scenario/log replay would override.
-//! 6. Fail loud. A method the registry does not list on the object is
+//! 7. Fail loud. A method the registry does not list on the object is
 //!    genuinely unknown — we never invent a value for it, so it returns
 //!    [`EvalError::UnsupportedBuiltin`].
 //!
@@ -88,6 +89,30 @@ pub(crate) fn call_with_runtime(
     {
         let value = coerce_hardware_value(value, returns, &call, ctx)?;
         return complete(ctx, &call, value, HardwareValueSource::Adapter);
+    }
+
+    if library_object == "Serial"
+        && let Some(reply) = runtime.serial.as_mut().call(method, &call)?
+    {
+        let value = coerce_hardware_value(reply.value, returns, &call, ctx)?;
+        if let Some(event) = reply.event
+            && let Some(trace) = ctx.trace.as_deref_mut()
+        {
+            trace.record_serial(event);
+        }
+        let source = if reply.external {
+            HardwareValueSource::VirtualSerialRx
+        } else {
+            HardwareValueSource::VirtualSerial
+        };
+        return complete(ctx, &call, value, source);
+    }
+
+    if library_object == "Serial" && crate::virtual_serial::is_explicitly_unsupported(method) {
+        return Err(EvalError::UnsupportedBuiltin {
+            object: source_object.to_string(),
+            method: method.to_string(),
+        });
     }
 
     if let Some(value) = system_model(library_object, method, args, &call.site, ctx, runtime)? {
@@ -570,7 +595,11 @@ mod tests {
                 depth: 0,
                 trace: Some(&mut self.trace),
             };
-            let mut runtime = EvalRuntime { time, hardware };
+            let mut runtime = EvalRuntime {
+                time,
+                hardware,
+                serial: crate::expr::SerialRuntime::fresh(),
+            };
             crate::builtins::dispatch_with_runtime(
                 object,
                 method,

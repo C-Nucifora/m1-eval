@@ -92,6 +92,28 @@ pub struct EvalCtx<'a> {
 pub(crate) struct EvalRuntime<'h> {
     pub(crate) time: EvalTime,
     pub(crate) hardware: Option<&'h mut dyn HardwareAdapter>,
+    pub(crate) serial: SerialRuntime<'h>,
+}
+
+/// A public evaluator call owns a fresh adapter, while a runner borrows one
+/// adapter across startup and every tick. The enum keeps that ownership detail
+/// private and leaves the public [`EvalCtx`] struct unchanged.
+pub(crate) enum SerialRuntime<'h> {
+    Fresh(crate::virtual_serial::VirtualSerial),
+    Shared(&'h mut crate::virtual_serial::VirtualSerial),
+}
+
+impl SerialRuntime<'_> {
+    pub(crate) fn fresh() -> Self {
+        SerialRuntime::Fresh(crate::virtual_serial::VirtualSerial::empty())
+    }
+
+    pub(crate) fn as_mut(&mut self) -> &mut crate::virtual_serial::VirtualSerial {
+        match self {
+            SerialRuntime::Fresh(serial) => serial,
+            SerialRuntime::Shared(serial) => serial,
+        }
+    }
 }
 
 impl EvalRuntime<'static> {
@@ -108,6 +130,7 @@ impl EvalRuntime<'static> {
         EvalRuntime {
             time,
             hardware: None,
+            serial: SerialRuntime::fresh(),
         }
     }
 }

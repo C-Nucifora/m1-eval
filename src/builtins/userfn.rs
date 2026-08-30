@@ -344,7 +344,11 @@ mod tests {
                 depth: 0,
                 trace: None,
             };
-            let mut runtime = EvalRuntime { time, hardware };
+            let mut runtime = EvalRuntime {
+                time,
+                hardware,
+                serial: crate::expr::SerialRuntime::fresh(),
+            };
             call_with_runtime(callee, args, &mut ctx, &mut runtime)
         }
     }

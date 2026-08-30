@@ -31,7 +31,9 @@ pub mod ident;
 pub use ident::{Target, classify};
 
 pub mod trace;
-pub use trace::Trace;
+pub use trace::{SerialDirection, SerialEvent, Trace};
+
+mod virtual_serial;
 
 pub mod expr;
 pub use expr::{EvalCtx, eval, eval_at_time};
@@ -42,7 +44,9 @@ pub mod stmt;
 pub use stmt::{exec, exec_at_time, exec_script, exec_script_at_time};
 
 pub mod scenario;
-pub use scenario::{InitialValue, InputKind, InputSeries, IoSeries, RunMode, Scenario};
+pub use scenario::{
+    InitialValue, InputKind, InputSeries, IoSeries, RunMode, Scenario, SerialRx, SerialScenario,
+};
 
 pub mod log;
 pub use log::{Log, LogMeta};

@@ -205,11 +205,33 @@ pub struct Scenario {
     /// Scenario-driven hardware-call overrides (`[[io]]`), keyed by
     /// `"Object.Method"` and resampled every tick. See [`IoSeries`].
     pub io: Vec<IoSeries>,
+    /// Deterministic virtual-serial inputs. Each declaration becomes visible to
+    /// `Serial.Receive` when evaluator time reaches its timestamp.
+    pub serial: SerialScenario,
     /// Whole-project mode only: substitute type-correct startup defaults for
     /// unseeded channel reads (each substitution is reported on the trace)
     /// instead of failing loud. **Off by default** — strict fail-loud is the
     /// baseline; defaulting is an explicit, visible opt-in.
     pub allow_default_inputs: bool,
+}
+
+/// Scenario-owned inputs for the deterministic virtual serial adapter.
+#[derive(Debug, Clone, Default, PartialEq)]
+pub struct SerialScenario {
+    /// Received byte chunks, ordered by timestamp and then declaration order.
+    pub rx: Vec<SerialRx>,
+}
+
+/// One byte chunk made available on a virtual RS232 port at evaluator time.
+#[derive(Debug, Clone, PartialEq)]
+pub struct SerialRx {
+    /// Seconds from the beginning of the run. Startup and periodic tick zero
+    /// both observe declarations at `0.0`.
+    pub time_s: f64,
+    /// Non-negative M1 serial port number.
+    pub port: i32,
+    /// Bytes appended to the port's receive stream at [`SerialRx::time_s`].
+    pub bytes: Vec<u8>,
 }
 
 impl Scenario {
@@ -504,6 +526,8 @@ struct RawScenario {
     overrides: Vec<RawInput>,
     #[serde(default)]
     io: Vec<RawIo>,
+    #[serde(default)]
+    serial: RawSerial,
     /// Opt-in unseeded-channel defaulting for whole-project mode (strict
     /// fail-loud when absent/false).
     #[serde(default)]
@@ -515,6 +539,22 @@ struct RawScenario {
 struct RawInitialValue {
     channel: String,
     value: RawValue,
+}
+
+/// Wire shape for `[serial]` and its ergonomic `[[serial.rx]]` entries.
+#[derive(Debug, Default, Deserialize)]
+#[serde(deny_unknown_fields)]
+struct RawSerial {
+    #[serde(default)]
+    rx: Vec<RawSerialRx>,
+}
+
+#[derive(Debug, Deserialize)]
+#[serde(deny_unknown_fields)]
+struct RawSerialRx {
+    time_s: f64,
+    port: i64,
+    bytes: Vec<i64>,
 }
 
 /// A raw input/override entry: a channel plus exactly one of `const`/`series`.
@@ -720,6 +760,7 @@ impl RawScenario {
             .into_iter()
             .map(RawIo::into_io)
             .collect::<Result<Vec<_>, _>>()?;
+        let serial = self.serial.into_serial()?;
         let mut io_selectors = BTreeSet::new();
         for entry in &io {
             if !io_selectors.insert((entry.call.clone(), entry.site.clone())) {
@@ -746,7 +787,93 @@ impl RawScenario {
             base_rate_hz: self.base_rate_hz,
             overrides,
             io,
+            serial,
             allow_default_inputs: self.allow_default_inputs,
+        })
+    }
+}
+
+impl RawSerial {
+    fn into_serial(self) -> Result<SerialScenario, EvalError> {
+        let mut rx = self
+            .rx
+            .into_iter()
+            .enumerate()
+            .map(|(declaration, entry)| {
+                if !entry.time_s.is_finite() || entry.time_s < 0.0 {
+                    return Err(EvalError::UnsupportedConstruct {
+                        kind: format!(
+                            "serial rx declaration {} has invalid time_s {} (expected a finite, non-negative time)",
+                            declaration + 1,
+                            entry.time_s
+                        ),
+                        at: 0,
+                    });
+                }
+                let port = i32::try_from(entry.port).map_err(|_| {
+                    EvalError::UnsupportedConstruct {
+                        kind: format!(
+                            "serial rx declaration {} has port {} outside the M1 Integer range",
+                            declaration + 1,
+                            entry.port
+                        ),
+                        at: 0,
+                    }
+                })?;
+                if port < 0 {
+                    return Err(EvalError::UnsupportedConstruct {
+                        kind: format!(
+                            "serial rx declaration {} has negative port {port}",
+                            declaration + 1
+                        ),
+                        at: 0,
+                    });
+                }
+                let bytes = entry
+                    .bytes
+                    .into_iter()
+                    .enumerate()
+                    .map(|(index, byte)| {
+                        u8::try_from(byte).map_err(|_| EvalError::UnsupportedConstruct {
+                            kind: format!(
+                                "serial rx declaration {} byte {} is {byte}, outside 0..=255",
+                                declaration + 1,
+                                index
+                            ),
+                            at: 0,
+                        })
+                    })
+                    .collect::<Result<Vec<_>, _>>()?;
+                if bytes.len() > 256 {
+                    return Err(EvalError::UnsupportedConstruct {
+                        kind: format!(
+                            "serial rx declaration {} has {} bytes, exceeding the 256-byte receive buffer",
+                            declaration + 1,
+                            bytes.len()
+                        ),
+                        at: 0,
+                    });
+                }
+                Ok((
+                    declaration,
+                    SerialRx {
+                        time_s: entry.time_s,
+                        port,
+                        bytes,
+                    },
+                ))
+            })
+            .collect::<Result<Vec<_>, EvalError>>()?;
+
+        // Stable ordering makes out-of-order source declarations ergonomic while
+        // preserving source order for chunks with the same timestamp.
+        rx.sort_by(|(left_index, left), (right_index, right)| {
+            left.time_s
+                .total_cmp(&right.time_s)
+                .then_with(|| left_index.cmp(right_index))
+        });
+        Ok(SerialScenario {
+            rx: rx.into_iter().map(|(_, entry)| entry).collect(),
         })
     }
 }
@@ -877,6 +1004,83 @@ series = [[0.0, 0.0], [0.5, 50.0]]
         // At/after the second keyframe -> 50.0.
         assert_eq!(speed.sample(0.5), Value::m1_float(50.0));
         assert_eq!(speed.sample(0.99), Value::m1_float(50.0));
+    }
+
+    #[test]
+    fn parses_and_stably_orders_virtual_serial_rx_declarations() {
+        let scenario = Scenario::from_toml_str(
+            r#"
+mode = "function"
+target = "Root.Demo.Update"
+duration_s = 0.2
+base_rate_hz = 100.0
+
+[[serial.rx]]
+time_s = 0.1
+port = 2
+bytes = [0x43]
+
+[[serial.rx]]
+time_s = 0.0
+port = 2
+bytes = [0x41]
+
+[[serial.rx]]
+time_s = 0.1
+port = 2
+bytes = [0x42]
+"#,
+        )
+        .expect("serial scenario parses");
+
+        assert_eq!(
+            scenario.serial.rx,
+            vec![
+                SerialRx {
+                    time_s: 0.0,
+                    port: 2,
+                    bytes: vec![0x41],
+                },
+                SerialRx {
+                    time_s: 0.1,
+                    port: 2,
+                    bytes: vec![0x43],
+                },
+                SerialRx {
+                    time_s: 0.1,
+                    port: 2,
+                    bytes: vec![0x42],
+                },
+            ]
+        );
+    }
+
+    #[test]
+    fn virtual_serial_wire_values_are_range_checked() {
+        for (entry, expected) in [
+            (
+                "time_s = -0.1\nport = 0\nbytes = [1]",
+                "finite, non-negative time",
+            ),
+            ("time_s = 0.0\nport = -1\nbytes = [1]", "negative port -1"),
+            ("time_s = 0.0\nport = 0\nbytes = [256]", "outside 0..=255"),
+            (
+                &format!(
+                    "time_s = 0.0\nport = 0\nbytes = [{}]",
+                    std::iter::repeat_n("0", 257).collect::<Vec<_>>().join(", ")
+                ),
+                "257 bytes",
+            ),
+        ] {
+            let source = format!(
+                "mode = \"function\"\ntarget = \"Root.Demo.Update\"\nduration_s = 0.1\nbase_rate_hz = 100.0\n\n[[serial.rx]]\n{entry}\n"
+            );
+            let error = Scenario::from_toml_str(&source).expect_err("invalid serial input fails");
+            assert!(
+                error.to_string().contains(expected),
+                "{error} should contain {expected:?}"
+            );
+        }
     }
 
     #[test]

@@ -1,0 +1,9 @@
+// Synthetic virtual-serial fixture. No proprietary or captured data.
+if (Init OK)
+{
+ local h = Serial.GetHandle(true);
+ if (Serial.Receive(h, 0))
+ {
+  Startup Byte = Serial.GetUnsignedInteger(h, 0, 1);
+ }
+}

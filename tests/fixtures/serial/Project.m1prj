@@ -1,0 +1,45 @@
+<?xml version="1.0"?>
+<!-- Synthetic virtual-serial fixture. No proprietary or captured data. -->
+<MoTeCM1BuildSession>
+ <Project Name="Virtual Serial" TargetHardware="ecu120">
+  <ComponentStream><List>
+   <Component Classname="BuiltIn.GroupCompound" Name="Root.Serial Test"/>
+   <Component Classname="BuiltIn.GroupCompound" Name="Root.Events"/>
+   <Component Classname="BuiltIn.EventKernel" Name="Root.Events.On 100Hz"/>
+   <Component Classname="BuiltIn.EventKernel" Name="Root.Events.On 50Hz"/>
+   <Component Classname="BuiltIn.EventKernel" Name="Root.Events.On Startup"/>
+   <Component Classname="BuiltIn.Channel" Name="Root.Serial Test.Init OK"><Props Type="bool"/></Component>
+   <Component Classname="BuiltIn.Channel" Name="Root.Serial Test.Diagnostic"><Props Type="i32"/></Component>
+   <Component Classname="BuiltIn.Channel" Name="Root.Serial Test.Startup Byte"><Props Type="i32"/></Component>
+   <Component Classname="BuiltIn.Channel" Name="Root.Serial Test.Handle A"><Props Type="u32"/></Component>
+   <Component Classname="BuiltIn.Channel" Name="Root.Serial Test.Handle B"><Props Type="u32"/></Component>
+   <Component Classname="BuiltIn.Channel" Name="Root.Serial Test.Available A"><Props Type="bool"/></Component>
+   <Component Classname="BuiltIn.Channel" Name="Root.Serial Test.Available B"><Props Type="bool"/></Component>
+   <Component Classname="BuiltIn.Channel" Name="Root.Serial Test.Byte A"><Props Type="i32"/></Component>
+   <Component Classname="BuiltIn.Channel" Name="Root.Serial Test.Byte B"><Props Type="i32"/></Component>
+   <Component Classname="BuiltIn.Channel" Name="Root.Serial Test.Nested Byte"><Props Type="i32"/></Component>
+   <Component Classname="BuiltIn.Channel" Name="Root.Serial Test.Tx Offset"><Props Type="i32"/></Component>
+   <Component Classname="BuiltIn.FuncUser" Filename="Serial Test.Init.m1scr" Name="Root.Serial Test.Init">
+    <Props SelectedTrigger="Root.Events.On Startup"/>
+   </Component>
+   <Component Classname="BuiltIn.FuncUser" Filename="Serial Test.Startup Receive.m1scr" Name="Root.Serial Test.Startup Receive">
+    <Props SelectedTrigger="Root.Events.On Startup"/>
+   </Component>
+   <Component Classname="BuiltIn.FuncUser" Filename="Serial Test.Receive A.m1scr" Name="Root.Serial Test.Receive A">
+    <Props SelectedTrigger="Root.Events.On 100Hz"/>
+   </Component>
+   <Component Classname="BuiltIn.FuncUser" Filename="Serial Test.Receive B.m1scr" Name="Root.Serial Test.Receive B">
+    <Props SelectedTrigger="Root.Events.On 50Hz"/>
+   </Component>
+   <Component Classname="BuiltIn.FuncUser" Filename="Serial Test.Nested.m1scr" Name="Root.Serial Test.Nested">
+    <Props SelectedTrigger="Root.Events.On 50Hz"/>
+   </Component>
+   <Component Classname="BuiltIn.FuncUser" Filename="Serial Test.Transmit.m1scr" Name="Root.Serial Test.Transmit">
+    <Props SelectedTrigger="Root.Events.On 50Hz"/>
+   </Component>
+   <Component Classname="BuiltIn.FuncUserParam" Filename="Serial Test.Read Helper.m1scr" Name="Root.Serial Test.Read Helper">
+    <Signature ReturnType="i32"><Params/></Signature>
+   </Component>
+  </List></ComponentStream>
+ </Project>
+</MoTeCM1BuildSession>
