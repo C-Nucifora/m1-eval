@@ -1,0 +1,2 @@
+// Synthetic nested-time fixture. No proprietary content.
+Out = System.ElapsedTime();

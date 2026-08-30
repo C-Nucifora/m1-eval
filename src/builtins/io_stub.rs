@@ -25,7 +25,7 @@
 
 use crate::env::{CallSite, OpState};
 use crate::error::EvalError;
-use crate::expr::{EvalCtx, coerce_for_declared_type, coerce_for_scalar_kind};
+use crate::expr::{EvalCtx, EvalRuntime, coerce_for_declared_type, coerce_for_scalar_kind};
 use crate::hardware::{
     AdapterReply, HardwareCall, HardwareProvenance, HardwareValueSource, ResolvedReceiver,
 };
@@ -42,8 +42,29 @@ pub fn call(
     source_object: &str,
     method: &str,
     args: &[Value],
+    ctx: &mut EvalCtx,
+) -> Result<Value, EvalError> {
+    let site = CallSite::new(ctx.script_name, 0);
+    let mut runtime = EvalRuntime::from_public(ctx.dt);
+    call_with_runtime(
+        library_object,
+        source_object,
+        method,
+        args,
+        site,
+        ctx,
+        &mut runtime,
+    )
+}
+
+pub(crate) fn call_with_runtime(
+    library_object: &str,
+    source_object: &str,
+    method: &str,
+    args: &[Value],
     site: CallSite,
     ctx: &mut EvalCtx,
+    runtime: &mut EvalRuntime<'_>,
 ) -> Result<Value, EvalError> {
     let call = HardwareCall {
         receiver: ResolvedReceiver::Library {
@@ -53,7 +74,7 @@ pub fn call(
         method: method.to_string(),
         site,
         arguments: args.to_vec(),
-        time: ctx.time,
+        time: runtime.time,
     };
     let returns = library_return_type(library_object, method);
 
@@ -62,14 +83,14 @@ pub fn call(
         return complete(ctx, &call, value, source);
     }
 
-    if let Some(hardware) = ctx.hardware.as_deref_mut()
+    if let Some(hardware) = runtime.hardware.as_deref_mut()
         && let AdapterReply::Value(value) = hardware.call(&call)?
     {
         let value = coerce_hardware_value(value, returns, &call, ctx)?;
         return complete(ctx, &call, value, HardwareValueSource::Adapter);
     }
 
-    if let Some(value) = system_model(library_object, method, args, &call.site, ctx)? {
+    if let Some(value) = system_model(library_object, method, args, &call.site, ctx, runtime)? {
         return complete(ctx, &call, value, HardwareValueSource::SystemModel);
     }
 
@@ -230,12 +251,27 @@ fn complete(
 /// trace, so a consumer knows the value came from outside evaluator computation.
 /// Structured provenance retains the resolved receiver and selected route.
 pub fn project_object_call(
+    object: &str,
+    method: &str,
+    args: &[Value],
+    ctx: &mut EvalCtx,
+) -> Result<Value, EvalError> {
+    let receiver = ResolvedReceiver::Unresolved {
+        spelling: object.to_string(),
+    };
+    let site = CallSite::new(ctx.script_name, 0);
+    let mut runtime = EvalRuntime::from_public(ctx.dt);
+    project_object_call_with_runtime(receiver, object, method, args, site, ctx, &mut runtime)
+}
+
+pub(crate) fn project_object_call_with_runtime(
     receiver: ResolvedReceiver,
     source_object: &str,
     method: &str,
     args: &[Value],
     site: CallSite,
     ctx: &mut EvalCtx,
+    runtime: &mut EvalRuntime<'_>,
 ) -> Result<Value, EvalError> {
     let call = HardwareCall {
         receiver,
@@ -243,7 +279,7 @@ pub fn project_object_call(
         method: method.to_string(),
         site,
         arguments: args.to_vec(),
-        time: ctx.time,
+        time: runtime.time,
     };
     let returns = project_return_type(method);
 
@@ -252,7 +288,7 @@ pub fn project_object_call(
         return complete(ctx, &call, value, source);
     }
 
-    if let Some(hardware) = ctx.hardware.as_deref_mut()
+    if let Some(hardware) = runtime.hardware.as_deref_mut()
         && let AdapterReply::Value(value) = hardware.call(&call)?
     {
         let value = coerce_hardware_value(value, returns, &call, ctx)?;
@@ -337,24 +373,25 @@ pub const PROJECT_OBJECT_STUB_METHODS: &[&str] = &[
     "Buzze",
 ];
 
-/// Deterministic clock and tick behavior derived only from [`EvalCtx::time`].
+/// Deterministic clock and tick behavior derived only from [`EvalRuntime::time`].
 fn system_model(
     object: &str,
     method: &str,
     args: &[Value],
     site: &CallSite,
     ctx: &mut EvalCtx,
+    runtime: &EvalRuntime<'_>,
 ) -> Result<Option<Value>, EvalError> {
     if object != "System" {
         return Ok(None);
     }
-    let now = ctx.time.base_tick as u32;
+    let now = runtime.time.base_tick as u32;
     let v = match (object, method) {
         // The catalogue defines this relative to the line which calls it, so
-        // each occurrence owns an epoch instead of inheriting run-global time.
-        ("System", "ElapsedTime") => elapsed_time(site, ctx),
+        // each occurrence owns and updates its previous execution time.
+        ("System", "ElapsedTime") => elapsed_time(site, ctx, runtime.time),
         ("System", "TickPeriod") | ("System", "HiResTickPeriod") => {
-            Value::m1_float(ctx.time.base_period_s as f32)
+            Value::m1_float(runtime.time.base_period_s as f32)
         }
         ("System", "Ticks") | ("System", "HiResTicks") => Value::m1_unsigned(now),
         ("System", "TicksSince") | ("System", "HiResTicksSince") => {
@@ -371,20 +408,23 @@ fn system_model(
     Ok(Some(v))
 }
 
-/// Seconds since this exact `System.ElapsedTime` occurrence first executed.
-fn elapsed_time(site: &CallSite, ctx: &mut EvalCtx) -> Value {
-    let now = ctx.time.elapsed_s;
+/// Seconds since this exact `System.ElapsedTime` occurrence last executed.
+fn elapsed_time(site: &CallSite, ctx: &mut EvalCtx, time: crate::hardware::EvalTime) -> Value {
+    let now = time.elapsed_s;
     let slot = ctx.state.entry(site.clone());
-    let first_execution_s = match slot {
-        OpState::SystemElapsed { first_execution_s } => *first_execution_s,
-        state => {
-            *state = OpState::SystemElapsed {
-                first_execution_s: now,
-            };
-            now
-        }
+    let interval_s = match slot {
+        OpState::SystemElapsed {
+            previous_execution_s,
+        } => now - *previous_execution_s,
+        // At run/startup time zero no interval has elapsed. A site first reached
+        // later uses the executing function's step instead of run-global time.
+        _ if now == 0.0 => 0.0,
+        _ => time.step_s,
     };
-    Value::m1_float((now - first_execution_s) as f32)
+    *slot = OpState::SystemElapsed {
+        previous_execution_s: now,
+    };
+    Value::m1_float(interval_s as f32)
 }
 
 fn unsigned_arg(args: &[Value], index: usize, method: &str) -> Result<u32, EvalError> {
@@ -495,15 +535,22 @@ mod tests {
                 group: Some("Root.Demo"),
                 fn_symbol: Some("Root.Demo.Update"),
                 script_name: "Demo.Update.m1scr",
-                time,
-                hardware,
+                dt: time.step_s,
                 scripts: &[],
                 signature_m1_types: None,
                 object_rules: None,
                 depth: 0,
                 trace: Some(&mut self.trace),
             };
-            crate::builtins::dispatch(object, method, args, site, &mut ctx)
+            let mut runtime = EvalRuntime { time, hardware };
+            crate::builtins::dispatch_with_runtime(
+                object,
+                method,
+                args,
+                site,
+                &mut ctx,
+                &mut runtime,
+            )
         }
     }
 
@@ -743,7 +790,7 @@ mod tests {
                 None,
             )
             .unwrap(),
-            Value::m1_float(0.0)
+            Value::m1_float(0.05)
         );
         assert_eq!(
             h.io_at(
@@ -786,7 +833,7 @@ mod tests {
     }
 
     #[test]
-    fn system_elapsed_time_starts_when_the_site_first_executes() {
+    fn system_elapsed_time_uses_step_on_a_late_first_hit_then_previous_instant() {
         let mut h = Harness::new();
         let site = CallSite::new("Demo.Update.m1scr", 20);
         assert_eq!(
@@ -799,8 +846,8 @@ mod tests {
                 None,
             )
             .unwrap(),
-            Value::m1_float(0.0),
-            "a late first execution establishes its own zero"
+            Value::m1_float(0.01),
+            "a late first execution uses the function step, not run-global time"
         );
         assert_eq!(
             h.io_at(
@@ -814,10 +861,23 @@ mod tests {
             .unwrap(),
             Value::m1_float(0.5)
         );
+        assert_eq!(
+            h.io_at(
+                "System",
+                "ElapsedTime",
+                &[],
+                CallSite::new("Demo.Update.m1scr", 20),
+                crate::hardware::EvalTime::periodic(800, 8.0, 0.01, 0.01),
+                None,
+            )
+            .unwrap(),
+            Value::m1_float(0.0),
+            "a repeated execution at the same evaluator instant has no interval"
+        );
     }
 
     #[test]
-    fn system_elapsed_time_sites_keep_independent_epochs() {
+    fn system_elapsed_time_sites_keep_independent_previous_execution_times() {
         let mut h = Harness::new();
         let first = CallSite::new("Demo.Update.m1scr", 20);
         let second = CallSite::new("Demo.Update.m1scr", 40);
@@ -832,7 +892,7 @@ mod tests {
                 None,
             )
             .unwrap(),
-            Value::m1_float(0.0)
+            Value::m1_float(0.01)
         );
         assert_eq!(
             h.io_at(
@@ -844,7 +904,7 @@ mod tests {
                 None,
             )
             .unwrap(),
-            Value::m1_float(0.0)
+            Value::m1_float(0.01)
         );
         let same_time = crate::hardware::EvalTime::periodic(300, 3.0, 0.01, 0.01);
         assert_eq!(

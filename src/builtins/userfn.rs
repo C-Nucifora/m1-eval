@@ -45,9 +45,9 @@
 //! overflowing the stack.
 
 use crate::error::EvalError;
-use crate::expr::{EvalCtx, coerce_for_declared_type};
+use crate::expr::{EvalCtx, EvalRuntime, coerce_for_declared_type};
 use crate::ident::{Target, classify};
-use crate::stmt::exec_script;
+use crate::stmt::exec_script_with_runtime;
 use crate::value::Value;
 use m1_typecheck::parsed::ParsedScript;
 use m1_typecheck::symbols::SymbolKind;
@@ -79,6 +79,16 @@ pub fn call(
     callee_path: &str,
     args: &[Value],
     ctx: &mut EvalCtx,
+) -> Result<Option<Value>, EvalError> {
+    let mut runtime = EvalRuntime::from_public(ctx.dt);
+    call_with_runtime(callee_path, args, ctx, &mut runtime)
+}
+
+pub(crate) fn call_with_runtime(
+    callee_path: &str,
+    args: &[Value],
+    ctx: &mut EvalCtx,
+    runtime: &mut EvalRuntime<'_>,
 ) -> Result<Option<Value>, EvalError> {
     // The callee must resolve to a project `Function`/`Method` symbol. Anything
     // else (a channel, a library object, an unresolved name) is not a user-function
@@ -203,18 +213,15 @@ pub fn call(
             group: callee_group.as_deref(),
             fn_symbol: Some(canon.as_str()),
             script_name: &callee_script_name,
-            time: ctx.time,
-            hardware: match ctx.hardware.as_mut() {
-                Some(hardware) => Some(&mut **hardware),
-                None => None,
-            },
+            dt: ctx.dt,
             scripts: ctx.scripts,
             signature_m1_types: ctx.signature_m1_types,
             object_rules: ctx.object_rules,
             depth: ctx.depth + 1,
             trace: ctx.trace.as_deref_mut(),
         };
-        exec_script(&callee_root, &mut callee_ctx).map_err(|e| e.in_script(&callee_script_name, t))
+        exec_script_with_runtime(&callee_root, &mut callee_ctx, runtime)
+            .map_err(|e| e.in_script(&callee_script_name, t))
     };
 
     // 4. Read the return value (the `Out` slot), then 5. restore the caller frame.
@@ -291,6 +298,21 @@ mod tests {
             args: &[Value],
             hardware: Option<&mut dyn crate::hardware::HardwareAdapter>,
         ) -> Result<Option<Value>, EvalError> {
+            self.call_at(
+                callee,
+                args,
+                crate::hardware::EvalTime::at_start(0.01),
+                hardware,
+            )
+        }
+
+        fn call_at(
+            &mut self,
+            callee: &str,
+            args: &[Value],
+            time: crate::hardware::EvalTime,
+            hardware: Option<&mut dyn crate::hardware::HardwareAdapter>,
+        ) -> Result<Option<Value>, EvalError> {
             // Split the immutable project/scripts borrow from the mutable stores.
             let project = &self.loaded.project;
             let scripts = &self.loaded.scripts;
@@ -302,15 +324,15 @@ mod tests {
                 group: Some("Root.Caller"),
                 fn_symbol: Some("Root.Caller.Update"),
                 script_name: "Caller.Update.m1scr",
-                time: crate::hardware::EvalTime::at_start(0.01),
-                hardware,
+                dt: time.step_s,
                 scripts,
                 signature_m1_types: Some(&self.loaded.signature_m1_types),
                 object_rules: Some(&self.loaded.object_rules),
                 depth: 0,
                 trace: None,
             };
-            call(callee, args, &mut ctx)
+            let mut runtime = EvalRuntime { time, hardware };
+            call_with_runtime(callee, args, &mut ctx, &mut runtime)
         }
     }
 
@@ -410,6 +432,27 @@ mod tests {
         assert_eq!(
             adapter.calls[0].time,
             crate::hardware::EvalTime::at_start(0.01)
+        );
+    }
+
+    #[test]
+    fn nested_elapsed_time_uses_the_shared_runtime_and_site_state() {
+        let mut h = Harness::new();
+        let site_first = crate::hardware::EvalTime::periodic(200, 2.0, 0.01, 0.02);
+        assert_eq!(
+            h.call_at("Root.Helper.Elapsed", &[], site_first, None)
+                .unwrap(),
+            Some(Value::m1_float(0.02))
+        );
+        assert_eq!(
+            h.call_at(
+                "Root.Helper.Elapsed",
+                &[],
+                crate::hardware::EvalTime::periodic(204, 2.04, 0.01, 0.02),
+                None,
+            )
+            .unwrap(),
+            Some(Value::m1_float(0.04))
         );
     }
 

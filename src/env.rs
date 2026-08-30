@@ -118,9 +118,9 @@ pub enum OpState {
     ChangeEdge { prev: bool, held: f64 },
     /// A countdown `Timer` object: the remaining time and whether it is running.
     Timer { remaining: f64, running: bool },
-    /// `System.ElapsedTime`: evaluator time when this exact call site first ran.
-    /// Later executions subtract this epoch from the deterministic run timeline.
-    SystemElapsed { first_execution_s: f64 },
+    /// `System.ElapsedTime`: evaluator time when this exact call site last ran.
+    /// Each execution returns the interval from this timestamp, then replaces it.
+    SystemElapsed { previous_execution_s: f64 },
 }
 
 /// The per-call-site state map for stateful builtins. A new site defaults to
@@ -170,11 +170,6 @@ pub struct Env {
     /// source-spelled `"Object.Method"` name. A matching value precedes the
     /// adapter and every built-in fallback. Empty by default.
     pub io_overrides: HashMap<String, Value>,
-    /// Scenario values for one exact hardware call occurrence, keyed by its
-    /// call name plus [`CallSite`]. These take precedence over wildcard
-    /// [`Env::io_overrides`] so two calls to the same method can be driven
-    /// independently without inventing receiver aliases.
-    pub io_site_overrides: HashMap<(String, CallSite), Value>,
     /// The current function frame's return-value slot — the `Out` object an M1
     /// user function assigns to (`Out = <expr>;`). A single slot per *active*
     /// frame: `userfn::call` saves the caller's slot, clears it, runs the callee
@@ -243,8 +238,7 @@ impl Env {
 
     /// A scenario override for one exact hardware call occurrence.
     pub fn io_override_at(&self, call: &str, site: &CallSite) -> Option<&Value> {
-        self.io_site_overrides
-            .get(&(call.to_string(), site.clone()))
+        self.io_overrides.get(&site_override_key(call, site))
     }
 
     /// Seed a wildcard scenario value for a hardware call name.
@@ -254,7 +248,9 @@ impl Env {
 
     /// Seed a scenario value for one exact hardware call occurrence.
     pub fn set_io_override_at(&mut self, call: impl Into<String>, site: CallSite, value: Value) {
-        self.io_site_overrides.insert((call.into(), site), value);
+        let call = call.into();
+        self.io_overrides
+            .insert(site_override_key(&call, &site), value);
     }
 
     /// Write the current frame's `Out` return slot — the value an `Out = <expr>;`
@@ -287,6 +283,17 @@ impl Env {
     pub fn leave_function(&mut self) {
         self.locals.clear();
     }
+}
+
+/// Private key namespace for exact-site values inside the established wildcard
+/// map. M1 identifiers cannot contain NUL, so ordinary call names cannot collide
+/// with these entries.
+fn site_override_key(call: &str, site: &CallSite) -> String {
+    format!(
+        "\0m1-eval-site\0{call}\0{}\0{}",
+        site.script(),
+        site.offset()
+    )
 }
 
 #[cfg(test)]

@@ -43,13 +43,13 @@
 use crate::counterfactual::Override;
 use crate::env::{Env, StateStore};
 use crate::error::EvalError;
-use crate::expr::EvalCtx;
+use crate::expr::{EvalCtx, EvalRuntime};
 use crate::hardware::{EvalTime, HardwareAdapter};
 use crate::ident::{Target, classify};
 use crate::loader::Loaded;
 use crate::log::Log;
 use crate::scenario::{InputSeries, IoSeries, RunMode, Scenario};
-use crate::stmt::exec_script;
+use crate::stmt::exec_script_with_runtime;
 use crate::summary::io_sets;
 use crate::trace::Trace;
 #[cfg(test)]
@@ -520,18 +520,22 @@ fn tick_loop(
                 group: sched.group.as_deref(),
                 fn_symbol: sched.fn_symbol.as_deref(),
                 script_name: &sched.script.name,
-                time: EvalTime::startup(1.0 / base_rate_hz),
-                hardware: match hardware.as_mut() {
-                    Some(hardware) => Some(&mut **hardware),
-                    None => None,
-                },
+                dt: 1.0 / base_rate_hz,
                 scripts: &loaded.scripts,
                 signature_m1_types: Some(&loaded.signature_m1_types),
                 object_rules: Some(&loaded.object_rules),
                 depth: 0,
                 trace: Some(&mut startup_trace),
             };
-            exec_script(&root, &mut ctx).map_err(|e| e.in_script(&sched.script.name, None))?;
+            let mut runtime = EvalRuntime {
+                time: EvalTime::startup(1.0 / base_rate_hz),
+                hardware: match hardware.as_mut() {
+                    Some(hardware) => Some(&mut **hardware),
+                    None => None,
+                },
+            };
+            exec_script_with_runtime(&root, &mut ctx, &mut runtime)
+                .map_err(|e| e.in_script(&sched.script.name, None))?;
         }
         trace.external.extend(startup_trace.external);
         trace.hardware.extend(startup_trace.hardware);
@@ -579,18 +583,22 @@ fn tick_loop(
                 group: sched.group.as_deref(),
                 fn_symbol: sched.fn_symbol.as_deref(),
                 script_name: &sched.script.name,
-                time: EvalTime::periodic(i as u64, t, 1.0 / base_rate_hz, plan.dt),
-                hardware: match hardware.as_mut() {
-                    Some(hardware) => Some(&mut **hardware),
-                    None => None,
-                },
+                dt: plan.dt,
                 scripts: &loaded.scripts,
                 signature_m1_types: Some(&loaded.signature_m1_types),
                 object_rules: Some(&loaded.object_rules),
                 depth: 0,
                 trace: Some(&mut trace),
             };
-            exec_script(&root, &mut ctx).map_err(|e| e.in_script(&sched.script.name, Some(t)))?;
+            let mut runtime = EvalRuntime {
+                time: EvalTime::periodic(i as u64, t, 1.0 / base_rate_hz, plan.dt),
+                hardware: match hardware.as_mut() {
+                    Some(hardware) => Some(&mut **hardware),
+                    None => None,
+                },
+            };
+            exec_script_with_runtime(&root, &mut ctx, &mut runtime)
+                .map_err(|e| e.in_script(&sched.script.name, Some(t)))?;
         }
 
         // 4. Record any channel a scheduled function *holds* this tick (it did not
@@ -1208,6 +1216,14 @@ fn run_counterfactual_inner(
                         group: group.as_deref(),
                         fn_symbol: fn_symbol.as_deref(),
                         script_name,
+                        dt: 1.0 / base_rate_hz,
+                        scripts: &loaded.scripts,
+                        signature_m1_types: Some(&loaded.signature_m1_types),
+                        object_rules: Some(&loaded.object_rules),
+                        depth: 0,
+                        trace: Some(&mut override_trace),
+                    };
+                    let mut runtime = EvalRuntime {
                         time: EvalTime::periodic(
                             i as u64,
                             t,
@@ -1218,13 +1234,8 @@ fn run_counterfactual_inner(
                             Some(hardware) => Some(&mut **hardware),
                             None => None,
                         },
-                        scripts: &loaded.scripts,
-                        signature_m1_types: Some(&loaded.signature_m1_types),
-                        object_rules: Some(&loaded.object_rules),
-                        depth: 0,
-                        trace: Some(&mut override_trace),
                     };
-                    crate::expr::eval(&value_node, &mut ctx)?
+                    crate::expr::eval_with_runtime(&value_node, &mut ctx, &mut runtime)?
                 }
             };
             pending.push((ov.channel().to_string(), value));
@@ -1257,18 +1268,22 @@ fn run_counterfactual_inner(
                 group: sched.group.as_deref(),
                 fn_symbol: sched.fn_symbol.as_deref(),
                 script_name: &sched.script.name,
-                time: EvalTime::periodic(i as u64, t, 1.0 / base_rate_hz, plan.dt),
-                hardware: match hardware.as_mut() {
-                    Some(hardware) => Some(&mut **hardware),
-                    None => None,
-                },
+                dt: plan.dt,
                 scripts: &loaded.scripts,
                 signature_m1_types: Some(&loaded.signature_m1_types),
                 object_rules: Some(&loaded.object_rules),
                 depth: 0,
                 trace: Some(&mut trace),
             };
-            exec_script(&root, &mut ctx).map_err(|e| e.in_script(&sched.script.name, Some(t)))?;
+            let mut runtime = EvalRuntime {
+                time: EvalTime::periodic(i as u64, t, 1.0 / base_rate_hz, plan.dt),
+                hardware: match hardware.as_mut() {
+                    Some(hardware) => Some(&mut **hardware),
+                    None => None,
+                },
+            };
+            exec_script_with_runtime(&root, &mut ctx, &mut runtime)
+                .map_err(|e| e.in_script(&sched.script.name, Some(t)))?;
         }
 
         // 5. Record every channel that did not record this tick by holding its env

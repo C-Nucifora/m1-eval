@@ -218,7 +218,7 @@ mod tests {
                 .expect("Drive State enum")
         }
 
-        fn ctx(&mut self) -> EvalCtx<'_, '_> {
+        fn ctx(&mut self) -> EvalCtx<'_> {
             EvalCtx {
                 project: &self.project,
                 calib: &self.calib,
@@ -227,8 +227,7 @@ mod tests {
                 group: Some("Root.Demo"),
                 fn_symbol: Some("Root.Demo.Update"),
                 script_name: "Demo.Update.m1scr",
-                time: crate::hardware::EvalTime::at_start(0.01),
-                hardware: None,
+                dt: 0.01,
                 scripts: &[],
                 signature_m1_types: None,
                 object_rules: None,

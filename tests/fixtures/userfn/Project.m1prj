@@ -19,6 +19,9 @@
    <Component Classname="BuiltIn.FuncUserParam" Filename="Helper.ReturnInt.m1scr" Name="Root.Helper.ReturnInt">
     <Signature ReturnType="f32"><Params/></Signature>
    </Component>
+   <Component Classname="BuiltIn.FuncUserParam" Filename="Helper.Elapsed.m1scr" Name="Root.Helper.Elapsed">
+    <Signature ReturnType="f32"><Params/></Signature>
+   </Component>
    <Component Classname="BuiltIn.FuncUserParam" Filename="Helper.FixedEcho.m1scr" Name="Root.Helper.FixedEcho">
     <Signature ReturnType="FixedPoint7dps"><Params><Param Name="x" Type="FixedPoint7dps"/></Params></Signature>
    </Component>

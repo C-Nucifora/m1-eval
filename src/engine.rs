@@ -332,7 +332,7 @@ mod tests {
             vec![
                 Value::m1_float(0.0),
                 Value::m1_float(0.01),
-                Value::m1_float(0.02),
+                Value::m1_float(0.01),
             ]
         );
         assert_eq!(
@@ -460,7 +460,7 @@ mod tests {
             Value::m1_float(0.0),
             Value::m1_float(0.02),
             Value::m1_float(0.02),
-            Value::m1_float(0.04),
+            Value::m1_float(0.02),
         ];
 
         let mut first_adapter = MetadataAdapter::default();
@@ -967,15 +967,24 @@ const = 6.0
             .expect("second hardware expression override parses");
         let mut adapter = MetadataAdapter::default();
 
-        let trace = engine
-            .run_counterfactual_with_adapter(&mut adapter)
-            .expect("counterfactual hardware expressions run");
+        let cfg = CounterfactualCfg {
+            base_rate_hz: 100.0,
+            duration_s: 0.03,
+        };
+        let trace = crate::runner::run_counterfactual_with_adapter(
+            &engine.loaded,
+            engine.log().expect("log remains attached"),
+            &engine.overrides,
+            &cfg,
+            &mut adapter,
+        )
+        .expect("counterfactual hardware expressions run");
         let elapsed_calls: Vec<&HardwareCall> = adapter
             .calls
             .iter()
             .filter(|call| call.method == "ElapsedTime")
             .collect();
-        assert_eq!(elapsed_calls.len(), 4, "two overrides on two ticks");
+        assert_eq!(elapsed_calls.len(), 6, "two overrides on three ticks");
         let sites: std::collections::BTreeSet<_> =
             elapsed_calls.iter().map(|call| call.site.clone()).collect();
         assert_eq!(sites.len(), 2);
@@ -994,6 +1003,15 @@ const = 6.0
                 .len(),
             1,
             "the identical expression layout differs only by override identity"
+        );
+        assert_eq!(
+            trace.channels["Root.CF.Sensor"],
+            vec![
+                Value::m1_float(0.0),
+                Value::m1_float(0.01),
+                Value::m1_float(0.01),
+            ],
+            "counterfactual calls keep previous-execution interval state"
         );
 
         let provenance: Vec<_> = trace

@@ -46,7 +46,7 @@ fn demo_update_script_computes_output() {
     trace.push_tick(0.0);
 
     let root = script.cst.root();
-    let mut ctx = EvalCtx {
+    let mut ctx: EvalCtx<'_> = EvalCtx {
         project: &loaded.project,
         calib: &loaded.calib,
         env: &mut env,
@@ -54,8 +54,7 @@ fn demo_update_script_computes_output() {
         group: Some("Root.Demo"),
         fn_symbol: Some("Root.Demo.Update"),
         script_name: &script.name,
-        time: m1_eval::EvalTime::at_start(0.01),
-        hardware: None,
+        dt: 0.01,
         scripts: &loaded.scripts,
         signature_m1_types: Some(&loaded.signature_m1_types),
         object_rules: Some(&loaded.object_rules),
@@ -99,8 +98,7 @@ fn demo_update_is_deterministic_in_inputs() {
             group: Some("Root.Demo"),
             fn_symbol: Some("Root.Demo.Update"),
             script_name: &script.name,
-            time: m1_eval::EvalTime::at_start(0.01),
-            hardware: None,
+            dt: 0.01,
             scripts: &loaded.scripts,
             signature_m1_types: Some(&loaded.signature_m1_types),
             object_rules: Some(&loaded.object_rules),
@@ -115,4 +113,46 @@ fn demo_update_is_deterministic_in_inputs() {
     assert_eq!(run(8.0), Value::m1_float(20.0));
     // Same input, same output (no wall-clock / RNG).
     assert_eq!(run(20.0), run(20.0));
+}
+
+#[test]
+fn eval_ctx_keeps_its_pre_hardware_public_shape() {
+    fn accepts_one_lifetime(_: &EvalCtx<'_>) {}
+
+    let dir = Path::new(env!("CARGO_MANIFEST_DIR")).join("tests/fixtures/mini");
+    let loaded = m1_eval::load(&dir.join("Project.m1prj"), None).expect("mini fixture loads");
+    let mut env = Env::new();
+    let mut state = StateStore::new();
+    let ctx: EvalCtx<'_> = EvalCtx {
+        project: &loaded.project,
+        calib: &loaded.calib,
+        env: &mut env,
+        state: &mut state,
+        group: Some("Root.Demo"),
+        fn_symbol: Some("Root.Demo.Update"),
+        script_name: "Demo.Update.m1scr",
+        dt: 0.02,
+        scripts: &loaded.scripts,
+        signature_m1_types: Some(&loaded.signature_m1_types),
+        object_rules: Some(&loaded.object_rules),
+        depth: 0,
+        trace: None,
+    };
+
+    accepts_one_lifetime(&ctx);
+    assert_eq!(ctx.dt, 0.02);
+}
+
+#[test]
+fn env_keeps_its_pre_exact_site_public_shape() {
+    let env = Env {
+        values: Default::default(),
+        locals: Default::default(),
+        statics: Default::default(),
+        io_overrides: Default::default(),
+        out: None,
+        default_unseeded_channels: false,
+    };
+
+    assert!(env.io_overrides.is_empty());
 }

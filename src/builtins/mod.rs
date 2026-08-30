@@ -28,7 +28,7 @@ pub mod userfn;
 
 use crate::env::CallSite;
 use crate::error::EvalError;
-use crate::expr::EvalCtx;
+use crate::expr::{EvalCtx, EvalRuntime};
 use crate::hardware::ResolvedReceiver;
 use crate::ident::{Target, classify};
 use crate::value::{M1Scalar, Value};
@@ -56,6 +56,19 @@ pub fn dispatch(
     site: CallSite,
     ctx: &mut EvalCtx,
 ) -> Result<Value, EvalError> {
+    let mut runtime = EvalRuntime::from_public(ctx.dt);
+    dispatch_with_runtime(object, method, args, site, ctx, &mut runtime)
+}
+
+/// Internal dispatch path carrying the runner's evaluator timeline and adapter.
+pub(crate) fn dispatch_with_runtime(
+    object: &str,
+    method: &str,
+    args: &[Value],
+    site: CallSite,
+    ctx: &mut EvalCtx,
+    runtime: &mut EvalRuntime<'_>,
+) -> Result<Value, EvalError> {
     let capability = {
         let scope = CapabilityScope {
             project: Some(ctx.project),
@@ -68,10 +81,12 @@ pub fn dispatch(
     };
 
     match capability.route {
-        CallRoute::UserFunction(canon) => match userfn::call(&canon, args, ctx)? {
-            Some(value) => Ok(value),
-            None => Err(unsupported(object, method)),
-        },
+        CallRoute::UserFunction(canon) => {
+            match userfn::call_with_runtime(&canon, args, ctx, runtime)? {
+                Some(value) => Ok(value),
+                None => Err(unsupported(object, method)),
+            }
+        }
         CallRoute::TableLookup => match try_table_lookup(object, args, ctx)? {
             Some(value) => Ok(value),
             None => Err(unsupported(object, method)),
@@ -107,7 +122,7 @@ pub fn dispatch(
             {
                 validate_arity(&library_object, object, method, args.len())?;
             }
-            io_stub::call(&library_object, object, method, args, site, ctx)
+            io_stub::call_with_runtime(&library_object, object, method, args, site, ctx, runtime)
         }
         CallRoute::MathAssumption(library_object) => {
             validate_arity(&library_object, object, method, args.len())?;
@@ -162,9 +177,9 @@ pub fn dispatch(
                 None => Err(unsupported(object, method)),
             }
         }
-        CallRoute::ProjectIo(receiver) => {
-            io_stub::project_object_call(receiver, object, method, args, site, ctx)
-        }
+        CallRoute::ProjectIo(receiver) => io_stub::project_object_call_with_runtime(
+            receiver, object, method, args, site, ctx, runtime,
+        ),
         CallRoute::Unsupported => Err(unsupported(object, method)),
     }
 }
@@ -172,11 +187,23 @@ pub fn dispatch(
 /// Dispatch a bare user-function call such as `Update(...)`. Bare callees cannot
 /// name a library builtin, so the shared capability model either resolves a
 /// script-backed function or rejects the call.
+#[cfg(test)]
 pub(crate) fn dispatch_bare(
     callee: &str,
     args: &[Value],
     site: CallSite,
     ctx: &mut EvalCtx,
+) -> Result<Value, EvalError> {
+    let mut runtime = EvalRuntime::from_public(ctx.dt);
+    dispatch_bare_with_runtime(callee, args, site, ctx, &mut runtime)
+}
+
+pub(crate) fn dispatch_bare_with_runtime(
+    callee: &str,
+    args: &[Value],
+    site: CallSite,
+    ctx: &mut EvalCtx,
+    runtime: &mut EvalRuntime<'_>,
 ) -> Result<Value, EvalError> {
     let capability = {
         let scope = CapabilityScope {
@@ -189,7 +216,7 @@ pub(crate) fn dispatch_bare(
         classify_bare_call(callee, &scope)
     };
     if let CallRoute::UserFunction(canon) = capability.route
-        && let Some(value) = userfn::call(&canon, args, ctx)?
+        && let Some(value) = userfn::call_with_runtime(&canon, args, ctx, runtime)?
     {
         return Ok(value);
     }
@@ -969,7 +996,7 @@ mod tests {
             h
         }
 
-        fn ctx(&mut self) -> EvalCtx<'_, '_> {
+        fn ctx(&mut self) -> EvalCtx<'_> {
             EvalCtx {
                 project: &self.project,
                 calib: &self.calib,
@@ -978,8 +1005,7 @@ mod tests {
                 group: Some("Root.Demo"),
                 fn_symbol: Some("Root.Demo.Update"),
                 script_name: "Demo.Update.m1scr",
-                time: crate::hardware::EvalTime::at_start(0.01),
-                hardware: None,
+                dt: 0.01,
                 scripts: &[],
                 signature_m1_types: None,
                 object_rules: None,
@@ -1501,7 +1527,7 @@ mod tests {
             self.project.symbols().enum_by_name("Drive State").unwrap()
         }
 
-        fn ctx(&mut self) -> EvalCtx<'_, '_> {
+        fn ctx(&mut self) -> EvalCtx<'_> {
             EvalCtx {
                 project: &self.project,
                 calib: &self.calib,
@@ -1510,8 +1536,7 @@ mod tests {
                 group: Some("Root.Demo"),
                 fn_symbol: Some("Root.Demo.Update"),
                 script_name: "Demo.Update.m1scr",
-                time: crate::hardware::EvalTime::at_start(0.01),
-                hardware: None,
+                dt: 0.01,
                 scripts: &[],
                 signature_m1_types: None,
                 object_rules: None,
@@ -1778,15 +1803,18 @@ mod tests {
                 group: Some("Root.Demo"),
                 fn_symbol: Some("Root.Demo.Update"),
                 script_name: "Demo.Update.m1scr",
-                time: crate::hardware::EvalTime::at_start(0.01),
-                hardware,
+                dt: 0.01,
                 scripts: &[],
                 signature_m1_types: None,
                 object_rules: Some(&self.object_rules),
                 depth: 0,
                 trace: Some(&mut self.trace),
             };
-            dispatch(object, method, args, site, &mut ctx)
+            let mut runtime = EvalRuntime {
+                time: crate::hardware::EvalTime::at_start(0.01),
+                hardware,
+            };
+            dispatch_with_runtime(object, method, args, site, &mut ctx, &mut runtime)
         }
     }
 
