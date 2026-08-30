@@ -2614,6 +2614,49 @@ base_rate_hz = 100.0
     }
 
     #[test]
+    fn counterfactual_serial_override_does_not_run_startup_port_initialization() {
+        let loaded = serial_fixture();
+        // Tx Offset selects only the Transmit function downstream, and that
+        // function does not call PortInit. Any initialized port here would have
+        // leaked from the whole-project startup schedule.
+        let channels = vec![InputSeries {
+            channel: "Root.Serial Test.Tx Offset".to_string(),
+            kind: InputKind::Const(Value::m1_integer(0)),
+        }];
+        let log = Log {
+            meta: LogMeta {
+                source: "synthetic-serial-counterfactual".to_string(),
+                duration_s: 0.01,
+                channel_count: channels.len(),
+                units: BTreeMap::new(),
+            },
+            channels,
+        };
+        let overrides = vec![
+            Override::parse("Root.Serial Test.Tx Offset=Serial.Receive(Serial.GetHandle(true), 0)")
+                .expect("serial override expression parses"),
+        ];
+        let cfg = CounterfactualCfg {
+            base_rate_hz: 100.0,
+            duration_s: 0.01,
+        };
+
+        let error = run_counterfactual(&loaded, &log, &overrides, &cfg)
+            .expect_err("counterfactual mode must not borrow whole-project startup state");
+        assert_eq!(
+            error.root_cause(),
+            &EvalError::BadCall {
+                detail: "Serial.Receive: port 0 is not initialized; call Serial.PortInit first"
+                    .to_string(),
+            }
+        );
+        assert_eq!(
+            error.to_string(),
+            "bad call: Serial.Receive: port 0 is not initialized; call Serial.PortInit first"
+        );
+    }
+
+    #[test]
     fn counterfactual_serial_rejects_a_logged_handle_after_in_cone_port_setup() {
         let loaded = serial_fixture();
         let channels = vec![
