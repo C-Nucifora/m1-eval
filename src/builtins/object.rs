@@ -329,22 +329,49 @@ fn constrain_value(
         return Ok(value);
     }
     if min.is_some_and(|bound| x < bound) {
-        return bound_value(
+        let constrained = bound_value(
             min.expect("checked above"),
             scalar.kind(),
             BoundSide::Lower,
             canon,
-        );
+        )?;
+        return ensure_in_range(constrained, rule, canon, min, max);
     }
     if max.is_some_and(|bound| x > bound) {
-        return bound_value(
+        let constrained = bound_value(
             max.expect("checked above"),
             scalar.kind(),
             BoundSide::Upper,
             canon,
-        );
+        )?;
+        return ensure_in_range(constrained, rule, canon, min, max);
     }
     Ok(value)
+}
+
+fn ensure_in_range(
+    value: Value,
+    rule: &ValidationRule,
+    canon: &str,
+    min: Option<f64>,
+    max: Option<f64>,
+) -> Result<Value, EvalError> {
+    let scalar = value.m1_scalar()?;
+    if rule_accepts(rule, scalar, canon)? {
+        return Ok(value);
+    }
+    let range = match (min, max) {
+        (Some(min), Some(max)) => format!("[{min}, {max}]"),
+        (Some(min), None) => format!("[{min}, +infinity)"),
+        (None, Some(max)) => format!("(-infinity, {max}]"),
+        (None, None) => "unbounded".to_string(),
+    };
+    Err(EvalError::TypeError {
+        detail: format!(
+            "validation range {range} on {canon:?} has no value in M1 {:?}",
+            scalar.kind()
+        ),
+    })
 }
 
 fn rule_accepts(rule: &ValidationRule, scalar: M1Scalar, canon: &str) -> Result<bool, EvalError> {
@@ -419,14 +446,36 @@ fn bound_value(
         }
         M1ScalarKind::FixedPoint7dps => {
             let scaled = bound * FixedPoint7dps::SCALE as f64;
-            let rounded = match side {
-                BoundSide::Lower => scaled.ceil(),
-                BoundSide::Upper => scaled.floor(),
-            };
-            if rounded < f64::from(i32::MIN) || rounded > f64::from(i32::MAX) {
+            if !scaled.is_finite() {
                 return Err(invalid());
             }
-            M1Scalar::FixedPoint7dps(FixedPoint7dps::from_raw(rounded as i32))
+            let min_raw = i64::from(i32::MIN);
+            let max_raw = i64::from(i32::MAX);
+            let mut raw = scaled.round().clamp(min_raw as f64, max_raw as f64) as i64;
+            let fixed_at = |raw: i64| {
+                FixedPoint7dps::from_raw(i32::try_from(raw).expect("raw is range-checked"))
+            };
+
+            match side {
+                BoundSide::Lower => {
+                    while raw <= max_raw && fixed_at(raw).as_f64() < bound {
+                        raw += 1;
+                    }
+                    while raw > min_raw && fixed_at(raw - 1).as_f64() >= bound {
+                        raw -= 1;
+                    }
+                }
+                BoundSide::Upper => {
+                    while raw >= min_raw && fixed_at(raw).as_f64() > bound {
+                        raw -= 1;
+                    }
+                    while raw < max_raw && fixed_at(raw + 1).as_f64() <= bound {
+                        raw += 1;
+                    }
+                }
+            }
+            let raw = i32::try_from(raw).map_err(|_| invalid())?;
+            M1Scalar::FixedPoint7dps(FixedPoint7dps::from_raw(raw))
         }
     };
     Ok(Value::M1(scalar))
@@ -480,5 +529,104 @@ mod tests {
         .unwrap_err();
         assert!(error.to_string().contains("Root.Bad"), "{error}");
         assert!(error.to_string().contains("exceeds"), "{error}");
+    }
+
+    #[test]
+    fn constrain_rejects_ranges_with_no_value_in_the_argument_family() {
+        let cases = [
+            (
+                "signed",
+                0.2,
+                0.8,
+                Value::m1_integer(-1),
+                Value::m1_integer(2),
+            ),
+            (
+                "unsigned",
+                0.2,
+                0.8,
+                Value::m1_unsigned(0),
+                Value::m1_unsigned(1),
+            ),
+            (
+                "float",
+                1.000_000_01,
+                1.000_000_02,
+                Value::m1_float(1.0),
+                Value::m1_float(f32::from_bits(1.0f32.to_bits() + 1)),
+            ),
+            (
+                "fixed",
+                0.000_000_01,
+                0.000_000_02,
+                Value::M1(M1Scalar::FixedPoint7dps(FixedPoint7dps::ZERO)),
+                Value::M1(M1Scalar::FixedPoint7dps(FixedPoint7dps::from_raw(1))),
+            ),
+        ];
+
+        for (name, min, max, below, above) in cases {
+            let rules = ObjectRules {
+                validation: HashMap::from([(
+                    name.to_string(),
+                    ValidationRule::MinMax { min, max },
+                )]),
+            };
+            for input in [below, above] {
+                let error = constrain_value(name, name, input, Some(&rules)).unwrap_err();
+                assert!(
+                    error.to_string().contains("has no value in M1"),
+                    "{name}: {error}"
+                );
+            }
+        }
+    }
+
+    #[test]
+    fn fixed_bounds_preserve_exact_seven_decimal_places() {
+        let lower_rules = ObjectRules {
+            validation: HashMap::from([(
+                "lower".to_string(),
+                ValidationRule::MinMax {
+                    min: 79.020_497_0,
+                    max: 100.0,
+                },
+            )]),
+        };
+        assert_eq!(
+            constrain_value(
+                "lower",
+                "lower",
+                Value::M1(M1Scalar::FixedPoint7dps(FixedPoint7dps::ZERO)),
+                Some(&lower_rules),
+            )
+            .unwrap(),
+            Value::M1(M1Scalar::FixedPoint7dps(FixedPoint7dps::from_raw(
+                790_204_970,
+            )))
+        );
+
+        let upper_rules = ObjectRules {
+            validation: HashMap::from([(
+                "upper".to_string(),
+                ValidationRule::MinMax {
+                    min: 0.0,
+                    max: 88.717_452_5,
+                },
+            )]),
+        };
+        assert_eq!(
+            constrain_value(
+                "upper",
+                "upper",
+                Value::M1(M1Scalar::FixedPoint7dps(FixedPoint7dps::from_raw(
+                    1_000_000_000,
+                ))),
+                Some(&upper_rules),
+            )
+            .unwrap(),
+            Value::M1(M1Scalar::FixedPoint7dps(FixedPoint7dps::from_raw(
+                887_174_525,
+            )))
+        );
     }
 }

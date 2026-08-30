@@ -771,12 +771,21 @@ fn classify_project_method(canon: &str, method: &str, project: &Project) -> Call
         return capability(BuiltinSupport::Direct, CallRoute::ChannelSet);
     }
     if object::is_numeric_source(canon, project) {
-        return match method {
-            "Validate" => capability(BuiltinSupport::Direct, CallRoute::ObjectValidate),
-            "Constrain" => capability(BuiltinSupport::Direct, CallRoute::ObjectConstrain),
-            "GetUnscheduled" => capability(BuiltinSupport::Direct, CallRoute::ObjectGetUnscheduled),
-            _ => unsupported_capability(),
-        };
+        match method {
+            "Validate" => {
+                return capability(BuiltinSupport::Direct, CallRoute::ObjectValidate);
+            }
+            "Constrain" => {
+                return capability(BuiltinSupport::Direct, CallRoute::ObjectConstrain);
+            }
+            "GetUnscheduled" => {
+                return capability(BuiltinSupport::Direct, CallRoute::ObjectGetUnscheduled);
+            }
+            // A typed hardware object also carries a numeric value. Core value
+            // methods claim only their exact names; every other method must
+            // continue to the receiver-specific timer/IO routes below.
+            _ => {}
+        }
     }
     if symbol.classname.as_deref() == Some("BuiltIn.Timer")
         && matches!(method, "Start" | "Stop" | "Reset" | "Remaining")
@@ -1918,6 +1927,41 @@ mod tests {
                 })
             );
         }
+    }
+
+    #[test]
+    fn typed_numeric_project_io_keeps_its_hardware_stub_route() {
+        let loaded = crate::loader::load(
+            &Path::new(env!("CARGO_MANIFEST_DIR")).join("tests/fixtures/enums/Project.m1prj"),
+            None,
+        )
+        .unwrap();
+        let mut h = ProjectObjHarness::new();
+        assert_eq!(
+            support_in(
+                &loaded,
+                Some("Root.Demo"),
+                Some("Root.Demo.Update"),
+                "Typed IO",
+                "GetScaled",
+            ),
+            BuiltinSupport::Stubbed
+        );
+        assert_eq!(
+            h.call("Typed IO", "GetScaled", &[]).unwrap(),
+            Value::m1_float(0.0)
+        );
+        assert_eq!(
+            support_in(
+                &loaded,
+                Some("Root.Demo"),
+                Some("Root.Demo.Update"),
+                "Limited Float",
+                "GetScaled",
+            ),
+            BuiltinSupport::Unsupported,
+            "ordinary numeric channels must not inherit hardware stubs"
+        );
     }
 
     #[test]
