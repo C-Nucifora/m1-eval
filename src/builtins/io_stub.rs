@@ -212,6 +212,14 @@ fn complete(
     value: Value,
     source: HardwareValueSource,
 ) -> Result<Value, EvalError> {
+    // `System.ElapsedTime` measures executions of the source occurrence, not
+    // executions of only the deterministic System model. Scenario and adapter
+    // routes therefore share its one per-site clock. This is deliberately here
+    // after their values have been coerced successfully, rather than in the
+    // model, so rejected/Unhandled routes leave no timestamp behind.
+    if call.canonical_name() == "System.ElapsedTime" {
+        record_elapsed_time_execution(ctx, &call.site, call.time);
+    }
     if let Some(trace) = ctx.trace.as_deref_mut() {
         if source.is_external() {
             trace.mark_external(call.source_name());
@@ -379,7 +387,7 @@ fn system_model(
     method: &str,
     args: &[Value],
     site: &CallSite,
-    ctx: &mut EvalCtx,
+    ctx: &EvalCtx,
     runtime: &EvalRuntime<'_>,
 ) -> Result<Option<Value>, EvalError> {
     if object != "System" {
@@ -387,8 +395,9 @@ fn system_model(
     }
     let now = runtime.time.base_tick as u32;
     let v = match (object, method) {
-        // The catalogue defines this relative to the line which calls it, so
-        // each occurrence owns and updates its previous execution time.
+        // The catalogue defines this relative to the line which calls it. The
+        // common successful completion path records that execution so scenario,
+        // adapter, and deterministic routes all share the same clock.
         ("System", "ElapsedTime") => elapsed_time(site, ctx, runtime.time),
         ("System", "TickPeriod") | ("System", "HiResTickPeriod") => {
             Value::m1_float(runtime.time.base_period_s as f32)
@@ -409,22 +418,32 @@ fn system_model(
 }
 
 /// Seconds since this exact `System.ElapsedTime` occurrence last executed.
-fn elapsed_time(site: &CallSite, ctx: &mut EvalCtx, time: crate::hardware::EvalTime) -> Value {
+///
+/// This lookup is intentionally read-only. [`record_elapsed_time_execution`]
+/// commits the timestamp only once a route has produced a valid value.
+fn elapsed_time(site: &CallSite, ctx: &EvalCtx, time: crate::hardware::EvalTime) -> Value {
     let now = time.elapsed_s;
-    let slot = ctx.state.entry(site.clone());
-    let interval_s = match slot {
-        OpState::SystemElapsed {
+    let interval_s = match ctx.state.get(site) {
+        Some(OpState::SystemElapsed {
             previous_execution_s,
-        } => now - *previous_execution_s,
+        }) => now - *previous_execution_s,
         // At run/startup time zero no interval has elapsed. A site first reached
         // later uses the executing function's step instead of run-global time.
         _ if now == 0.0 => 0.0,
         _ => time.step_s,
     };
-    *slot = OpState::SystemElapsed {
-        previous_execution_s: now,
-    };
     Value::m1_float(interval_s as f32)
+}
+
+/// Record one successfully completed `System.ElapsedTime` call occurrence.
+fn record_elapsed_time_execution(
+    ctx: &mut EvalCtx,
+    site: &CallSite,
+    time: crate::hardware::EvalTime,
+) {
+    *ctx.state.entry(site.clone()) = OpState::SystemElapsed {
+        previous_execution_s: time.elapsed_s,
+    };
 }
 
 fn unsigned_arg(args: &[Value], index: usize, method: &str) -> Result<u32, EvalError> {
@@ -916,6 +935,106 @@ mod tests {
             h.io_at("System", "ElapsedTime", &[], second, same_time, None,)
                 .unwrap(),
             Value::m1_float(0.5)
+        );
+    }
+
+    #[test]
+    fn adapter_then_system_elapsed_time_share_one_50hz_site_clock() {
+        let mut h = Harness::new();
+        let site = CallSite::new("Demo.Update.m1scr", 20);
+        let mut adapter = RecordingAdapter {
+            reply: AdapterReply::Value(Value::m1_float(7.0)),
+            calls: Vec::new(),
+        };
+
+        assert_eq!(
+            h.io_at(
+                "System",
+                "ElapsedTime",
+                &[],
+                site.clone(),
+                crate::hardware::EvalTime::periodic(0, 0.0, 0.02, 0.02),
+                Some(&mut adapter),
+            )
+            .unwrap(),
+            Value::m1_float(7.0),
+            "the adapter owns the initial result"
+        );
+
+        adapter.reply = AdapterReply::Unhandled;
+        assert_eq!(
+            h.io_at(
+                "System",
+                "ElapsedTime",
+                &[],
+                site.clone(),
+                crate::hardware::EvalTime::periodic(1, 0.02, 0.02, 0.02),
+                Some(&mut adapter),
+            )
+            .unwrap(),
+            Value::m1_float(0.02),
+            "the deterministic model measures from the adapter-backed execution"
+        );
+        assert_eq!(
+            h.io_at(
+                "System",
+                "ElapsedTime",
+                &[],
+                site,
+                crate::hardware::EvalTime::periodic(2, 0.04, 0.02, 0.02),
+                Some(&mut adapter),
+            )
+            .unwrap(),
+            Value::m1_float(0.02)
+        );
+    }
+
+    #[test]
+    fn exact_scenario_then_system_elapsed_time_share_one_50hz_site_clock() {
+        let mut h = Harness::new();
+        let site = CallSite::new("Demo.Update.m1scr", 20);
+        h.env
+            .set_io_override_at("System.ElapsedTime", site.clone(), Value::m1_float(9.0));
+
+        assert_eq!(
+            h.io_at(
+                "System",
+                "ElapsedTime",
+                &[],
+                site.clone(),
+                crate::hardware::EvalTime::periodic(0, 0.0, 0.02, 0.02),
+                None,
+            )
+            .unwrap(),
+            Value::m1_float(9.0),
+            "the exact scenario owns the initial result"
+        );
+
+        h.env.io_overrides.clear();
+        assert_eq!(
+            h.io_at(
+                "System",
+                "ElapsedTime",
+                &[],
+                site.clone(),
+                crate::hardware::EvalTime::periodic(1, 0.02, 0.02, 0.02),
+                None,
+            )
+            .unwrap(),
+            Value::m1_float(0.02),
+            "the deterministic model measures from the scenario-backed execution"
+        );
+        assert_eq!(
+            h.io_at(
+                "System",
+                "ElapsedTime",
+                &[],
+                site,
+                crate::hardware::EvalTime::periodic(2, 0.04, 0.02, 0.02),
+                None,
+            )
+            .unwrap(),
+            Value::m1_float(0.02)
         );
     }
 
