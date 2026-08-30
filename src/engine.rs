@@ -936,7 +936,10 @@ const = 6.0
             .filter(|call| call.method == "FlashSize")
             .collect();
         assert_eq!(flash_calls.len(), 2);
-        assert_eq!(flash_calls[0].site.script(), "<counterfactual-override>");
+        assert_eq!(
+            flash_calls[0].site.script(),
+            "<counterfactual-override:0:Root.CF.Sensor>"
+        );
         assert_eq!(flash_calls[0].time.base_tick, 0);
         assert_eq!(flash_calls[1].time.base_tick, 1);
         assert!(
@@ -946,9 +949,71 @@ const = 6.0
         );
         assert!(trace.hardware.iter().any(|record| {
             record.source == HardwareValueSource::Adapter
-                && record.site.script() == "<counterfactual-override>"
+                && record.site.script() == "<counterfactual-override:0:Root.CF.Sensor>"
                 && record.canonical_call() == "System.FlashSize"
         }));
+    }
+
+    #[test]
+    fn identical_counterfactual_hardware_expressions_keep_distinct_call_sites() {
+        let mut engine = cf_engine();
+        let (_dir, path) = temp_log("csv", CF_LOG_CSV);
+        engine.load_log(&path).expect("log attaches");
+        engine
+            .override_channel("Root.CF.Sensor=System.ElapsedTime()")
+            .expect("first hardware expression override parses");
+        engine
+            .override_channel("Root.CF.Mid=System.ElapsedTime()")
+            .expect("second hardware expression override parses");
+        let mut adapter = MetadataAdapter::default();
+
+        let trace = engine
+            .run_counterfactual_with_adapter(&mut adapter)
+            .expect("counterfactual hardware expressions run");
+        let elapsed_calls: Vec<&HardwareCall> = adapter
+            .calls
+            .iter()
+            .filter(|call| call.method == "ElapsedTime")
+            .collect();
+        assert_eq!(elapsed_calls.len(), 4, "two overrides on two ticks");
+        let sites: std::collections::BTreeSet<_> =
+            elapsed_calls.iter().map(|call| call.site.clone()).collect();
+        assert_eq!(sites.len(), 2);
+        assert_eq!(
+            sites.iter().map(|site| site.script()).collect::<Vec<_>>(),
+            vec![
+                "<counterfactual-override:0:Root.CF.Sensor>",
+                "<counterfactual-override:1:Root.CF.Mid>",
+            ]
+        );
+        assert_eq!(
+            sites
+                .iter()
+                .map(|site| site.offset())
+                .collect::<std::collections::BTreeSet<_>>()
+                .len(),
+            1,
+            "the identical expression layout differs only by override identity"
+        );
+
+        let provenance: Vec<_> = trace
+            .hardware
+            .iter()
+            .filter(|record| record.canonical_call() == "System.ElapsedTime")
+            .collect();
+        assert_eq!(provenance.len(), 2);
+        assert!(
+            provenance
+                .iter()
+                .all(|record| record.source == HardwareValueSource::SystemModel)
+        );
+        assert_eq!(
+            provenance
+                .iter()
+                .map(|record| record.site.clone())
+                .collect::<std::collections::BTreeSet<_>>(),
+            sites
+        );
     }
 
     #[test]

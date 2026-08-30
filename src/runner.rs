@@ -1185,6 +1185,7 @@ fn run_counterfactual_inner(
                 PreparedOverride::Const { value, .. } => value.clone(),
                 PreparedOverride::Expr {
                     wrapped,
+                    script_name,
                     group,
                     fn_symbol,
                     ..
@@ -1206,7 +1207,7 @@ fn run_counterfactual_inner(
                         state: &mut state,
                         group: group.as_deref(),
                         fn_symbol: fn_symbol.as_deref(),
-                        script_name: CF_OVERRIDE_SCRIPT,
+                        script_name,
                         time: EvalTime::periodic(
                             i as u64,
                             t,
@@ -1306,11 +1307,6 @@ fn run_counterfactual_inner(
     Ok(trace)
 }
 
-/// The synthetic script-name identity used for the [`CallSite`](crate::env::CallSite)
-/// of an expression override's stateful operators (overrides rarely use stateful
-/// operators, but the call-site key needs a stable, collision-free name).
-const CF_OVERRIDE_SCRIPT: &str = "<counterfactual-override>";
-
 /// A counterfactual override compiled for the tick loop: a canonical channel path
 /// plus either a constant value or a pre-validated expression snippet re-parsed and
 /// evaluated each tick against the logged snapshot.
@@ -1325,6 +1321,11 @@ enum PreparedOverride {
     Expr {
         channel: String,
         wrapped: String,
+        /// Stable synthetic script identity for call sites inside this override.
+        /// It contains both the input ordinal and canonical target so identical
+        /// expression layouts in separate overrides cannot share state or trace
+        /// provenance.
+        script_name: String,
         group: Option<String>,
         fn_symbol: Option<String>,
     },
@@ -1360,7 +1361,8 @@ fn prepare_overrides(
     let no_locals = HashMap::new();
     overrides
         .iter()
-        .map(|ov| {
+        .enumerate()
+        .map(|(ordinal, ov)| {
             let canon = match classify(ov.channel(), group, fn_symbol, &loaded.project, &no_locals)
             {
                 Target::Symbol(p) => p,
@@ -1385,6 +1387,7 @@ fn prepare_overrides(
                         });
                     }
                     Ok(PreparedOverride::Expr {
+                        script_name: format!("<counterfactual-override:{ordinal}:{canon}>"),
                         channel: canon,
                         wrapped,
                         group: group.map(str::to_string),
