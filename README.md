@@ -252,6 +252,20 @@ m1-eval --project Project.m1prj --coverage
 See [`docs/cli.md`](docs/cli.md) for the full flag list, the scenario file
 format, and the exit-code contract.
 
+The real-project smoke tests remain read-only and keep proprietary files out of
+the repository. Point each variable at a corpus repository root, version
+directory, or exact `Project.m1prj`; the tests discover the matching project and
+root `parameters.m1cfg`, then report every substituted input:
+
+```sh
+M1_EVAL_EVM1_DIR=/path/to/EV-M1 \
+M1_EVAL_AVM1_DIR=/path/to/av-firmware \
+  cargo test --test evm1_smoke -- --nocapture
+```
+
+Either corpus test prints a clear skip reason when its variable is absent; the
+available corpus still runs, and neither test is ignored.
+
 ## What it adds (Phase 3 — log-driven counterfactual replay)
 
 **Phase 3** is the headline feature. Import a recorded MoTeC run, treat every

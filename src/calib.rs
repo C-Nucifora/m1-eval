@@ -19,12 +19,14 @@
 //! - A `<Parameter Name="...">` holds a single `<Cell Type="..." Unit="...">`.
 //!   Cell content may be a `<![CDATA[...]]>` block or plain text; `roxmltree`'s
 //!   `Node::text()` returns the CDATA content either way.
-//! - Numbers may be in scientific notation (e.g. `1.0000e-003`). They are parsed
+//! - Numbers may be in scientific notation (e.g. `1.0000e-003`), and unsigned
+//!   cells may use M1 hexadecimal notation (e.g. `0x400`). They are parsed
 //!   according to the cell's declared type and restored to their M1-width scalar
 //!   family. Untyped and historical `f64` cells narrow to M1 binary32.
-//! - `enum` cells carry a non-numeric member name (e.g. `On`), and `bool` cells
-//!   are not numeric calibration values. Both are skipped here (and surface as
-//!   `MissingCalibration` if some script later reads them as a number).
+//! - Scalar `enum` cells usually carry a member name (e.g. `On`) and are skipped.
+//!   Table enum axes instead contain the enum's numeric integer representation;
+//!   those values are retained as M1 integers. Boolean cells are not numeric
+//!   calibration values and are skipped.
 //! - A `<Table Name="...">` has ordered `<X>`/`<Y>`/`<Z>` axis children, each
 //!   wrapping a `<Cells>` of breakpoint `<Cell>`s, plus a `<Body><Cells>` of
 //!   interpolation values.
@@ -69,8 +71,8 @@ impl Calibration {
     /// Parse a `.m1cfg` document's numeric values from its XML text.
     ///
     /// Malformed XML, unsupported numeric types, and values outside their M1
-    /// storage range fail loud. Enum and Boolean cells are skipped because they
-    /// are not numeric calibration values.
+    /// storage range fail loud. Named enum members and Boolean cells are skipped;
+    /// numeric enum representations (used by table axes) are retained.
     pub fn from_m1cfg_str(xml: &str) -> Result<Calibration, EvalError> {
         let doc = roxmltree::Document::parse(xml).map_err(|e| EvalError::MissingCalibration {
             path: format!(".m1cfg parse error: {e}"),
@@ -84,9 +86,9 @@ impl Calibration {
             let Some(cell) = param.children().find(|c| c.has_tag_name("Cell")) else {
                 continue;
             };
-            // Skip non-numeric cells (enum members and booleans) — they are not
-            // calibration *numbers*. A script that later reads such a value as
-            // a number will fail loud at that read, not here.
+            // Skip named enum members and booleans — they are not calibration
+            // numbers. Numeric enum representations remain available to the
+            // table reader and to unusual scalar exports that use that form.
             if let Some(v) = cell_value(cell, cell.attribute("Type"), name)? {
                 params.insert(name.to_string(), v);
             }
@@ -115,8 +117,9 @@ impl Calibration {
 }
 
 /// Parse one calibration cell according to its declared M1 storage type.
-/// Enum and Boolean cells are non-numeric and return `None`. An absent type uses
-/// the historical untyped-cell rule: numeric cells are parsed as binary32.
+/// Named enum members and Boolean cells are non-numeric and return `None`;
+/// numeric enum representations return an integer. An absent type uses the
+/// historical untyped-cell rule: numeric cells are parsed as binary32.
 fn cell_value(
     cell: roxmltree::Node<'_, '_>,
     declared_type: Option<&str>,
@@ -131,7 +134,21 @@ fn cell_value(
     };
 
     let scalar = match ty {
-        "enum" | "bool" => return Ok(None),
+        "bool" => return Ok(None),
+        "enum" => match text.parse::<f64>() {
+            // Named members belong to the project enum model, not this numeric
+            // calibration store. Keep the existing skip behavior for them.
+            Err(_) => return Ok(None),
+            Ok(value)
+                if value.is_finite()
+                    && value.fract() == 0.0
+                    && value >= f64::from(i32::MIN)
+                    && value <= f64::from(i32::MAX) =>
+            {
+                M1Scalar::Integer(value as i32)
+            }
+            Ok(_) => return Err(width_error()),
+        },
         "f32" | "f64" | "untyped-f32" => {
             let narrowed = text.parse::<f32>().map_err(|_| width_error())?;
             if !narrowed.is_finite() {
@@ -144,8 +161,7 @@ fn cell_value(
             .ok()
             .map(M1Scalar::Integer)
             .ok_or_else(width_error)?,
-        "u8" | "u16" | "u32" | "u64" => text
-            .parse::<u32>()
+        "u8" | "u16" | "u32" | "u64" => parse_unsigned_cell(text)
             .ok()
             .map(M1Scalar::UnsignedInteger)
             .ok_or_else(width_error)?,
@@ -159,6 +175,18 @@ fn cell_value(
         }
     };
     Ok(Some(scalar))
+}
+
+/// Parse the unsigned literal forms emitted by M1 configuration exports.
+/// Decimal and `0x` hexadecimal forms share the evaluator's 32-bit storage
+/// limit. A trailing `u` is accepted for parity with script literals.
+fn parse_unsigned_cell(text: &str) -> Result<u32, std::num::ParseIntError> {
+    let lower = text.to_ascii_lowercase();
+    let body = lower.strip_suffix('u').unwrap_or(&lower);
+    match body.strip_prefix("0x") {
+        Some(hex) => u32::from_str_radix(hex, 16),
+        None => body.parse::<u32>(),
+    }
 }
 
 /// Collect the `<Cell>` breakpoint/body values under a `<Cells>` wrapper found
@@ -306,10 +334,36 @@ mod tests {
     }
 
     #[test]
+    fn numeric_enum_table_axis_uses_integer_representation() {
+        let xml = r#"<Configuration>
+          <Table Name="Root.Enum Curve">
+            <X><Cells Type="enum"><Cell>0.0e+00</Cell><Cell>2.0e+00</Cell></Cells></X>
+            <Body><Cells Type="f32"><Cell>5</Cell><Cell>25</Cell></Cells></Body>
+          </Table>
+        </Configuration>"#;
+        let calibration = Calibration::from_m1cfg_str(xml).unwrap();
+        let table = calibration.table("Root.Enum Curve").unwrap();
+        assert_eq!(
+            table.axes[0],
+            vec![M1Scalar::Integer(0), M1Scalar::Integer(2)]
+        );
+
+        let fractional = r#"<Configuration>
+          <Table Name="Root.Bad Enum Curve">
+            <X><Cells Type="enum"><Cell>0.5</Cell></Cells></X>
+          </Table>
+        </Configuration>"#;
+        let error = Calibration::from_m1cfg_str(fractional).unwrap_err();
+        assert!(format!("{error}").contains("enum"), "{error}");
+    }
+
+    #[test]
     fn cell_types_preserve_signedness_and_reject_width_overflow() {
         let xml = r#"<Configuration>
           <Parameter Name="Signed"><Cell Type="s32">-2147483648</Cell></Parameter>
           <Parameter Name="Unsigned"><Cell Type="u32">4294967295</Cell></Parameter>
+          <Parameter Name="Hex"><Cell Type="u32">0x0400</Cell></Parameter>
+          <Parameter Name="Upper Hex"><Cell Type="u32">0XFFu</Cell></Parameter>
           <Parameter Name="Fixed"><Cell Type="FixedPoint7dps">1.2345678</Cell></Parameter>
         </Configuration>"#;
         let calibration = Calibration::from_m1cfg_str(xml).unwrap();
@@ -320,6 +374,14 @@ mod tests {
         assert_eq!(
             calibration.param("Unsigned"),
             Some(M1Scalar::UnsignedInteger(u32::MAX))
+        );
+        assert_eq!(
+            calibration.param("Hex"),
+            Some(M1Scalar::UnsignedInteger(0x400))
+        );
+        assert_eq!(
+            calibration.param("Upper Hex"),
+            Some(M1Scalar::UnsignedInteger(0xff))
         );
         assert_eq!(
             calibration.param("Fixed"),
