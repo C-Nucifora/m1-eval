@@ -1671,6 +1671,17 @@ mod tests {
                 &loaded,
                 Some("Root.Demo"),
                 Some("Root.Demo.Update"),
+                "Sensor.Diagnostic",
+                "AsInteger"
+            ),
+            BuiltinSupport::Direct,
+            "package-generated sensor diagnostics use the catalogue enum"
+        );
+        assert_eq!(
+            support_in(
+                &loaded,
+                Some("Root.Demo"),
+                Some("Root.Demo.Update"),
                 "Drive State.Idle",
                 "AsString"
             ),
@@ -2643,7 +2654,7 @@ mod tests {
         // Logging) handled by the generic typed fallback must classify as
         // Stubbed, so coverage stays consistent with runtime dispatch.
         let cases = [
-            ("CanComms", "RxOpenStandard"),     // Handle -> unit stub
+            ("CanComms", "RxOpenStandard"),     // Handle -> unsigned-zero stub
             ("CanComms", "GetFloat"),           // FloatingPoint -> 0.0
             ("CanComms", "GetUnsignedInteger"), // Integer -> 0
             ("CanComms", "RxMessage"),          // Boolean -> false

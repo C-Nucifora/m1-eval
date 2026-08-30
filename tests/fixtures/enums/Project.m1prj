@@ -10,6 +10,10 @@
   <ComponentStream><List>
    <Component Classname="BuiltIn.GroupCompound" Name="Root.Demo"/>
    <Component Classname="BuiltIn.Channel" Name="Root.Demo.Mode"><Props Type="::This.Drive State"/></Component>
+   <Component Classname="BuiltIn.Parameter" Name="Root.Demo.Configured Mode"><Props Type="::This.Drive State"/></Component>
+   <Component Classname="BuiltIn.Parameter" Name="Root.Demo.Left Coefficient"><Props Type="f32"/></Component>
+   <Component Classname="BuiltIn.Parameter" Name="Root.Demo.Right Coefficient"><Props Type="f32"/></Component>
+   <Component Classname="BuiltIn.Channel" Name="Root.Demo.Ratio"><Props Type="f32"/></Component>
    <Component Classname="BuiltIn.GroupCompound" Name="Root.Demo.Compound"/>
    <Component Classname="BuiltIn.Channel" Name="Root.Demo.Compound.Value"><Props Type="::This.Drive State"/></Component>
    <Component Classname="BuiltIn.Channel" Name="Root.Demo.Precharge State"><Props Type="u8"/></Component>
@@ -27,6 +31,9 @@
    <Component Classname="BuiltIn.Channel" Name="Root.Demo.Calibration Compound.Value"><Props Type="f32"/></Component>
    <Component Classname="BuiltIn.Timer" Name="Root.Demo.Startup Delay"/>
    <Component Classname="MoTeC Input.Sensor" Name="Root.Demo.Typed IO"><Props Type="f32"/></Component>
+   <Component Classname="MoTeC Input.Sensor" Name="Root.Demo.Sensor"/>
+   <Component Classname="BuiltIn.GroupCompound" Name="Root.Demo.Sensor.Diagnostic"/>
+   <Component Classname="BuiltIn.Channel" Name="Root.Demo.Sensor.Diagnostic.Value"/>
    <Component Classname="BuiltIn.GroupCompound" Name="Root.Demo.Service Bits"/>
    <Component Classname="BuiltIn.CAN.Message" Name="Root.Demo.DashVals"/>
    <Component Classname="BuiltIn.CAN.Signal" Name="Root.Demo.DashVals.Aux Switch"/>
@@ -34,6 +41,7 @@
    <Component Classname="BuiltIn.Channel" Name="Root.Demo.Flag"><Props Type="u8"/></Component>
    <Component Classname="BuiltIn.FuncUser" Filename="Demo.Update.m1scr" Name="Root.Demo.Update"/>
    <Component Classname="BuiltIn.FuncUser" Filename="Demo.Report.m1scr" Name="Root.Demo.Report"/>
+   <Component Classname="BuiltIn.FuncUser" Filename="Demo.Ratio.m1scr" Name="Root.Demo.Ratio Update"/>
   </List></ComponentStream>
  </Project>
 </MoTeCM1BuildSession>

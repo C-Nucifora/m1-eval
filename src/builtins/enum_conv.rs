@@ -24,12 +24,23 @@
 //! `.` — never on whitespace.
 
 use crate::error::EvalError;
-use crate::expr::EvalCtx;
+use crate::expr::{EvalCtx, coerce_for_declared_type};
 use crate::ident::{Target, classify};
 use crate::value::Value;
 use m1_typecheck::Project;
-use m1_typecheck::symbols::SymbolKind;
+use m1_typecheck::symbols::{EnumId, SymbolKind};
+use m1_typecheck::types::ValueType;
 use std::collections::{HashMap, HashSet};
+
+/// The concrete channel that stores an enum source and its authoritative type.
+#[derive(Debug, Clone, PartialEq, Eq)]
+struct EnumValueSource {
+    path: String,
+    enum_id: EnumId,
+    /// Package-generated storage may expose the enum's integer representation;
+    /// ordinary typed sources retain the stricter enum-value contract.
+    numeric_storage: bool,
+}
 
 /// Convert `<object>.AsInteger()` to its declared enum integer.
 ///
@@ -103,29 +114,33 @@ fn enum_value(object: &str, ctx: &mut EvalCtx) -> Result<Option<Value>, EvalErro
         // fall through to other dispatch.
         return Ok(None);
     };
-    let Some(value_path) = enum_value_path(&canon, ctx.project) else {
+    let Some(source) = enum_value_source(&canon, ctx.project) else {
         return Ok(None);
     };
-    read_enum_at(&value_path, ctx).map(Some)
+    read_enum_at(&source, ctx).map(Some)
 }
 
 /// Resolve an enum-valued project object to the symbol `read_symbol` consumes.
 /// Constants and direct typed objects keep their own path. A value compound
 /// follows its declared default, then its generated `.Value` child.
 pub(crate) fn enum_value_path(canon: &str, project: &Project) -> Option<String> {
-    enum_value_path_inner(canon, project, &mut HashSet::new())
+    enum_value_source(canon, project).map(|source| source.path)
 }
 
-fn enum_value_path_inner(
+fn enum_value_source(canon: &str, project: &Project) -> Option<EnumValueSource> {
+    enum_value_source_inner(canon, project, &mut HashSet::new())
+}
+
+fn enum_value_source_inner(
     canon: &str,
     project: &Project,
     seen: &mut HashSet<String>,
-) -> Option<String> {
+) -> Option<EnumValueSource> {
     if !seen.insert(canon.to_string()) {
         return None;
     }
     let symbol = project.symbols().get(canon)?;
-    if symbol.value_type.is_enum()
+    if let ValueType::Enum(enum_id) = symbol.value_type
         && matches!(
             symbol.kind,
             SymbolKind::Channel
@@ -136,7 +151,11 @@ fn enum_value_path_inner(
                 | SymbolKind::Other
         )
     {
-        return Some(canon.to_string());
+        return Some(EnumValueSource {
+            path: canon.to_string(),
+            enum_id,
+            numeric_storage: false,
+        });
     }
 
     if symbol.kind == SymbolKind::Group
@@ -144,9 +163,42 @@ fn enum_value_path_inner(
     {
         let locals = HashMap::new();
         if let Target::Symbol(path) = classify(default, Some(canon), None, project, &locals)
-            && let Some(value_path) = enum_value_path_inner(&path, project, seen)
+            && let Some(source) = enum_value_source_inner(&path, project, seen)
         {
-            return Some(value_path);
+            return Some(source);
+        }
+    }
+
+    // `MoTeC Input.Sensor` generates an untyped `Diagnostic.Value` channel.
+    // M1 nevertheless exposes the compound as `Sensor Diagnostic Enumeration`:
+    // real scripts compare `Sensor.Diagnostic.AsInteger()` with members of that
+    // catalogue enum. Recover the omitted type from the package class and the
+    // generated child shape, never from a corpus-specific symbol path.
+    if symbol.kind == SymbolKind::Group
+        && canon
+            .rsplit_once('.')
+            .is_some_and(|(_, leaf)| leaf == "Diagnostic")
+        && let Some((owner, _)) = canon.rsplit_once('.')
+        && project
+            .symbols()
+            .get(owner)
+            .and_then(|owner| owner.classname.as_deref())
+            == Some("MoTeC Input.Sensor")
+        && let Some(enum_id) = project
+            .symbols()
+            .enum_by_name("Sensor Diagnostic Enumeration")
+    {
+        let path = format!("{canon}.Value");
+        if project
+            .symbols()
+            .get(&path)
+            .is_some_and(|value| value.kind == SymbolKind::Channel)
+        {
+            return Some(EnumValueSource {
+                path,
+                enum_id,
+                numeric_storage: true,
+            });
         }
     }
 
@@ -158,7 +210,7 @@ fn enum_value_path_inner(
         return project
             .symbols()
             .get(&value_path)
-            .and_then(|_| enum_value_path_inner(&value_path, project, seen));
+            .and_then(|_| enum_value_source_inner(&value_path, project, seen));
     }
     None
 }
@@ -168,16 +220,22 @@ fn enum_value_path_inner(
 /// the same semantics as a plain read: a written/seeded value, else (in
 /// whole-project mode) the channel's externally-driven enum startup default, else
 /// — in single-function/cone mode — a fail-loud [`EvalError::MissingInput`]. A
-/// non-enum value is a `TypeError` (never a guessed integer).
-fn read_enum_at(canon: &str, ctx: &mut EvalCtx) -> Result<Value, EvalError> {
-    let value = crate::expr::read_symbol(canon, ctx)?;
-    if matches!(value, Value::Enum { .. }) {
-        Ok(value)
-    } else {
-        Err(EvalError::TypeError {
-            detail: format!("value at {canon:?} is not an enum value"),
-        })
+/// typed enum source must already contain that enum. A package-derived source may
+/// contain the generated numeric representation, which is validated and restored
+/// through its catalogue enum id.
+fn read_enum_at(source: &EnumValueSource, ctx: &mut EvalCtx) -> Result<Value, EvalError> {
+    let value = crate::expr::read_symbol(&source.path, ctx)?;
+    if !source.numeric_storage && !matches!(value, Value::Enum { .. }) {
+        return Err(EvalError::TypeError {
+            detail: format!("value at {:?} is not an enum value", source.path),
+        });
     }
+    coerce_for_declared_type(
+        &source.path,
+        value,
+        ValueType::Enum(source.enum_id),
+        ctx.project,
+    )
 }
 
 #[cfg(test)]
@@ -309,6 +367,54 @@ mod tests {
         assert_eq!(
             h.as_int("Root.Demo.Compound").unwrap(),
             Some(Value::m1_integer(0))
+        );
+    }
+
+    #[test]
+    fn sensor_diagnostic_recovers_catalogue_enum_from_package_shape() {
+        let mut h = Harness::new();
+        let diagnostic_id = h
+            .project
+            .symbols()
+            .enum_by_name("Sensor Diagnostic Enumeration")
+            .expect("firmware diagnostic enum is registered");
+        assert_eq!(
+            enum_value_source("Root.Demo.Sensor.Diagnostic", &h.project),
+            Some(EnumValueSource {
+                path: "Root.Demo.Sensor.Diagnostic.Value".to_string(),
+                enum_id: diagnostic_id,
+                numeric_storage: true,
+            })
+        );
+
+        // Package-generated Diagnostic.Value is untyped in the project XML.
+        // Its numeric storage is interpreted through the authoritative enum,
+        // including non-zero members, before AsInteger converts it back.
+        h.env
+            .set("Root.Demo.Sensor.Diagnostic.Value", Value::m1_integer(1));
+        assert_eq!(
+            h.as_int("Sensor.Diagnostic").unwrap(),
+            Some(Value::m1_integer(1))
+        );
+    }
+
+    #[test]
+    fn arbitrary_untyped_diagnostic_group_is_not_an_enum_source() {
+        let h = Harness::new();
+        assert_eq!(
+            enum_value_source("Root.Demo.Service Bits", &h.project),
+            None,
+            "an untyped group must not acquire a diagnostic enum by name alone"
+        );
+    }
+
+    #[test]
+    fn typed_enum_source_does_not_accept_untyped_numeric_storage() {
+        let mut h = Harness::new();
+        h.env.set("Root.Demo.Mode", Value::m1_integer(0));
+        assert!(
+            matches!(h.as_int("Mode"), Err(EvalError::TypeError { .. })),
+            "only the catalogue-backed package source may restore numeric storage"
         );
     }
 

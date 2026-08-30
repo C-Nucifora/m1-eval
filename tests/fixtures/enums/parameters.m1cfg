@@ -1,0 +1,12 @@
+<?xml version="1.0"?>
+<Configuration>
+ <Parameter Name="Demo.Configured Mode">
+  <Cell Type="enum">Precharging</Cell>
+ </Parameter>
+ <Parameter Name="Demo.Left Coefficient">
+  <Cell Type="f32">0.0</Cell>
+ </Parameter>
+ <Parameter Name="Demo.Right Coefficient">
+  <Cell Type="f32">0.0</Cell>
+ </Parameter>
+</Configuration>
