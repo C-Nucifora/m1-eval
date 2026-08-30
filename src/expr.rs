@@ -1871,6 +1871,41 @@ mod tests {
     }
 
     #[test]
+    fn corrected_pure_builtins_preserve_m1_scalars_end_to_end() {
+        let mut h = Harness::new();
+        assert_eq!(
+            rhs_value("Calculate.Average(1, 2)", &mut h).unwrap(),
+            Value::m1_integer(1)
+        );
+        assert_eq!(
+            rhs_value("Calculate.Average(1.0, 2.0)", &mut h).unwrap(),
+            Value::m1_float(1.5)
+        );
+        assert_eq!(
+            rhs_value("Calculate.Bias(20.0, 10.0, -0.5)", &mut h).unwrap(),
+            Value::m1_float(12.5)
+        );
+        assert_eq!(
+            rhs_value("Calculate.MaximumFloat()", &mut h).unwrap(),
+            Value::m1_float(f32::MAX)
+        );
+        assert_eq!(
+            rhs_value("Convert.ToInteger(-2.5)", &mut h).unwrap(),
+            Value::m1_integer(-3)
+        );
+        assert_eq!(
+            rhs_value("Convert.ToUnsignedInteger(-2.6)", &mut h).unwrap(),
+            Value::m1_unsigned(0)
+        );
+        assert_eq!(
+            rhs_value("Convert.ToFixed7DP(1)", &mut h).unwrap(),
+            Value::M1(M1Scalar::FixedPoint7dps(FixedPoint7dps::from_raw(
+                10_000_000,
+            )))
+        );
+    }
+
+    #[test]
     fn unimplemented_builtin_call_still_fails_loud() {
         let mut h = Harness::new();
         // A buffered sample-delay (Delay.Signal15) is intentionally not

@@ -1,73 +1,261 @@
 // SPDX-License-Identifier: GPL-3.0-or-later
 //! The pure `Convert.*` numeric-conversion builtins (Tier-1).
 //!
-//! - `Convert.ToInteger(x)` — truncate toward zero to a signed integer.
-//! - `Convert.ToUnsignedInteger(x)` — truncate toward zero to an unsigned
-//!   integer (a negative input truncates toward zero, then the magnitude is
-//!   taken — documented assumption, since the intrinsic signature is unsigned).
+//! `ToInteger` and `ToUnsignedInteger` round to the nearest representable M1
+//! integer, with halfway cases rounded away from zero. Values beyond the target
+//! range select its nearest endpoint, so a negative unsigned conversion becomes
+//! zero rather than a positive magnitude.
 //!
-//! Truncation (toward zero), not rounding, is the documented choice for Phase 1;
-//! MoTeC's exact rounding mode is to be confirmed against M1 Sim during fidelity
-//! work. Runtime values can represent `FixedPoint7dps`, but migrating the
-//! builtin engine itself is tracked separately in issue #38;
-//! `Convert.ToFixed7DP` therefore remains fail-loud here.
+//! The pinned catalogue declares `ToFixed7DP` for an integral argument. It is a
+//! numeric conversion, not a raw-bit reinterpretation: `1` becomes `1.0000000`.
+//! Because Fixed Point 7dps stores a signed 32-bit value scaled by `10^-7`, only
+//! whole-number inputs from `-214` through `214` fit. Calls outside that range
+//! fail loud instead of wrapping or silently clipping.
 
 use crate::error::EvalError;
-use crate::value::Value;
+use crate::value::{FixedPoint7dps, M1Scalar, Value};
 
-/// Evaluate one `Convert.<method>` call. Returns `Ok(None)` for any method not
-/// implemented here so the dispatcher can fall through to its fail-loud default
-/// (e.g. `ToFixed7DP`). Arity is validated by the caller.
+/// Evaluate one `Convert.<method>` call.
+///
+/// Returns `Ok(None)` when this module does not implement `method`. The caller
+/// validates arity against the pinned intrinsic catalogue before dispatch.
 pub fn call(method: &str, args: &[Value]) -> Result<Option<Value>, EvalError> {
-    let v = match method {
-        "ToInteger" => Value::Int(args[0].as_f64()?.trunc() as i64),
-        "ToUnsignedInteger" => {
-            // Truncate toward zero; the intrinsic return type is unsigned, so a
-            // negative value's magnitude is taken (documented assumption).
-            let truncated = args[0].as_f64()?.trunc();
-            Value::Uint(truncated.abs() as u64)
-        }
+    let value = match method {
+        "ToInteger" => to_integer(&args[0])?,
+        "ToUnsignedInteger" => to_unsigned_integer(&args[0])?,
+        "ToFixed7DP" => to_fixed_7dps(&args[0])?,
         _ => return Ok(None),
     };
-    Ok(Some(v))
+    Ok(Some(value))
+}
+
+fn to_integer(argument: &Value) -> Result<Value, EvalError> {
+    let result = match argument.m1_scalar()? {
+        M1Scalar::Integer(value) => value,
+        M1Scalar::UnsignedInteger(value) => value.min(i32::MAX as u32) as i32,
+        M1Scalar::FloatingPoint(value) => round_f32_to_i32(value)?,
+        M1Scalar::FixedPoint7dps(value) => round_fixed_to_i32(value),
+    };
+    Ok(Value::m1_integer(result))
+}
+
+fn to_unsigned_integer(argument: &Value) -> Result<Value, EvalError> {
+    let result = match argument.m1_scalar()? {
+        M1Scalar::Integer(value) => value.max(0) as u32,
+        M1Scalar::UnsignedInteger(value) => value,
+        M1Scalar::FloatingPoint(value) => round_f32_to_u32(value)?,
+        M1Scalar::FixedPoint7dps(value) => round_fixed_to_i32(value).max(0) as u32,
+    };
+    Ok(Value::m1_unsigned(result))
+}
+
+fn to_fixed_7dps(argument: &Value) -> Result<Value, EvalError> {
+    let integer = match argument.m1_scalar()? {
+        M1Scalar::Integer(value) => i64::from(value),
+        M1Scalar::UnsignedInteger(value) => i64::from(value),
+        other => {
+            return Err(EvalError::TypeError {
+                detail: format!(
+                    "Convert.ToFixed7DP expects an M1 Integer or UnsignedInteger, got {other:?}"
+                ),
+            });
+        }
+    };
+    let scaled = integer * FixedPoint7dps::SCALE;
+    let raw = i32::try_from(scaled).map_err(|_| EvalError::TypeError {
+        detail: format!(
+            "Convert.ToFixed7DP input {integer} is outside the Fixed Point 7dps range; integral inputs must be between -214 and 214"
+        ),
+    })?;
+    Ok(Value::M1(M1Scalar::FixedPoint7dps(
+        FixedPoint7dps::from_raw(raw),
+    )))
+}
+
+fn round_f32_to_i32(value: f32) -> Result<i32, EvalError> {
+    if value.is_nan() {
+        return Err(not_convertible("Integer", value));
+    }
+    Ok(value.round() as i32)
+}
+
+fn round_f32_to_u32(value: f32) -> Result<u32, EvalError> {
+    if value.is_nan() {
+        return Err(not_convertible("UnsignedInteger", value));
+    }
+    Ok(value.round() as u32)
+}
+
+/// Round an exact scaled fixed-point value to the nearest integer. Rust integer
+/// division truncates toward zero, so adding one unit when the remainder is at
+/// least half the scale implements halfway-away-from-zero without a float.
+fn round_fixed_to_i32(value: FixedPoint7dps) -> i32 {
+    let raw = i64::from(value.raw());
+    let whole = raw / FixedPoint7dps::SCALE;
+    let remainder = raw % FixedPoint7dps::SCALE;
+    let adjustment = if remainder.abs() * 2 >= FixedPoint7dps::SCALE {
+        remainder.signum()
+    } else {
+        0
+    };
+    (whole + adjustment) as i32
+}
+
+fn not_convertible(target: &str, value: f32) -> EvalError {
+    EvalError::TypeError {
+        detail: format!("{value:?} has no nearest M1 {target} value"),
+    }
 }
 
 #[cfg(test)]
 mod tests {
     use super::*;
 
+    fn fixed(raw: i32) -> Value {
+        Value::M1(M1Scalar::FixedPoint7dps(FixedPoint7dps::from_raw(raw)))
+    }
+
     fn ok(method: &str, args: &[Value]) -> Value {
         call(method, args).unwrap().unwrap()
     }
 
     #[test]
-    fn to_integer_truncates_toward_zero() {
-        assert_eq!(ok("ToInteger", &[Value::Float(2.9)]), Value::Int(2));
-        assert_eq!(ok("ToInteger", &[Value::Float(-2.9)]), Value::Int(-2));
-        // An already-integral value passes through.
-        assert_eq!(ok("ToInteger", &[Value::Int(5)]), Value::Int(5));
+    fn to_integer_rounds_to_nearest_with_ties_away_from_zero() {
+        for (source, expected) in [
+            (2.4, 2),
+            (2.6, 3),
+            (-2.4, -2),
+            (-2.6, -3),
+            (2.5, 3),
+            (-2.5, -3),
+            (0.0, 0),
+        ] {
+            assert_eq!(
+                ok("ToInteger", &[Value::m1_float(source)]),
+                Value::m1_integer(expected),
+                "failed to round {source}"
+            );
+        }
     }
 
     #[test]
-    fn to_unsigned_integer_truncates() {
+    fn to_integer_clamps_to_the_signed_range() {
         assert_eq!(
-            ok("ToUnsignedInteger", &[Value::Float(3.7)]),
-            Value::Uint(3)
+            ok("ToInteger", &[Value::m1_unsigned(u32::MAX)]),
+            Value::m1_integer(i32::MAX)
         );
-        assert_eq!(ok("ToUnsignedInteger", &[Value::Int(9)]), Value::Uint(9));
+        assert_eq!(
+            ok("ToInteger", &[Value::m1_float(f32::MAX)]),
+            Value::m1_integer(i32::MAX)
+        );
+        assert_eq!(
+            ok("ToInteger", &[Value::m1_float(-f32::MAX)]),
+            Value::m1_integer(i32::MIN)
+        );
+        assert_eq!(
+            ok("ToInteger", &[Value::m1_integer(i32::MIN)]),
+            Value::m1_integer(i32::MIN)
+        );
     }
 
     #[test]
-    fn non_numeric_input_fails_loud() {
+    fn to_unsigned_rounds_then_clamps_negative_values_to_zero() {
+        assert_eq!(
+            ok("ToUnsignedInteger", &[Value::m1_float(3.6)]),
+            Value::m1_unsigned(4)
+        );
+        assert_eq!(
+            ok("ToUnsignedInteger", &[Value::m1_float(3.5)]),
+            Value::m1_unsigned(4)
+        );
+        for source in [-0.4, -0.5, -2.4, -2.5, -2.6] {
+            assert_eq!(
+                ok("ToUnsignedInteger", &[Value::m1_float(source)]),
+                Value::m1_unsigned(0),
+                "negative source {source} must not become its magnitude"
+            );
+        }
+        assert_eq!(
+            ok("ToUnsignedInteger", &[Value::m1_integer(i32::MIN)]),
+            Value::m1_unsigned(0)
+        );
+        assert_eq!(
+            ok("ToUnsignedInteger", &[Value::m1_float(f32::MAX)]),
+            Value::m1_unsigned(u32::MAX)
+        );
+    }
+
+    #[test]
+    fn fixed_point_arguments_round_exactly_without_binary_float() {
+        for (raw, expected) in [
+            (14_999_999, 1),
+            (15_000_000, 2),
+            (-14_999_999, -1),
+            (-15_000_000, -2),
+        ] {
+            assert_eq!(ok("ToInteger", &[fixed(raw)]), Value::m1_integer(expected));
+        }
+        assert_eq!(
+            ok("ToUnsignedInteger", &[fixed(-15_000_000)]),
+            Value::m1_unsigned(0)
+        );
+    }
+
+    #[test]
+    fn to_fixed_7dps_is_numeric_and_covers_its_integral_domain() {
+        for (source, raw) in [
+            (-214, -2_140_000_000),
+            (-1, -10_000_000),
+            (0, 0),
+            (1, 10_000_000),
+            (214, 2_140_000_000),
+        ] {
+            assert_eq!(ok("ToFixed7DP", &[Value::m1_integer(source)]), fixed(raw));
+        }
+        assert_eq!(
+            ok("ToFixed7DP", &[Value::m1_unsigned(214)]),
+            fixed(2_140_000_000)
+        );
+    }
+
+    #[test]
+    fn to_fixed_7dps_rejects_one_beyond_each_integral_boundary() {
+        for argument in [Value::m1_integer(-215), Value::m1_integer(215)] {
+            match call("ToFixed7DP", &[argument]) {
+                Err(EvalError::TypeError { detail }) => {
+                    assert!(detail.contains("between -214 and 214"), "{detail}");
+                }
+                other => panic!("expected fixed-point range error, got {other:?}"),
+            }
+        }
+        assert!(matches!(
+            call("ToFixed7DP", &[Value::m1_unsigned(215)]),
+            Err(EvalError::TypeError { .. })
+        ));
+    }
+
+    #[test]
+    fn invalid_conversion_inputs_fail_loud() {
+        assert!(matches!(
+            call("ToInteger", &[Value::m1_float(f32::NAN)]),
+            Err(EvalError::TypeError { .. })
+        ));
+        assert!(matches!(
+            call("ToFixed7DP", &[Value::m1_float(1.0)]),
+            Err(EvalError::TypeError { .. })
+        ));
         assert!(matches!(
             call("ToInteger", &[Value::Str("x".into())]),
+            Err(EvalError::TypeError { .. })
+        ));
+        assert!(matches!(
+            call("ToInteger", &[Value::Float(1.0)]),
             Err(EvalError::TypeError { .. })
         ));
     }
 
     #[test]
     fn unimplemented_method_returns_none() {
-        // The compatibility builtin engine has not migrated ToFixed7DP yet.
-        assert!(call("ToFixed7DP", &[Value::Int(1)]).unwrap().is_none());
+        assert!(call("NotAMethod", &[]).unwrap().is_none());
     }
 }

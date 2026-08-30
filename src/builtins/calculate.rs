@@ -1,218 +1,235 @@
 // SPDX-License-Identifier: GPL-3.0-or-later
 //! The pure `Calculate.*` math builtins (Tier-1).
 //!
-//! These are deterministic, side-effect-free, time-independent functions: max,
-//! min, modulo, bias blend, the constant PI, floor/ceiling, power, square root,
-//! NaN test, and the fast trig approximations. Their semantics are paraphrased
-//! from our understanding of the M1 library (never copied from the proprietary
-//! manuals).
-//!
-//! ## Numeric result typing
-//!
-//! Where the intrinsic signature returns `Integer|FloatingPoint`
-//! (`Max`/`Min`/`Modulo`), the result kind follows the operands: integral when
-//! every operand is integral (preserving signed/unsigned via `numeric_join`),
-//! float when any operand is float. The float-only signatures
-//! (`Floor`/`Ceiling`/`Power`/`FastSquareRoot`/trig/`Bias`) always return a
-//! [`Value::Float`].
+//! These functions operate directly on the runtime's M1-width scalar values.
+//! Integer overloads return an M1 integer family, while floating overloads
+//! calculate and return IEEE-754 binary32 values. The behavior is paraphrased
+//! from the local M1 development manual and pinned intrinsic catalogue; no
+//! proprietary source text or data is included here.
 //!
 //! Stateful `Calculate` methods (`Stable`, `Hysteresis`, `Between`, `Beyond`)
-//! are flagged stateful in the intrinsic library and belong to the stateful
-//! milestone (M6); they are deliberately *not* implemented here and therefore
-//! fall through `dispatch` to a fail-loud `UnsupportedBuiltin`.
+//! are handled by the stateful builtin engine and are not implemented here.
 
 use crate::error::EvalError;
 use crate::value::{M1Scalar, Value};
 use m1_typecheck::types::{ValueType, numeric_join};
 
-/// Evaluate one `Calculate.<method>` call. Returns `Ok(None)` when `method` is
-/// not one of the pure functions implemented here, so the dispatcher can fall
-/// through to its fail-loud default (the stateful `Calculate` methods land
-/// there until M6). Arity is validated by the caller against the intrinsic
-/// library before this runs.
+/// Evaluate one `Calculate.<method>` call.
+///
+/// Returns `Ok(None)` when this pure engine does not implement `method`, so the
+/// dispatcher can try the appropriate route or fail loud. The dispatcher
+/// validates arity against the pinned intrinsic catalogue before calling here.
 pub fn call(method: &str, args: &[Value]) -> Result<Option<Value>, EvalError> {
-    let v = match method {
+    let value = match method {
         "Max" => binary_minmax(args, true)?,
         "Min" => binary_minmax(args, false)?,
-        "Absolute" => abs(args)?,
+        "Absolute" => absolute(args)?,
         "Average" => average(args)?,
         "Modulo" => modulo(args)?,
         "Bias" => bias(args)?,
-        "PI" => Value::Float(std::f64::consts::PI),
-        "NAN" => Value::Float(f64::NAN),
-        "Infinity" => Value::Float(f64::INFINITY),
-        // The largest representable finite float (paraphrased: the maximum finite
-        // floating-point magnitude the firmware can hold).
-        "MaximumFloat" => Value::Float(f32::MAX as f64),
-        "Floor" => Value::Float(unary_f64(args)?.floor()),
-        "Ceiling" => Value::Float(unary_f64(args)?.ceil()),
+        "PI" => Value::m1_float(std::f32::consts::PI),
+        "NAN" => Value::m1_float(f32::NAN),
+        "Infinity" => Value::m1_float(f32::INFINITY),
+        "MaximumFloat" => Value::m1_float(f32::MAX),
+        "Floor" => Value::m1_float(unary_f32(args)?.floor()),
+        "Ceiling" => Value::m1_float(unary_f32(args)?.ceil()),
         "Power" => {
-            let (base, exp) = two_f64(args)?;
-            Value::Float(base.powf(exp))
+            let (base, exponent) = two_f32(args)?;
+            Value::m1_float(base.powf(exponent))
         }
-        "FastSquareRoot" => Value::Float(unary_f64(args)?.sqrt()),
-        "IsNAN" => Value::Bool(unary_f64(args)?.is_nan()),
-        "IsFinite" => Value::Bool(unary_f64(args)?.is_finite()),
-        "FastSin" => Value::Float(unary_f64(args)?.sin()),
-        "FastCos" => Value::Float(unary_f64(args)?.cos()),
-        "FastTan" => Value::Float(unary_f64(args)?.tan()),
-        // The inverse trig functions mirror the `FastSin` paraphrase note: the std
-        // implementation, a documented assumption (radians, principal value).
-        "InverseSin" => Value::Float(unary_f64(args)?.asin()),
-        "InverseCos" => Value::Float(unary_f64(args)?.acos()),
-        "InverseTan" => Value::Float(unary_f64(args)?.atan()),
+        "FastSquareRoot" => Value::m1_float(unary_f32(args)?.sqrt()),
+        "IsNAN" => Value::Bool(unary_f32(args)?.is_nan()),
+        "IsFinite" => Value::Bool(unary_f32(args)?.is_finite()),
+        "FastSin" => Value::m1_float(unary_f32(args)?.sin()),
+        "FastCos" => Value::m1_float(unary_f32(args)?.cos()),
+        "FastTan" => Value::m1_float(unary_f32(args)?.tan()),
+        // The standard-library implementations remain explicit evaluator
+        // assumptions for the firmware's approximation details.
+        "InverseSin" => Value::m1_float(unary_f32(args)?.asin()),
+        "InverseCos" => Value::m1_float(unary_f32(args)?.acos()),
+        "InverseTan" => Value::m1_float(unary_f32(args)?.atan()),
         "InverseTan2" => {
-            let (y, x) = two_f64(args)?;
-            Value::Float(y.atan2(x))
+            let (y, x) = two_f32(args)?;
+            Value::m1_float(y.atan2(x))
         }
-        // Not a pure Calculate function we implement: let the dispatcher decide
-        // (stateful ones -> M6 -> UnsupportedBuiltin; unknown names likewise).
         _ => return Ok(None),
     };
-    Ok(Some(v))
+    Ok(Some(value))
 }
 
-/// `Max`/`Min` of two numbers. The result preserves integrality: if both
-/// operands are integral the result is integral (signed/unsigned chosen by
-/// `numeric_join`), otherwise it is a float. Comparison itself is done in `f64`
-/// so mixed int/float operands compare correctly.
+/// Return the greater or lesser argument under M1 numeric promotion.
 fn binary_minmax(args: &[Value], want_max: bool) -> Result<Value, EvalError> {
-    let (a, b) = (&args[0], &args[1]);
-    let af = a.as_f64()?;
-    let bf = b.as_f64()?;
-    let pick_a = if want_max { af >= bf } else { af <= bf };
-    let chosen = if pick_a { a } else { b };
-    // Re-type the chosen operand under the join so e.g. max(Int, Uint) is Uint.
-    retype_numeric(chosen, numeric_join(value_type(a), value_type(b)))
-}
-
-/// `Modulo(a, b)` — the remainder of `a / b`. Integral when both operands are
-/// integral (chosen by `numeric_join`), float otherwise. A zero divisor fails
-/// loud rather than producing NaN.
-fn modulo(args: &[Value]) -> Result<Value, EvalError> {
-    let (a, b) = (&args[0], &args[1]);
-    let joined = numeric_join(value_type(a), value_type(b));
+    let (left, right) = (&args[0], &args[1]);
+    let joined = numeric_join(value_type(left), value_type(right));
     match joined {
         ValueType::Float => {
-            let bf = b.as_f64()?;
-            if bf == 0.0 {
-                return Err(modulo_by_zero());
-            }
-            Ok(Value::Float(a.as_f64()? % bf))
+            let left = left.m1_scalar()?.as_f32();
+            let right = right.m1_scalar()?.as_f32();
+            Ok(Value::m1_float(if want_max {
+                left.max(right)
+            } else {
+                left.min(right)
+            }))
         }
         ValueType::Unsigned => {
-            let bu = as_u64(b)?;
-            if bu == 0 {
-                return Err(modulo_by_zero());
-            }
-            Ok(Value::Uint(as_u64(a)? % bu))
+            let left = as_u32_bits(left)?;
+            let right = as_u32_bits(right)?;
+            Ok(Value::m1_unsigned(if want_max {
+                left.max(right)
+            } else {
+                left.min(right)
+            }))
         }
         ValueType::Integer => {
-            let bi = as_i64(b)?;
-            if bi == 0 {
+            let left = as_i32(left)?;
+            let right = as_i32(right)?;
+            Ok(Value::m1_integer(if want_max {
+                left.max(right)
+            } else {
+                left.min(right)
+            }))
+        }
+        _ => Err(non_numeric("min/max", left, right)),
+    }
+}
+
+/// Return the remainder of the first argument divided by the second.
+fn modulo(args: &[Value]) -> Result<Value, EvalError> {
+    let (left, right) = (&args[0], &args[1]);
+    match numeric_join(value_type(left), value_type(right)) {
+        ValueType::Float => {
+            let divisor = right.m1_scalar()?.as_f32();
+            if divisor == 0.0 {
                 return Err(modulo_by_zero());
             }
-            Ok(Value::Int(as_i64(a)? % bi))
+            Ok(Value::m1_float(left.m1_scalar()?.as_f32() % divisor))
         }
-        _ => Err(EvalError::TypeError {
-            detail: format!("Calculate.Modulo on non-numeric operands {a:?}, {b:?}"),
-        }),
+        ValueType::Unsigned => {
+            let divisor = as_u32_bits(right)?;
+            if divisor == 0 {
+                return Err(modulo_by_zero());
+            }
+            Ok(Value::m1_unsigned(as_u32_bits(left)? % divisor))
+        }
+        ValueType::Integer => {
+            let divisor = as_i32(right)?;
+            if divisor == 0 {
+                return Err(modulo_by_zero());
+            }
+            Ok(Value::m1_integer(as_i32(left)?.wrapping_rem(divisor)))
+        }
+        _ => Err(non_numeric("Modulo", left, right)),
     }
 }
 
-/// `Bias(a, b, t)` — a linear blend between `a` (at `t=0`) and `b` (at `t=1`):
-/// `a + (b - a) * t`. The blended result is always a float (the blend factor is
-/// fractional). This is our paraphrased reading of the bias/cross-fade helper.
+/// Return the manual's biased average of two values.
+///
+/// A bias of `-1` selects the lower argument, `0` selects their average, and
+/// `1` selects the higher argument. Intermediate values interpolate from the
+/// midpoint by half the absolute separation. Evaluation is binary32 throughout.
 fn bias(args: &[Value]) -> Result<Value, EvalError> {
-    let a = args[0].as_f64()?;
-    let b = args[1].as_f64()?;
-    let t = args[2].as_f64()?;
-    Ok(Value::Float(a + (b - a) * t))
+    let left = args[0].m1_scalar()?.as_f32();
+    let right = args[1].m1_scalar()?.as_f32();
+    let bias = args[2].m1_scalar()?.as_f32();
+    let average = left.midpoint(right);
+    let half_separation = left.midpoint(-right).abs();
+    let result = if bias == -1.0 {
+        left.min(right)
+    } else if bias == 0.0 {
+        average
+    } else if bias == 1.0 {
+        left.max(right)
+    } else {
+        average + bias * half_separation
+    };
+    Ok(Value::m1_float(result))
 }
 
-/// `Absolute(x)` — the magnitude of `x`, preserving integrality the same way
-/// `Max`/`Min` do (the intrinsic signature is `Integer|FloatingPoint`). An
-/// unsigned operand is already non-negative, so it is returned unchanged; a
-/// signed integer or float is negated when below zero. Re-typing under the
-/// operand's own [`ValueType`] keeps `Int`→`Int`, `Uint`→`Uint`, `Float`→`Float`.
-fn abs(args: &[Value]) -> Result<Value, EvalError> {
-    match &args[0] {
-        // An unsigned operand is already non-negative.
-        Value::Uint(x) => Ok(Value::Uint(*x)),
-        Value::Int(x) => Ok(Value::Int(x.abs())),
-        Value::Float(x) => Ok(Value::Float(x.abs())),
-        other => Err(EvalError::TypeError {
-            detail: format!("Calculate.Absolute on non-numeric operand {other:?}"),
-        }),
+/// Return the magnitude of one numeric value, preserving its documented
+/// integer or floating overload family.
+fn absolute(args: &[Value]) -> Result<Value, EvalError> {
+    match args[0].m1_scalar()? {
+        M1Scalar::Integer(value) => {
+            value
+                .checked_abs()
+                .map(Value::m1_integer)
+                .ok_or_else(|| EvalError::TypeError {
+                    detail: format!("Calculate.Absolute({value}) is outside the M1 Integer range"),
+                })
+        }
+        M1Scalar::UnsignedInteger(value) => Ok(Value::m1_unsigned(value)),
+        M1Scalar::FloatingPoint(value) => Ok(Value::m1_float(value.abs())),
+        M1Scalar::FixedPoint7dps(value) => Ok(Value::m1_float(value.as_f64().abs() as f32)),
     }
 }
 
-/// `Average(a, b)` — the arithmetic mean `(a + b) / 2`. Always a [`Value::Float`]:
-/// the mean of two integers is generally fractional, so we never round it back to
-/// an integer (the intrinsic return tag is `Integer|FloatingPoint`, but retaining
-/// the fractional part is this evaluator's documented assumption).
+/// Return the arithmetic mean using the overload selected by the arguments.
+///
+/// The integral overload returns the joined integral family and discards a half
+/// unit toward zero. The floating overload calculates and returns binary32.
+/// Wider intermediates keep equal extrema from overflowing before the division.
 fn average(args: &[Value]) -> Result<Value, EvalError> {
-    let a = args[0].as_f64()?;
-    let b = args[1].as_f64()?;
-    Ok(Value::Float((a + b) / 2.0))
-}
-
-/// Coerce a single argument to `f64` for the float-only functions.
-fn unary_f64(args: &[Value]) -> Result<f64, EvalError> {
-    args[0].as_f64()
-}
-
-/// Coerce two arguments to `f64` for the two-arg float functions.
-fn two_f64(args: &[Value]) -> Result<(f64, f64), EvalError> {
-    Ok((args[0].as_f64()?, args[1].as_f64()?))
-}
-
-/// Re-express a value under a target numeric [`ValueType`]. Used so `Max`/`Min`
-/// hand back the joined kind (e.g. an `Int` operand chosen in a join that landed
-/// on `Float` is returned as a `Float`).
-fn retype_numeric(v: &Value, target: ValueType) -> Result<Value, EvalError> {
-    match target {
-        ValueType::Float => Ok(Value::Float(v.as_f64()?)),
-        ValueType::Unsigned => Ok(Value::Uint(as_u64(v)?)),
-        ValueType::Integer => Ok(Value::Int(as_i64(v)?)),
-        _ => Err(EvalError::TypeError {
-            detail: format!("non-numeric operand {v:?} in Calculate min/max"),
-        }),
+    let (left, right) = (&args[0], &args[1]);
+    match numeric_join(value_type(left), value_type(right)) {
+        ValueType::Float => {
+            let left = left.m1_scalar()?.as_f32();
+            let right = right.m1_scalar()?.as_f32();
+            Ok(Value::m1_float(left.midpoint(right)))
+        }
+        ValueType::Unsigned => {
+            let sum = u64::from(as_u32_bits(left)?) + u64::from(as_u32_bits(right)?);
+            Ok(Value::m1_unsigned((sum / 2) as u32))
+        }
+        ValueType::Integer => {
+            let sum = i64::from(as_i32(left)?) + i64::from(as_i32(right)?);
+            Ok(Value::m1_integer((sum / 2) as i32))
+        }
+        _ => Err(non_numeric("Average", left, right)),
     }
 }
 
-/// The [`ValueType`] of a runtime value, for `numeric_join`-driven result typing.
-fn value_type(v: &Value) -> ValueType {
-    match v {
-        Value::Bool(_) => ValueType::Boolean,
-        Value::Int(_) => ValueType::Integer,
-        Value::Uint(_) => ValueType::Unsigned,
-        Value::Float(_) => ValueType::Float,
+fn unary_f32(args: &[Value]) -> Result<f32, EvalError> {
+    Ok(args[0].m1_scalar()?.as_f32())
+}
+
+fn two_f32(args: &[Value]) -> Result<(f32, f32), EvalError> {
+    Ok((args[0].m1_scalar()?.as_f32(), args[1].m1_scalar()?.as_f32()))
+}
+
+fn value_type(value: &Value) -> ValueType {
+    match value {
         Value::M1(M1Scalar::Integer(_)) => ValueType::Integer,
         Value::M1(M1Scalar::UnsignedInteger(_)) => ValueType::Unsigned,
         Value::M1(M1Scalar::FloatingPoint(_) | M1Scalar::FixedPoint7dps(_)) => ValueType::Float,
+        Value::Bool(_) => ValueType::Boolean,
         Value::Enum { id, .. } => ValueType::Enum(*id),
         Value::Str(_) => ValueType::String,
+        Value::Int(_) | Value::Uint(_) | Value::Float(_) => ValueType::Unknown,
     }
 }
 
-fn as_i64(v: &Value) -> Result<i64, EvalError> {
-    match v {
-        Value::Int(x) => Ok(*x),
-        Value::Uint(x) => Ok(*x as i64),
+fn as_i32(value: &Value) -> Result<i32, EvalError> {
+    match value.m1_scalar()? {
+        M1Scalar::Integer(value) => Ok(value),
         other => Err(EvalError::TypeError {
-            detail: format!("{other:?} is not an integer"),
+            detail: format!("{other:?} is not an M1 Integer"),
         }),
     }
 }
 
-fn as_u64(v: &Value) -> Result<u64, EvalError> {
-    match v {
-        Value::Uint(x) => Ok(*x),
-        Value::Int(x) => Ok(*x as u64),
+fn as_u32_bits(value: &Value) -> Result<u32, EvalError> {
+    match value.m1_scalar()? {
+        M1Scalar::Integer(value) => Ok(value as u32),
+        M1Scalar::UnsignedInteger(value) => Ok(value),
         other => Err(EvalError::TypeError {
-            detail: format!("{other:?} is not an unsigned integer"),
+            detail: format!("{other:?} is not an integral M1 value"),
         }),
+    }
+}
+
+fn non_numeric(operation: &str, left: &Value, right: &Value) -> EvalError {
+    EvalError::TypeError {
+        detail: format!("Calculate.{operation} requires numeric operands, got {left:?}, {right:?}"),
     }
 }
 
@@ -225,206 +242,302 @@ fn modulo_by_zero() -> EvalError {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::value::FixedPoint7dps;
 
     fn ok(method: &str, args: &[Value]) -> Value {
         call(method, args).unwrap().unwrap()
     }
 
     #[test]
-    fn max_and_min_preserve_integrality() {
-        assert_eq!(ok("Max", &[Value::Int(2), Value::Int(3)]), Value::Int(3));
-        assert_eq!(ok("Min", &[Value::Int(2), Value::Int(3)]), Value::Int(2));
-        // A float operand promotes the result.
+    fn max_and_min_preserve_m1_numeric_families() {
         assert_eq!(
-            ok("Max", &[Value::Int(2), Value::Float(3.5)]),
-            Value::Float(3.5)
+            ok("Max", &[Value::m1_integer(2), Value::m1_integer(3)]),
+            Value::m1_integer(3)
         );
-        // The smaller wins for Min, retyped to the join (float here).
         assert_eq!(
-            ok("Min", &[Value::Int(2), Value::Float(3.5)]),
-            Value::Float(2.0)
+            ok("Min", &[Value::m1_integer(2), Value::m1_integer(3)]),
+            Value::m1_integer(2)
         );
-        // Unsigned join stays unsigned.
-        assert_eq!(ok("Max", &[Value::Uint(2), Value::Uint(9)]), Value::Uint(9));
+        assert_eq!(
+            ok("Max", &[Value::m1_integer(2), Value::m1_float(3.5)]),
+            Value::m1_float(3.5)
+        );
+        assert_eq!(
+            ok("Min", &[Value::m1_integer(2), Value::m1_float(3.5)]),
+            Value::m1_float(2.0)
+        );
+        assert_eq!(
+            ok("Max", &[Value::m1_unsigned(2), Value::m1_unsigned(9)]),
+            Value::m1_unsigned(9)
+        );
     }
 
     #[test]
-    fn modulo_int_float_and_zero() {
-        assert_eq!(ok("Modulo", &[Value::Int(7), Value::Int(3)]), Value::Int(1));
+    fn modulo_uses_m1_width_and_fails_on_zero() {
         assert_eq!(
-            ok("Modulo", &[Value::Float(7.5), Value::Float(2.0)]),
-            Value::Float(1.5)
+            ok("Modulo", &[Value::m1_integer(7), Value::m1_integer(3)]),
+            Value::m1_integer(1)
+        );
+        assert_eq!(
+            ok("Modulo", &[Value::m1_float(7.5), Value::m1_float(2.0)]),
+            Value::m1_float(1.5)
         );
         assert!(matches!(
-            call("Modulo", &[Value::Int(1), Value::Int(0)]),
+            call("Modulo", &[Value::m1_integer(1), Value::m1_integer(0)]),
             Err(EvalError::TypeError { .. })
         ));
     }
 
     #[test]
-    fn bias_blends_linearly() {
-        // t=0 -> a, t=1 -> b, t=0.5 -> midpoint.
-        assert_eq!(
-            ok(
-                "Bias",
-                &[Value::Float(10.0), Value::Float(20.0), Value::Float(0.0)]
-            ),
-            Value::Float(10.0)
-        );
-        assert_eq!(
-            ok(
-                "Bias",
-                &[Value::Float(10.0), Value::Float(20.0), Value::Float(1.0)]
-            ),
-            Value::Float(20.0)
-        );
-        assert_eq!(
-            ok(
-                "Bias",
-                &[Value::Float(10.0), Value::Float(20.0), Value::Float(0.25)]
-            ),
-            Value::Float(12.5)
-        );
-    }
-
-    #[test]
-    fn pi_is_the_constant() {
-        assert_eq!(ok("PI", &[]), Value::Float(std::f64::consts::PI));
-    }
-
-    #[test]
-    fn floor_ceiling_power_sqrt() {
-        assert_eq!(ok("Floor", &[Value::Float(2.7)]), Value::Float(2.0));
-        assert_eq!(ok("Ceiling", &[Value::Float(2.1)]), Value::Float(3.0));
-        assert_eq!(
-            ok("Power", &[Value::Float(2.0), Value::Float(10.0)]),
-            Value::Float(1024.0)
-        );
-        assert_eq!(
-            ok("FastSquareRoot", &[Value::Float(16.0)]),
-            Value::Float(4.0)
-        );
-        // Integral input coerces to f64 for the float-only functions.
-        assert_eq!(ok("Floor", &[Value::Int(5)]), Value::Float(5.0));
-    }
-
-    #[test]
-    fn is_nan_detects_nan() {
-        assert_eq!(ok("IsNAN", &[Value::Float(f64::NAN)]), Value::Bool(true));
-        assert_eq!(ok("IsNAN", &[Value::Float(1.0)]), Value::Bool(false));
-    }
-
-    #[test]
-    fn fast_trig_matches_std() {
-        // Our fast trig is the std implementation in Phase 1 (documented
-        // assumption); exact-match the std result.
-        assert_eq!(
-            ok("FastSin", &[Value::Float(0.0)]),
-            Value::Float(0.0_f64.sin())
-        );
-        assert_eq!(
-            ok("FastCos", &[Value::Float(0.0)]),
-            Value::Float(0.0_f64.cos())
-        );
-        assert_eq!(
-            ok("FastTan", &[Value::Float(0.0)]),
-            Value::Float(0.0_f64.tan())
-        );
-        // atan2(1, 1) = pi/4.
-        assert_eq!(
-            ok("InverseTan2", &[Value::Float(1.0), Value::Float(1.0)]),
-            Value::Float(std::f64::consts::FRAC_PI_4)
-        );
-    }
-
-    #[test]
-    fn absolute_preserves_integrality() {
-        // Signed integer magnitude stays an Int.
-        assert_eq!(ok("Absolute", &[Value::Int(-3)]), Value::Int(3));
-        assert_eq!(ok("Absolute", &[Value::Int(3)]), Value::Int(3));
-        // Float magnitude stays a Float.
-        assert_eq!(ok("Absolute", &[Value::Float(-2.5)]), Value::Float(2.5));
-        // Unsigned is already non-negative and stays a Uint.
-        assert_eq!(ok("Absolute", &[Value::Uint(7)]), Value::Uint(7));
-    }
-
-    #[test]
-    fn average_is_the_mean_and_always_float() {
-        // (a + b) / 2; fractional even for two integers.
-        assert_eq!(
-            ok("Average", &[Value::Int(2), Value::Int(4)]),
-            Value::Float(3.0)
-        );
-        assert_eq!(
-            ok("Average", &[Value::Int(1), Value::Int(2)]),
-            Value::Float(1.5)
-        );
-        assert_eq!(
-            ok("Average", &[Value::Float(10.0), Value::Float(20.0)]),
-            Value::Float(15.0)
-        );
-    }
-
-    #[test]
-    fn nan_and_infinity_constants() {
-        // NAN() -> a Float that reports as NaN.
-        match ok("NAN", &[]) {
-            Value::Float(x) => assert!(x.is_nan()),
-            other => panic!("expected NaN Float, got {other:?}"),
+    fn bias_matches_minimum_average_and_maximum_across_signs() {
+        for (left, right) in [
+            (10.0_f32, 20.0_f32),
+            (-20.0_f32, -10.0_f32),
+            (-10.0_f32, 20.0_f32),
+        ] {
+            let low = left.min(right);
+            let high = left.max(right);
+            assert_eq!(
+                ok(
+                    "Bias",
+                    &[
+                        Value::m1_float(left),
+                        Value::m1_float(right),
+                        Value::m1_float(-1.0),
+                    ],
+                ),
+                Value::m1_float(low)
+            );
+            assert_eq!(
+                ok(
+                    "Bias",
+                    &[
+                        Value::m1_float(left),
+                        Value::m1_float(right),
+                        Value::m1_float(0.0),
+                    ],
+                ),
+                Value::m1_float(left * 0.5 + right * 0.5)
+            );
+            assert_eq!(
+                ok(
+                    "Bias",
+                    &[
+                        Value::m1_float(left),
+                        Value::m1_float(right),
+                        Value::m1_float(1.0),
+                    ],
+                ),
+                Value::m1_float(high)
+            );
         }
-        assert_eq!(ok("Infinity", &[]), Value::Float(f64::INFINITY));
+
+        assert_eq!(
+            ok(
+                "Bias",
+                &[
+                    Value::m1_integer(0),
+                    Value::m1_integer(0),
+                    Value::m1_float(0.75),
+                ],
+            ),
+            Value::m1_float(0.0)
+        );
+        // Reversing the arguments must not reverse the meaning of the bias.
+        assert_eq!(
+            ok(
+                "Bias",
+                &[
+                    Value::m1_float(20.0),
+                    Value::m1_float(10.0),
+                    Value::m1_float(-0.5),
+                ],
+            ),
+            Value::m1_float(12.5)
+        );
+
+        for (left, right) in [(f32::MAX, -f32::MAX), (-f32::MAX, f32::MAX)] {
+            for (bias, expected) in [(-1.0, -f32::MAX), (0.0, 0.0), (1.0, f32::MAX)] {
+                assert_eq!(
+                    ok(
+                        "Bias",
+                        &[
+                            Value::m1_float(left),
+                            Value::m1_float(right),
+                            Value::m1_float(bias),
+                        ],
+                    ),
+                    Value::m1_float(expected),
+                    "failed finite Bias anchor {bias} for {left}, {right}",
+                );
+            }
+        }
     }
 
     #[test]
-    fn is_finite_classifies() {
-        assert_eq!(ok("IsFinite", &[Value::Float(1.0)]), Value::Bool(true));
+    fn average_returns_the_selected_overload_type() {
         assert_eq!(
-            ok("IsFinite", &[Value::Float(f64::INFINITY)]),
+            ok("Average", &[Value::m1_integer(2), Value::m1_integer(4)]),
+            Value::m1_integer(3)
+        );
+        assert_eq!(
+            ok("Average", &[Value::m1_integer(1), Value::m1_integer(2)]),
+            Value::m1_integer(1)
+        );
+        assert_eq!(
+            ok("Average", &[Value::m1_integer(-1), Value::m1_integer(-2)]),
+            Value::m1_integer(-1)
+        );
+        assert_eq!(
+            ok("Average", &[Value::m1_unsigned(1), Value::m1_unsigned(2)]),
+            Value::m1_unsigned(1)
+        );
+        assert_eq!(
+            ok("Average", &[Value::m1_float(10.0), Value::m1_float(20.0)]),
+            Value::m1_float(15.0)
+        );
+        assert_eq!(
+            ok("Average", &[Value::m1_float(1.0), Value::m1_float(2.0)]),
+            Value::m1_float(1.5)
+        );
+        assert_eq!(
+            ok(
+                "Average",
+                &[Value::m1_integer(i32::MAX), Value::m1_integer(i32::MAX)]
+            ),
+            Value::m1_integer(i32::MAX)
+        );
+        assert_eq!(
+            ok(
+                "Average",
+                &[Value::m1_unsigned(u32::MAX), Value::m1_unsigned(u32::MAX),]
+            ),
+            Value::m1_unsigned(u32::MAX)
+        );
+
+        for value in [f32::from_bits(1), -f32::from_bits(1)] {
+            assert_eq!(
+                ok("Average", &[Value::m1_float(value), Value::m1_float(value)]),
+                Value::m1_float(value),
+                "the average of two identical subnormals must preserve the input",
+            );
+            assert_eq!(
+                ok(
+                    "Bias",
+                    &[
+                        Value::m1_float(value),
+                        Value::m1_float(value),
+                        Value::m1_float(0.0),
+                    ],
+                ),
+                Value::m1_float(value),
+                "zero Bias of identical subnormals must preserve their average",
+            );
+        }
+    }
+
+    #[test]
+    fn constants_use_binary32() {
+        assert_eq!(ok("PI", &[]), Value::m1_float(std::f32::consts::PI));
+        assert_eq!(ok("Infinity", &[]), Value::m1_float(f32::INFINITY));
+        assert_eq!(ok("MaximumFloat", &[]), Value::m1_float(f32::MAX));
+        assert!(matches!(
+            ok("NAN", &[]),
+            Value::M1(M1Scalar::FloatingPoint(value)) if value.is_nan()
+        ));
+    }
+
+    #[test]
+    fn unary_and_power_functions_return_binary32() {
+        assert_eq!(ok("Floor", &[Value::m1_float(2.7)]), Value::m1_float(2.0));
+        assert_eq!(ok("Ceiling", &[Value::m1_float(2.1)]), Value::m1_float(3.0));
+        assert_eq!(
+            ok("Power", &[Value::m1_float(2.0), Value::m1_float(10.0)]),
+            Value::m1_float(1024.0)
+        );
+        assert_eq!(
+            ok("FastSquareRoot", &[Value::m1_float(16.0)]),
+            Value::m1_float(4.0)
+        );
+        assert_eq!(ok("Floor", &[Value::m1_integer(5)]), Value::m1_float(5.0));
+    }
+
+    #[test]
+    fn predicates_classify_binary32_values() {
+        assert_eq!(ok("IsNAN", &[Value::m1_float(f32::NAN)]), Value::Bool(true));
+        assert_eq!(ok("IsFinite", &[Value::m1_float(1.0)]), Value::Bool(true));
+        assert_eq!(
+            ok("IsFinite", &[Value::m1_float(f32::INFINITY)]),
             Value::Bool(false)
         );
+    }
+
+    #[test]
+    fn trig_functions_use_binary32_results() {
         assert_eq!(
-            ok("IsFinite", &[Value::Float(f64::NAN)]),
-            Value::Bool(false)
+            ok("FastSin", &[Value::m1_float(0.0)]),
+            Value::m1_float(0.0_f32.sin())
+        );
+        assert_eq!(
+            ok("FastCos", &[Value::m1_float(0.0)]),
+            Value::m1_float(0.0_f32.cos())
+        );
+        assert_eq!(
+            ok("InverseTan2", &[Value::m1_float(1.0), Value::m1_float(1.0)]),
+            Value::m1_float(std::f32::consts::FRAC_PI_4)
+        );
+        assert_eq!(
+            ok("InverseSin", &[Value::m1_float(1.0)]),
+            Value::m1_float(std::f32::consts::FRAC_PI_2)
         );
     }
 
     #[test]
-    fn maximum_float_is_the_largest_finite() {
-        assert_eq!(ok("MaximumFloat", &[]), Value::Float(f32::MAX as f64));
+    fn absolute_preserves_integral_or_float_overload() {
+        assert_eq!(
+            ok("Absolute", &[Value::m1_integer(-3)]),
+            Value::m1_integer(3)
+        );
+        assert_eq!(
+            ok("Absolute", &[Value::m1_unsigned(7)]),
+            Value::m1_unsigned(7)
+        );
+        assert_eq!(
+            ok("Absolute", &[Value::m1_float(-2.5)]),
+            Value::m1_float(2.5)
+        );
+        assert_eq!(
+            ok(
+                "Absolute",
+                &[Value::M1(M1Scalar::FixedPoint7dps(
+                    FixedPoint7dps::from_raw(-12_500_000),
+                ))],
+            ),
+            Value::m1_float(1.25)
+        );
+        match call("Absolute", &[Value::m1_integer(i32::MIN)]) {
+            Err(EvalError::TypeError { detail }) => {
+                assert!(detail.contains("outside the M1 Integer range"), "{detail}");
+            }
+            other => panic!("minimum M1 Integer magnitude must fail loud, got {other:?}"),
+        }
     }
 
     #[test]
-    fn inverse_trig_matches_std() {
-        // Principal values in radians (std implementation, documented assumption).
-        assert_eq!(
-            ok("InverseSin", &[Value::Float(0.0)]),
-            Value::Float(0.0_f64.asin())
-        );
-        assert_eq!(
-            ok("InverseCos", &[Value::Float(1.0)]),
-            Value::Float(1.0_f64.acos())
-        );
-        assert_eq!(
-            ok("InverseTan", &[Value::Float(0.0)]),
-            Value::Float(0.0_f64.atan())
-        );
-        // asin(1) = pi/2.
-        assert_eq!(
-            ok("InverseSin", &[Value::Float(1.0)]),
-            Value::Float(std::f64::consts::FRAC_PI_2)
-        );
+    fn rejects_legacy_numeric_arguments() {
+        assert!(matches!(
+            call("Average", &[Value::Int(1), Value::Int(2)]),
+            Err(EvalError::TypeError { .. })
+        ));
     }
 
     #[test]
     fn unimplemented_method_returns_none() {
-        // Stateful Calculate methods are not implemented here -> None, so the
-        // dispatcher fails loud (UnsupportedBuiltin) until M6.
         assert!(
-            call("Stable", &[Value::Float(1.0), Value::Float(0.1)])
+            call("Stable", &[Value::m1_float(1.0), Value::m1_float(0.1)])
                 .unwrap()
                 .is_none()
         );
-        assert!(call("Hysteresis", &[]).unwrap().is_none());
         assert!(call("NotAMethod", &[]).unwrap().is_none());
     }
 }
