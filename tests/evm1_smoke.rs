@@ -161,15 +161,16 @@ fn evm1_whole_project_runs_end_to_end() {
     };
     let engine = load_evm1(&dir);
 
-    // A short whole-project run. No `target` is needed in whole-project mode; the
-    // base tick is pinned at 500 Hz (the fastest EV-M1 control rate) so every
-    // scheduled rate (500/200/50/10/2 Hz) divides it cleanly. 0.02 s = 10 base
-    // ticks — enough for the slower loops to fire at least once.
+    // A short whole-project run needs no `target`. The base tick is pinned at
+    // 1000 Hz, the least common multiple of the scheduled 500/200/50/10/2 Hz
+    // rates, giving every function an exact integer tick period. 0.02 s = 20
+    // base ticks — enough for the slower loops to fire
+    // at least once.
     let scenario = Scenario::from_toml_str(
         r#"
 mode = "whole-project"
 duration_s = 0.02
-base_rate_hz = 500.0
+base_rate_hz = 1000.0
 "#,
     )
     .expect("whole-project scenario parses");
@@ -178,8 +179,8 @@ base_rate_hz = 500.0
         .run(&scenario)
         .expect("EV-M1 whole-project run completes without an EvalError");
 
-    // 0.02 s at 500 Hz = 10 base ticks; the trace has a dense time axis.
-    assert_eq!(trace.time.len(), 10, "expected 10 base ticks");
+    // 0.02 s at 1000 Hz = 20 base ticks; the trace has a dense time axis.
+    assert_eq!(trace.time.len(), 20, "expected 20 base ticks");
     assert!(
         !trace.channels.is_empty(),
         "whole-project run produced no channel columns"

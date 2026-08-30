@@ -1794,11 +1794,11 @@ duration_s = 0.01
         assert_eq!(trace.time.len(), 2, "auto base is 200 Hz");
         assert_eq!(
             trace.channels.get("Root.T.Parameterized Out"),
-            Some(&vec![Value::Float(3.0), Value::Float(3.0)])
+            Some(&vec![Value::m1_float(3.0), Value::m1_float(3.0)])
         );
         assert_eq!(
             trace.channels.get("Root.T.Started"),
-            Some(&vec![Value::Float(4.0), Value::Float(4.0)])
+            Some(&vec![Value::m1_float(4.0), Value::m1_float(4.0)])
         );
         assert!(!trace.channels.contains_key("Root.T.Unscheduled Out"));
         assert!(!trace.channels.contains_key("Root.T.Invalid Out"));

@@ -145,10 +145,6 @@ fn resolve_selected_trigger(
     resolving: &mut BTreeSet<String>,
 ) -> TriggerStatus {
     let selected = selected.trim();
-    if is_startup_trigger(selected) {
-        return TriggerStatus::Startup;
-    }
-
     if selected.starts_with("$(") {
         let Some((reference, attribute)) = parse_attribute_reference(selected) else {
             return unresolved(
@@ -231,6 +227,9 @@ fn resolve_selected_trigger(
         );
     }
     let leaf = target.rsplit('.').next().unwrap_or(target.as_str());
+    if leaf.eq_ignore_ascii_case("On Startup") {
+        return TriggerStatus::Startup;
+    }
     let Some(number) = leaf
         .strip_prefix("On ")
         .and_then(|value| value.strip_suffix("Hz"))
@@ -262,15 +261,6 @@ fn unresolved(trigger: &str, reason: String) -> TriggerStatus {
     }
 }
 
-fn is_startup_trigger(trigger: &str) -> bool {
-    trigger.eq_ignore_ascii_case("startup")
-        || trigger.eq_ignore_ascii_case("On Startup")
-        || trigger
-            .rsplit('.')
-            .next()
-            .is_some_and(|leaf| leaf.eq_ignore_ascii_case("On Startup"))
-}
-
 fn parse_attribute_reference(expression: &str) -> Option<(&str, &str)> {
     let body = expression.strip_prefix("$(")?.strip_suffix(')')?;
     let (component, attribute) = body.rsplit_once(':')?;
@@ -294,7 +284,10 @@ fn resolve_component_path(owner: &str, value: &str) -> Option<String> {
         climb += 1;
         rest = tail;
     }
-    if climb > owner_segments.len() || rest.is_empty() {
+    // `Root` is the highest valid component. Consuming every owner segment
+    // would step above it and produce a non-canonical path without the Root
+    // prefix, so treat that as an invalid climb rather than a missing target.
+    if rest.is_empty() || (climb > 0 && climb >= owner_segments.len()) {
         return None;
     }
     let ancestor = &owner_segments[..owner_segments.len() - climb];
@@ -327,12 +320,16 @@ mod tests {
   <Component Classname="BuiltIn.GroupCompound" Name="Root.Events"/>
   <Component Classname="BuiltIn.EventKernel" Name="Root.Events.On 100Hz"/>
   <Component Classname="BuiltIn.EventKernel" Name="Root.Events.On 200Hz"/>
+  <Component Classname="BuiltIn.EventKernel" Name="Root.Events.On Startup"/>
   <Component Classname="BuiltIn.FuncUser" Name="Root.Direct" Filename="Direct.m1scr"><Props SelectedTrigger="Root.Events.On 100Hz"/></Component>
   <Component Classname="BuiltIn.GroupCompound" Name="Root.Control"/>
   <Component Classname="BuiltIn.FuncUser" Name="Root.Control.Grouped" Filename="Grouped.m1scr"><Props SelectedTrigger="Parent.Parent.Events.On 100Hz"/></Component>
   <Component Classname="BuiltIn.MethodUser" Name="Root.Control.Calculation"><Props SelectedTrigger="Parent.Parent.Events.On 200Hz"/></Component>
   <Component Classname="BuiltIn.FuncUser" Name="Root.Control.Parameterized" Filename="Parameterized.m1scr"><Props SelectedTrigger="$(Parent.Calculation:SelectedTrigger)"/></Component>
   <Component Classname="BuiltIn.FuncUser" Name="Root.Startup" Filename="Startup.m1scr"><Props SelectedTrigger="Parent.Events.On Startup"/></Component>
+  <Component Classname="BuiltIn.FuncUser" Name="Root.DanglingStartup" Filename="DanglingStartup.m1scr"><Props SelectedTrigger="Root.Nope.On Startup"/></Component>
+  <Component Classname="BuiltIn.GroupCompound" Name="Root.NotAnEvent.On Startup"/>
+  <Component Classname="BuiltIn.FuncUser" Name="Root.WrongStartupClass" Filename="WrongStartupClass.m1scr"><Props SelectedTrigger="Root.NotAnEvent.On Startup"/></Component>
   <Component Classname="BuiltIn.FuncUserParam" Name="Root.Helper" Filename="Helper.m1scr"/>
   <Component Classname="BuiltIn.FuncUser" Name="Root.Unscheduled" Filename="Unscheduled.m1scr"/>
   <Component Classname="BuiltIn.FuncUser" Name="Root.Invalid" Filename="Invalid.m1scr"><Props SelectedTrigger="Root.Events.On 999Hz"/></Component>
@@ -344,6 +341,8 @@ mod tests {
                 "Grouped.m1scr",
                 "Parameterized.m1scr",
                 "Startup.m1scr",
+                "DanglingStartup.m1scr",
+                "WrongStartupClass.m1scr",
                 "Helper.m1scr",
                 "Unscheduled.m1scr",
                 "Invalid.m1scr",
@@ -363,6 +362,16 @@ mod tests {
             Some(&TriggerStatus::Periodic(200.0))
         );
         assert_eq!(map.get("Root.Startup"), Some(&TriggerStatus::Startup));
+        assert!(matches!(
+            map.get("Root.DanglingStartup"),
+            Some(TriggerStatus::Unresolved { reason, .. })
+                if reason.contains("missing component `Root.Nope.On Startup`")
+        ));
+        assert!(matches!(
+            map.get("Root.WrongStartupClass"),
+            Some(TriggerStatus::Unresolved { reason, .. })
+                if reason.contains("instead of a BuiltIn.EventKernel")
+        ));
         assert_eq!(map.get("Root.Helper"), Some(&TriggerStatus::Helper));
         assert_eq!(
             map.get("Root.Unscheduled"),
@@ -393,5 +402,17 @@ mod tests {
             map.get("Root.Missing"),
             Some(TriggerStatus::Unresolved { reason, .. }) if reason.contains("missing component")
         ));
+    }
+
+    #[test]
+    fn relative_paths_cannot_climb_above_root() {
+        assert_eq!(
+            resolve_component_path("Root.Group.Function", "Parent.Parent.Events.On 100Hz"),
+            Some("Root.Events.On 100Hz".to_string())
+        );
+        assert_eq!(
+            resolve_component_path("Root.Group", "Parent.Parent.Events.On 100Hz"),
+            None
+        );
     }
 }
