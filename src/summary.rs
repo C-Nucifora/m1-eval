@@ -29,7 +29,6 @@ use crate::value::Value;
 use m1_core::{Field, Kind, Node};
 use m1_typecheck::Project;
 use m1_typecheck::parsed::ParsedScript;
-use m1_typecheck::symbols::SymbolKind;
 use std::collections::{BTreeSet, HashMap};
 
 /// The canonical read/write sets of one function's body.
@@ -97,11 +96,12 @@ impl Walker<'_> {
     }
 
     /// Account the *receiver* of a method call's callee. Mirrors `m1-typecheck`
-    /// schedule.rs: when the receiver resolves to a project channel/parameter,
-    /// `Chan.Set*(…)` is the imperative setter — a **write** of that channel — and
-    /// any other method (`AsInteger`/`Lookup`/`Get…`/…) is a **read**. A
-    /// library/object callee (`Calculate.Max`) has no channel receiver and is
-    /// ignored. The arguments are handled by the caller, not here.
+    /// schedule.rs: `Value.Set*(…)` is an imperative **write** only when its
+    /// receiver resolves to a firmware-writable channel. Other value methods
+    /// are **reads**, except a supported `GetUnscheduled`, whose contract
+    /// explicitly omits the scheduling edge. A library/object callee
+    /// (`Calculate.Max`) has no project-value receiver and is ignored. The
+    /// arguments are handled by the caller, not here.
     fn account_call_callee(&mut self, call_node: &Node) {
         let Some(callee) = call_node.child_by_field(Field::Function) else {
             return;
@@ -115,23 +115,50 @@ impl Walker<'_> {
         ) else {
             return;
         };
-        // The receiver must resolve to a project channel/parameter to count.
         let Some(path) = self.canonical_symbol(&receiver) else {
             return;
         };
-        let writable = self
-            .project
-            .symbols()
-            .get(&path)
-            .map(|s| matches!(s.kind, SymbolKind::Channel | SymbolKind::Parameter))
-            .unwrap_or(false);
-        if !writable {
+
+        if method.text() == "GetUnscheduled"
+            && crate::builtins::object::unscheduled_value_path(&path, self.project).is_some()
+        {
+            // Only channels and generated table values own this method. Its
+            // entire purpose is to suppress the receiver's scheduling edge.
             return;
         }
         if method.text().starts_with("Set") {
-            self.sets.writes.insert(path);
-        } else {
-            self.sets.reads.insert(path);
+            if let Some(value_path) =
+                crate::builtins::object::writable_value_path(&path, self.project)
+            {
+                self.sets.writes.insert(value_path);
+            }
+            return;
+        }
+        if matches!(method.text(), "Lookup" | "Get")
+            && self
+                .project
+                .symbols()
+                .get(&path)
+                .is_some_and(|symbol| symbol.kind == m1_typecheck::symbols::SymbolKind::Table)
+        {
+            // Table lookup/indexing reads calibration axes and body cells, not
+            // the generated runtime `.Value` channel. Arguments remain reads
+            // because `walk_call` accounts for them before the receiver.
+            return;
+        }
+
+        // Parameters are readable even though they are calibration-owned and
+        // therefore excluded from `writable_value_path`. Enum conversions use
+        // their parallel typed resolver so their receiver edges are retained.
+        let value_path = match method.text() {
+            "AsInteger" | "AsString" => {
+                crate::builtins::enum_conv::enum_value_path(&path, self.project)
+                    .or_else(|| crate::builtins::object::numeric_value_path(&path, self.project))
+            }
+            _ => crate::builtins::object::numeric_value_path(&path, self.project),
+        };
+        if let Some(value_path) = value_path {
+            self.sets.reads.insert(value_path);
         }
     }
 
@@ -252,6 +279,13 @@ mod tests {
         .project
     }
 
+    fn enum_project() -> Project {
+        let dir = Path::new(env!("CARGO_MANIFEST_DIR")).join("tests/fixtures/enums");
+        crate::loader::load(&dir.join("Project.m1prj"), None)
+            .expect("enum fixture loads")
+            .project
+    }
+
     /// Parse a synthetic script body under the `Demo.Update.m1scr` name so it
     /// canonicalises against the fixture's `Root.Demo` group.
     fn script_from(src: &str) -> ParsedScript {
@@ -338,5 +372,101 @@ mod tests {
 
         assert!(sets.reads.contains("Root.Demo.Output"), "{sets:?}");
         assert!(!sets.writes.contains("Root.Demo.Output"), "{sets:?}");
+    }
+
+    #[test]
+    fn get_unscheduled_omits_only_its_receiver_dependency() {
+        let project = mini_project();
+        let script =
+            script_from("local x = Output.GetUnscheduled();\nlocal y = Speed.Validate(Gain);\n");
+        let sets = io_sets(&script, &project, Some("Root.Demo"));
+
+        assert!(
+            !sets.reads.contains("Root.Demo.Output"),
+            "GetUnscheduled must not create a scheduler edge: {sets:?}"
+        );
+        assert!(
+            sets.reads.contains("Root.Demo.Speed"),
+            "other object methods still read their receiver: {sets:?}"
+        );
+        assert!(
+            sets.reads.contains("Root.Demo.Gain"),
+            "call arguments remain ordinary reads: {sets:?}"
+        );
+    }
+
+    #[test]
+    fn parameter_value_method_is_a_read_but_set_is_not_a_write() {
+        let project = mini_project();
+        let script = script_from("local valid = Gain.Validate(Speed);\nGain.Set(Output);\n");
+        let sets = io_sets(&script, &project, Some("Root.Demo"));
+
+        assert!(
+            sets.reads.contains("Root.Demo.Gain"),
+            "parameter validation still reads its receiver: {sets:?}"
+        );
+        assert!(
+            !sets.writes.contains("Root.Demo.Gain"),
+            "parameters remain calibration-owned: {sets:?}"
+        );
+        assert!(sets.reads.contains("Root.Demo.Speed"), "{sets:?}");
+        assert!(sets.reads.contains("Root.Demo.Output"), "{sets:?}");
+    }
+
+    #[test]
+    fn parameter_backed_compound_set_is_not_a_scheduler_write() {
+        let project = mini_project();
+        let script = script_from("Calibration Compound.Set(Output);\n");
+        let sets = io_sets(&script, &project, Some("Root.Demo"));
+
+        assert!(
+            !sets
+                .writes
+                .contains("Root.Demo.Calibration Compound.Calibration"),
+            "the declared Parameter default is calibration-owned: {sets:?}"
+        );
+        assert!(
+            !sets.writes.contains("Root.Demo.Calibration Compound.Value"),
+            "the generated sibling must not bypass the declared default: {sets:?}"
+        );
+        assert!(sets.reads.contains("Root.Demo.Output"), "{sets:?}");
+    }
+
+    #[test]
+    fn enum_conversions_read_channel_and_compound_receivers() {
+        let project = enum_project();
+        let script = script_from(
+            "local direct = Mode.AsString();\nlocal compound = Compound.AsInteger();\n",
+        );
+        let sets = io_sets(&script, &project, Some("Root.Demo"));
+
+        assert!(sets.reads.contains("Root.Demo.Mode"), "{sets:?}");
+        assert!(sets.reads.contains("Root.Demo.Compound.Value"), "{sets:?}");
+    }
+
+    #[test]
+    fn table_lookup_and_get_do_not_read_the_generated_value_channel() {
+        let project = mini_project();
+        let script = script_from("local x = Map.Lookup(Speed);\nlocal y = Map.Get(0);\n");
+        let sets = io_sets(&script, &project, Some("Root.Demo"));
+
+        assert!(sets.reads.contains("Root.Demo.Speed"), "{sets:?}");
+        assert!(
+            !sets.reads.contains("Root.Demo.Map.Value"),
+            "calibration-only table calls must not create a runtime channel edge: {sets:?}"
+        );
+    }
+
+    #[test]
+    fn value_compound_set_writes_its_declared_default_channel() {
+        let project = mini_project();
+        let script = script_from("Sensor Compound.Set(2.0);\n");
+        let sets = io_sets(&script, &project, Some("Root.Demo"));
+
+        assert!(
+            sets.writes.contains("Root.Demo.Sensor Compound.Sensor"),
+            "the scheduler must see the same concrete write as runtime: {sets:?}"
+        );
+        assert!(!sets.writes.contains("Root.Demo.Sensor Compound"));
     }
 }

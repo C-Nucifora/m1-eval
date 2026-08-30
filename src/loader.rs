@@ -14,6 +14,7 @@
 //! `Engine` facade (a later task) re-wraps it so no toolchain types leak past the
 //! library boundary.
 
+use crate::builtins::object::ObjectRules;
 use crate::calib::Calibration;
 use crate::error::EvalError;
 use crate::triggers::{TriggerMap, TriggerStatus};
@@ -63,6 +64,9 @@ pub struct Loaded {
     /// Exact numeric families from raw function signatures. This complements
     /// the typechecker's coarser `ValueType` model at evaluator boundaries.
     pub signature_m1_types: SignatureM1Types,
+    /// Validation ranges declared on project value objects. Core object methods
+    /// use this index for `Validate`, `Constrain`, and `Set`.
+    pub object_rules: ObjectRules,
     /// Function symbols whose `.m1prj` `SelectedTrigger` resolves to the
     /// `On Startup` event kernel, including any resolved attribute reference.
     /// The whole-project runner executes these exactly once before the periodic
@@ -118,6 +122,7 @@ pub fn load(project_path: &Path, cfg_path: Option<&Path>) -> Result<Loaded, Eval
 
     let project_xml = read_xml(project_path)?;
     let signature_m1_types = signature_m1_types(&project_xml)?;
+    let object_rules = ObjectRules::from_project_xml(&project_xml)?;
     let triggers = TriggerMap::from_project_xml(&project_xml, &project, &scripts)?;
     let startup_fn_symbols = triggers
         .iter()
@@ -131,6 +136,7 @@ pub fn load(project_path: &Path, cfg_path: Option<&Path>) -> Result<Loaded, Eval
         scripts,
         calib,
         signature_m1_types,
+        object_rules,
         startup_fn_symbols,
         triggers,
     })

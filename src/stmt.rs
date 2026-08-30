@@ -765,6 +765,7 @@ mod tests {
                 dt: 0.01,
                 scripts: &[],
                 signature_m1_types: None,
+                object_rules: None,
                 depth: 0,
                 trace: Some(&mut self.trace),
             }
@@ -1155,6 +1156,7 @@ mod tests {
             dt: 0.01,
             scripts: &[],
             signature_m1_types: Some(&loaded.signature_m1_types),
+            object_rules: Some(&loaded.object_rules),
             depth: 0,
             trace: Some(&mut trace),
         };

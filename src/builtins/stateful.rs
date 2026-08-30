@@ -1013,6 +1013,7 @@ mod tests {
                 dt: self.dt,
                 scripts: &[],
                 signature_m1_types: None,
+                object_rules: None,
                 depth: 0,
                 trace: None,
             };
@@ -1171,6 +1172,7 @@ mod tests {
                 dt: h.dt,
                 scripts: &[],
                 signature_m1_types: None,
+                object_rules: None,
                 depth: 0,
                 trace: None,
             };
@@ -1204,6 +1206,7 @@ mod tests {
             dt: h.dt,
             scripts: &[],
             signature_m1_types: None,
+            object_rules: None,
             depth: 0,
             trace: None,
         };
@@ -1512,6 +1515,7 @@ mod tests {
                 dt: h.dt,
                 scripts: &[],
                 signature_m1_types: None,
+                object_rules: None,
                 depth: 0,
                 trace: None,
             };
@@ -1541,6 +1545,7 @@ mod tests {
                 dt: h.dt,
                 scripts: &[],
                 signature_m1_types: None,
+                object_rules: None,
                 depth: 0,
                 trace: None,
             };

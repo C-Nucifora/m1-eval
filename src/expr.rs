@@ -69,6 +69,10 @@ pub struct EvalCtx<'a> {
     /// `None` is supported for direct expression users that did not load a
     /// project through [`crate::loader::load`].
     pub signature_m1_types: Option<&'a crate::loader::SignatureM1Types>,
+    /// Project-owned validation rules for core object methods. Loader-backed
+    /// evaluation always supplies them; small expression unit tests may omit
+    /// them when they do not call those methods.
+    pub object_rules: Option<&'a crate::builtins::object::ObjectRules>,
     /// Current inline-call nesting depth. `0` at the top of a tick; incremented
     /// each time [`crate::builtins::userfn::call`] enters a callee body, so a
     /// runtime call cycle fails loud past a fixed bound rather than overflowing
@@ -1313,6 +1317,7 @@ mod tests {
                 dt: 0.01,
                 scripts: &[],
                 signature_m1_types: None,
+                object_rules: None,
                 depth: 0,
                 trace: None,
             }

@@ -57,6 +57,7 @@ fn demo_update_script_computes_output() {
         dt: 0.01,
         scripts: &loaded.scripts,
         signature_m1_types: Some(&loaded.signature_m1_types),
+        object_rules: Some(&loaded.object_rules),
         depth: 0,
         trace: Some(&mut trace),
     };
@@ -100,6 +101,7 @@ fn demo_update_is_deterministic_in_inputs() {
             dt: 0.01,
             scripts: &loaded.scripts,
             signature_m1_types: Some(&loaded.signature_m1_types),
+            object_rules: Some(&loaded.object_rules),
             depth: 0,
             trace: None,
         };

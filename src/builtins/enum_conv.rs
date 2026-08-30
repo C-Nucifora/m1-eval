@@ -27,7 +27,9 @@ use crate::error::EvalError;
 use crate::expr::EvalCtx;
 use crate::ident::{Target, classify};
 use crate::value::Value;
+use m1_typecheck::Project;
 use m1_typecheck::symbols::SymbolKind;
+use std::collections::{HashMap, HashSet};
 
 /// Convert `<object>.AsInteger()` to its declared enum integer.
 ///
@@ -41,6 +43,33 @@ use m1_typecheck::symbols::SymbolKind;
 ///   conversion cannot proceed (an unknown member, an unset enum channel, or a
 ///   non-enum runtime value) — never a guessed integer.
 pub fn as_integer(object: &str, ctx: &mut EvalCtx) -> Result<Option<Value>, EvalError> {
+    let Some(value) = enum_value(object, ctx)? else {
+        return Ok(None);
+    };
+    let integer =
+        i32::try_from(value.as_enum_int(ctx.project)?).map_err(|_| EvalError::TypeError {
+            detail: format!("enum value from {object:?} is outside the M1 Integer range"),
+        })?;
+    Ok(Some(Value::m1_integer(integer)))
+}
+
+/// Convert `<object>.AsString()` to the enum member's exact display name.
+pub fn as_string(object: &str, ctx: &mut EvalCtx) -> Result<Option<Value>, EvalError> {
+    let Some(value) = enum_value(object, ctx)? else {
+        return Ok(None);
+    };
+    // Match AsInteger's fail-loud membership contract. `Value::Enum` is public,
+    // so a caller can seed a structurally valid value whose member does not
+    // belong to its declared enum; never echo that corrupt member as a string.
+    value.as_enum_int(ctx.project)?;
+    let Value::Enum { member, .. } = value else {
+        unreachable!("enum_value only returns Value::Enum");
+    };
+    Ok(Some(Value::Str(member)))
+}
+
+/// Resolve either supported enum source form to its current enum value.
+fn enum_value(object: &str, ctx: &mut EvalCtx) -> Result<Option<Value>, EvalError> {
     // Form 1: an enum-type-qualified member literal `<EnumTypeName>.<Member>`.
     // Split on the rightmost `.` only — both the type name and the member may
     // contain spaces.
@@ -48,15 +77,10 @@ pub fn as_integer(object: &str, ctx: &mut EvalCtx) -> Result<Option<Value>, Eval
         && let Some(id) = ctx.project.symbols().enum_by_name(prefix)
     {
         if ctx.project.symbols().enum_has_member(id, leaf) {
-            let v = Value::Enum {
+            return Ok(Some(Value::Enum {
                 id,
                 member: leaf.to_string(),
-            };
-            let integer =
-                i32::try_from(v.as_enum_int(ctx.project)?).map_err(|_| EvalError::TypeError {
-                    detail: format!("enum member {leaf:?} is outside the M1 Integer range"),
-                })?;
-            return Ok(Some(Value::m1_integer(integer)));
+            }));
         }
         // The prefix *is* an enum type but the leaf is not one of its members:
         // a fail-loud error rather than a silent miss — the author wrote an
@@ -79,25 +103,64 @@ pub fn as_integer(object: &str, ctx: &mut EvalCtx) -> Result<Option<Value>, Eval
         // fall through to other dispatch.
         return Ok(None);
     };
-    let Some(kind) = ctx.project.symbols().get(&canon).map(|s| s.kind) else {
+    let Some(value_path) = enum_value_path(&canon, ctx.project) else {
         return Ok(None);
     };
+    read_enum_at(&value_path, ctx).map(Some)
+}
 
-    match kind {
-        // An enum-typed channel (or parameter): read its current enum value.
-        SymbolKind::Channel | SymbolKind::Parameter => convert_value_at(&canon, ctx).map(Some),
-        // A value-compound: the enum value lives on its `.Value` child.
-        SymbolKind::Group => {
-            let value_path = format!("{canon}.Value");
-            // Only treat it as a value-compound when the `.Value` child exists.
-            if ctx.project.symbols().get(&value_path).is_none() {
-                return Ok(None);
-            }
-            convert_value_at(&value_path, ctx).map(Some)
-        }
-        // Any other symbol kind is not an enum source — fall through.
-        _ => Ok(None),
+/// Resolve an enum-valued project object to the symbol `read_symbol` consumes.
+/// Constants and direct typed objects keep their own path. A value compound
+/// follows its declared default, then its generated `.Value` child.
+pub(crate) fn enum_value_path(canon: &str, project: &Project) -> Option<String> {
+    enum_value_path_inner(canon, project, &mut HashSet::new())
+}
+
+fn enum_value_path_inner(
+    canon: &str,
+    project: &Project,
+    seen: &mut HashSet<String>,
+) -> Option<String> {
+    if !seen.insert(canon.to_string()) {
+        return None;
     }
+    let symbol = project.symbols().get(canon)?;
+    if symbol.value_type.is_enum()
+        && matches!(
+            symbol.kind,
+            SymbolKind::Channel
+                | SymbolKind::Parameter
+                | SymbolKind::Constant
+                | SymbolKind::Object
+                | SymbolKind::Reference
+                | SymbolKind::Other
+        )
+    {
+        return Some(canon.to_string());
+    }
+
+    if symbol.kind == SymbolKind::Group
+        && let Some(default) = symbol.default_value.as_deref()
+    {
+        let locals = HashMap::new();
+        if let Target::Symbol(path) = classify(default, Some(canon), None, project, &locals)
+            && let Some(value_path) = enum_value_path_inner(&path, project, seen)
+        {
+            return Some(value_path);
+        }
+    }
+
+    if matches!(
+        symbol.kind,
+        SymbolKind::Group | SymbolKind::Table | SymbolKind::Object
+    ) {
+        let value_path = format!("{canon}.Value");
+        return project
+            .symbols()
+            .get(&value_path)
+            .and_then(|_| enum_value_path_inner(&value_path, project, seen));
+    }
+    None
 }
 
 /// Read the current value at a canonical channel path and convert it to its enum
@@ -106,13 +169,15 @@ pub fn as_integer(object: &str, ctx: &mut EvalCtx) -> Result<Option<Value>, Eval
 /// whole-project mode) the channel's externally-driven enum startup default, else
 /// — in single-function/cone mode — a fail-loud [`EvalError::MissingInput`]. A
 /// non-enum value is a `TypeError` (never a guessed integer).
-fn convert_value_at(canon: &str, ctx: &mut EvalCtx) -> Result<Value, EvalError> {
+fn read_enum_at(canon: &str, ctx: &mut EvalCtx) -> Result<Value, EvalError> {
     let value = crate::expr::read_symbol(canon, ctx)?;
-    let integer =
-        i32::try_from(value.as_enum_int(ctx.project)?).map_err(|_| EvalError::TypeError {
-            detail: format!("enum value at {canon:?} is outside the M1 Integer range"),
-        })?;
-    Ok(Value::m1_integer(integer))
+    if matches!(value, Value::Enum { .. }) {
+        Ok(value)
+    } else {
+        Err(EvalError::TypeError {
+            detail: format!("value at {canon:?} is not an enum value"),
+        })
+    }
 }
 
 #[cfg(test)]
@@ -165,6 +230,7 @@ mod tests {
                 dt: 0.01,
                 scripts: &[],
                 signature_m1_types: None,
+                object_rules: None,
                 depth: 0,
                 trace: None,
             }
