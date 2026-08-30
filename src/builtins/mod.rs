@@ -472,11 +472,15 @@ fn unsupported(object: &str, method: &str) -> EvalError {
 /// actually run for this receiver in this project.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum BuiltinSupport {
-    /// Implemented by the dispatch table under the documented maturity contract.
-    Supported,
-    /// A deterministic implementation whose exact M1 behavior still needs
-    /// conformance evidence.
-    Assumed,
+    /// Runs through a direct evaluator implementation.
+    ///
+    /// This is an execution-route label, not the README's evidence maturity:
+    /// direct implementations are still `Assumed` maturity until compared with
+    /// captured M1 output.
+    Direct,
+    /// Runs through an explicit offline model, such as a time-domain update law.
+    /// The coverage report renders this operational category as `Assumed`.
+    Modeled,
     /// A Tier-3 IO object handled as a documented/scenario-fed stub.
     Stubbed,
     /// Not implemented — fails loud at runtime.
@@ -560,7 +564,7 @@ const SUPPORTED_PURE_METHODS: &[(&str, &str)] = &[
 ];
 
 /// Pure implementations with a documented outstanding conformance question.
-const ASSUMED_PURE_METHODS: &[(&str, &str)] = &[
+const MODELED_PURE_METHODS: &[(&str, &str)] = &[
     // The current conversion code truncates; exact M1 rounding is awaiting
     // conformance vectors.
     ("Convert", "ToInteger"),
@@ -570,7 +574,7 @@ const ASSUMED_PURE_METHODS: &[(&str, &str)] = &[
 /// Time-domain implementations based on the evaluator's documented Phase-1
 /// model. They run deterministically, but remain assumptions until checked
 /// against M1 Sim. Keep this list aligned with `stateful::call`.
-const ASSUMED_STATEFUL_METHODS: &[(&str, &str)] = &[
+const MODELED_STATEFUL_METHODS: &[(&str, &str)] = &[
     ("Calculate", "Stable"),
     ("Calculate", "Hysteresis"),
     ("Calculate", "Between"),
@@ -606,7 +610,7 @@ const STUB_OBJECTS: &[&str] = &["CanComms", "Serial", "System", "Logging"];
 /// have deterministic standard-library implementations here, but remain explicit
 /// assumptions because their ECU-script validity and exact M1 behavior are not
 /// established.
-const ASSUMED_MATH_METHODS: &[(&str, &str)] = &[("Math", "atan2"), ("Math", "fabs")];
+const MODELED_MATH_METHODS: &[(&str, &str)] = &[("Math", "atan2"), ("Math", "fabs")];
 
 /// Classify a member call with the same receiver resolution runtime dispatch
 /// uses. A user function is checked first because `Service Bits.Update` and a
@@ -619,7 +623,7 @@ pub(crate) fn classify_member_call(
 ) -> CallCapability {
     let full_path = format!("{object}.{method}");
     if let Some(canon) = script_backed_user_function(&full_path, scope) {
-        return capability(BuiltinSupport::Supported, CallRoute::UserFunction(canon));
+        return capability(BuiltinSupport::Direct, CallRoute::UserFunction(canon));
     }
 
     let Some(project) = scope.project else {
@@ -641,7 +645,7 @@ pub(crate) fn classify_member_call(
     }
 
     if method == "AsInteger" && is_enum_literal(object, project) {
-        return capability(BuiltinSupport::Supported, CallRoute::EnumAsInteger);
+        return capability(BuiltinSupport::Direct, CallRoute::EnumAsInteger);
     }
 
     // `Library.` explicitly selects the intrinsic namespace. An unknown object
@@ -662,7 +666,7 @@ pub(crate) fn classify_member_call(
 /// script is executable through this syntax.
 pub(crate) fn classify_bare_call(callee: &str, scope: &CapabilityScope<'_>) -> CallCapability {
     match script_backed_user_function(callee, scope) {
-        Some(canon) => capability(BuiltinSupport::Supported, CallRoute::UserFunction(canon)),
+        Some(canon) => capability(BuiltinSupport::Direct, CallRoute::UserFunction(canon)),
         None => unsupported_capability(),
     }
 }
@@ -692,25 +696,25 @@ fn classify_library(object: &str, method: &str) -> CallCapability {
     let pair = (object, method);
     if SUPPORTED_PURE_METHODS.contains(&pair) {
         return capability(
-            BuiltinSupport::Supported,
+            BuiltinSupport::Direct,
             CallRoute::PureLibrary(object.to_string()),
         );
     }
-    if ASSUMED_PURE_METHODS.contains(&pair) {
+    if MODELED_PURE_METHODS.contains(&pair) {
         return capability(
-            BuiltinSupport::Assumed,
+            BuiltinSupport::Modeled,
             CallRoute::PureLibrary(object.to_string()),
         );
     }
-    if ASSUMED_STATEFUL_METHODS.contains(&pair) {
+    if MODELED_STATEFUL_METHODS.contains(&pair) {
         return capability(
-            BuiltinSupport::Assumed,
+            BuiltinSupport::Modeled,
             CallRoute::StatefulLibrary(object.to_string()),
         );
     }
-    if ASSUMED_MATH_METHODS.contains(&pair) {
+    if MODELED_MATH_METHODS.contains(&pair) {
         return capability(
-            BuiltinSupport::Assumed,
+            BuiltinSupport::Modeled,
             CallRoute::MathAssumption(object.to_string()),
         );
     }
@@ -734,21 +738,21 @@ fn classify_project_method(canon: &str, method: &str, project: &Project) -> Call
 
     if symbol.kind == SymbolKind::Table {
         return match method {
-            "Lookup" => capability(BuiltinSupport::Assumed, CallRoute::TableLookup),
-            "Get" => capability(BuiltinSupport::Supported, CallRoute::TableGet),
+            "Lookup" => capability(BuiltinSupport::Modeled, CallRoute::TableLookup),
+            "Get" => capability(BuiltinSupport::Direct, CallRoute::TableGet),
             _ => unsupported_capability(),
         };
     }
     if method == "AsInteger" && is_enum_source(canon, project) {
-        return capability(BuiltinSupport::Supported, CallRoute::EnumAsInteger);
+        return capability(BuiltinSupport::Direct, CallRoute::EnumAsInteger);
     }
     if method == "Set" && matches!(symbol.kind, SymbolKind::Channel | SymbolKind::Parameter) {
-        return capability(BuiltinSupport::Supported, CallRoute::ChannelSet);
+        return capability(BuiltinSupport::Direct, CallRoute::ChannelSet);
     }
     if symbol.classname.as_deref() == Some("BuiltIn.Timer")
         && matches!(method, "Start" | "Stop" | "Reset" | "Remaining")
     {
-        return capability(BuiltinSupport::Assumed, CallRoute::Timer);
+        return capability(BuiltinSupport::Modeled, CallRoute::Timer);
     }
     if matches!(
         symbol.kind,
@@ -1072,7 +1076,7 @@ mod tests {
         let mut h = Harness::new();
         assert_eq!(
             classify_builtin("Debounce", "Filter"),
-            BuiltinSupport::Assumed
+            BuiltinSupport::Modeled
         );
         assert_eq!(
             h.call(
@@ -1145,13 +1149,13 @@ mod tests {
 
     #[test]
     fn math_atan2_is_classified_assumed() {
-        assert_eq!(classify_builtin("Math", "atan2"), BuiltinSupport::Assumed);
+        assert_eq!(classify_builtin("Math", "atan2"), BuiltinSupport::Modeled);
     }
 
     #[test]
     fn math_fabs_is_classified_assumed() {
         // Same provenance rationale as atan2: routed, but calibration-only.
-        assert_eq!(classify_builtin("Math", "fabs"), BuiltinSupport::Assumed);
+        assert_eq!(classify_builtin("Math", "fabs"), BuiltinSupport::Modeled);
     }
 
     #[test]
@@ -1165,7 +1169,7 @@ mod tests {
                 "Map",
                 "Get"
             ),
-            BuiltinSupport::Supported
+            BuiltinSupport::Direct
         );
     }
 
@@ -1433,7 +1437,7 @@ mod tests {
                 "Drive State.Idle",
                 "AsInteger"
             ),
-            BuiltinSupport::Supported
+            BuiltinSupport::Direct
         );
         assert_eq!(
             support_in(
@@ -1443,7 +1447,7 @@ mod tests {
                 "Mode",
                 "AsInteger"
             ),
-            BuiltinSupport::Supported
+            BuiltinSupport::Direct
         );
         assert_eq!(
             support_in(
@@ -1472,7 +1476,7 @@ mod tests {
                     "Startup Delay",
                     method
                 ),
-                BuiltinSupport::Assumed,
+                BuiltinSupport::Modeled,
                 "Timer.{method} should use the documented timer assumption"
             );
             assert_eq!(
@@ -1616,7 +1620,7 @@ mod tests {
                 "Precharge State",
                 "Set"
             ),
-            BuiltinSupport::Supported
+            BuiltinSupport::Direct
         );
         assert_eq!(
             support_in(
@@ -1889,7 +1893,7 @@ mod tests {
         ] {
             assert_eq!(
                 classify_builtin("Calculate", method),
-                BuiltinSupport::Supported,
+                BuiltinSupport::Direct,
                 "Calculate.{method} should be Supported"
             );
         }
@@ -1899,13 +1903,13 @@ mod tests {
     fn library_catalog_matches_coverage_and_runtime_dispatch() {
         let mut cases = SUPPORTED_PURE_METHODS
             .iter()
-            .map(|&(object, method)| (object, method, BuiltinSupport::Supported))
+            .map(|&(object, method)| (object, method, BuiltinSupport::Direct))
             .chain(
-                ASSUMED_PURE_METHODS
+                MODELED_PURE_METHODS
                     .iter()
-                    .chain(ASSUMED_STATEFUL_METHODS.iter())
-                    .chain(ASSUMED_MATH_METHODS.iter())
-                    .map(|&(object, method)| (object, method, BuiltinSupport::Assumed)),
+                    .chain(MODELED_STATEFUL_METHODS.iter())
+                    .chain(MODELED_MATH_METHODS.iter())
+                    .map(|&(object, method)| (object, method, BuiltinSupport::Modeled)),
             )
             .collect::<Vec<_>>();
         for &object in STUB_OBJECTS {
@@ -1943,8 +1947,8 @@ mod tests {
         for (object, method, expected) in cases {
             let name = format!("{object}.{method}");
             let bucket = match expected {
-                BuiltinSupport::Supported => &report.supported,
-                BuiltinSupport::Assumed => &report.assumed,
+                BuiltinSupport::Direct => &report.supported,
+                BuiltinSupport::Modeled => &report.assumed,
                 BuiltinSupport::Stubbed => &report.stubbed,
                 _ => unreachable!("catalog test covers executable methods"),
             };
@@ -1977,27 +1981,20 @@ mod tests {
     }
 
     #[test]
-    fn io_stub_methods_are_classified_stubbed() {
-        // Each project-object IO method is reported as a documented stub.
-        for method in [
-            "Tx",
-            "TxOpen",
-            "TxInitialise",
-            "Init",
-            "SetBit",
-            "SetUnsignedInteger",
-            "GetScaled",
-            "GetUnsignedInteger",
-            "Receive",
-            "Update",
-            "SetState",
-            "Buzze",
-        ] {
+    fn project_io_stub_catalog_matches_classification_and_dispatch() {
+        let mut harness = ProjectObjHarness::new();
+        // Exercise every entry in the shared project-object catalog through both
+        // coverage's classifier and runtime's dispatcher. This catches drift in
+        // either direction when a new IO method is added.
+        for &method in io_stub::PROJECT_OBJECT_STUB_METHODS {
             assert_eq!(
                 classify_builtin("DashVals", method),
                 BuiltinSupport::Stubbed,
                 "{method} should be a stub"
             );
+            harness
+                .call("DashVals", method, &[])
+                .unwrap_or_else(|error| panic!("stubbed DashVals.{method} failed: {error}"));
         }
     }
 
