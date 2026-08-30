@@ -35,6 +35,7 @@
 use crate::env::{CallSite, OpState};
 use crate::error::EvalError;
 use crate::expr::EvalCtx;
+use crate::hardware::EvalTime;
 use crate::value::{M1Scalar, Value};
 use m1_typecheck::types::{ValueType, numeric_join};
 use std::cmp::Ordering;
@@ -194,48 +195,62 @@ fn advance_time(current: f64, dt: f64) -> f64 {
     current + dt
 }
 
-fn reduce_time(current: f64, dt: f64) -> f64 {
-    (current - dt).max(0.0)
-}
-
-/// Evaluate a `Timer` object method (`Start`/`Stop`/`Reset`/`Remaining`).
-/// Returns `Ok(None)` for a non-Timer method so the caller fails loud.
+/// Source-compatible direct entry for a `Timer` object method.
 ///
-/// A `Timer` is a project *object*, so all four methods on the same object must
-/// share one countdown. We therefore key the state by the **object path**
-/// (`object_key`, a [`CallSite`] with the object path in the script slot and a
-/// zero offset) rather than the individual call site — `Start`/`Remaining`/… on
-/// one Timer all address the same state. The countdown advances by `ctx.dt` each
-/// time `Remaining` is read (the documented Phase-1 model: a
-/// Timer is read once per tick, so reading advances it one tick), clamped at
-/// zero. `Start(period)` (re)loads the period and runs; `Stop` halts without
-/// clearing; `Reset` clears to zero and halts.
+/// The original signature has no absolute-time argument, so this wrapper uses
+/// periodic tick zero. Call [`timer_at`] when retaining a
+/// [`StateStore`](crate::env::StateStore) across direct evaluations;
+/// runner-backed calls already supply their current time.
 pub fn timer(
     method: &str,
     args: &[Value],
     object_key: CallSite,
     ctx: &mut EvalCtx,
 ) -> Result<Option<Value>, EvalError> {
+    let time = EvalTime::at_start(ctx.dt);
+    timer_at(method, args, object_key, time, ctx)
+}
+
+/// Evaluate a `Timer` object method at explicit deterministic evaluator time.
+///
+/// A `Timer` is a project object, so all four methods on the same object share
+/// one countdown. State is keyed by the object path rather than the individual
+/// call site. `Start(period)` records an absolute deadline. `Remaining` observes
+/// `deadline - now` without modifying state, so two reads at one instant are
+/// identical and a timer continues to elapse on ticks where no script reads it.
+/// `Stop` freezes the duration at the current time; `Reset` clears it.
+pub fn timer_at(
+    method: &str,
+    args: &[Value],
+    object_key: CallSite,
+    time: EvalTime,
+    ctx: &mut EvalCtx,
+) -> Result<Option<Value>, EvalError> {
     // Only the Timer object methods are handled; anything else is not a timer.
     if !matches!(method, "Start" | "Stop" | "Reset" | "Remaining") {
         return Ok(None);
     }
-    let dt = ctx.dt;
-    let slot = ctx.state.entry(object_key);
-    // Read the current countdown (default: stopped at zero).
-    let (mut remaining, mut running) = match slot {
-        OpState::Timer { remaining, running } => (*remaining, *running),
-        _ => (0.0, false),
+    let now = time.elapsed_s;
+    // Read the current countdown (default: stopped at zero). While running,
+    // `remaining` stores the absolute deadline; when stopped it stores the
+    // frozen duration. This preserves the established public OpState shape.
+    let (mut remaining, mut running) = match ctx.state.get(&object_key) {
+        Some(OpState::Timer { remaining, running }) => (*remaining, *running),
+        Some(_) | None => (0.0, false),
     };
 
     let result = match method {
         "Start" => {
             // Start (or restart) counting down from `period`.
-            remaining = seconds(&args[0])?.max(0.0);
+            let period = seconds(&args[0])?.max(0.0);
+            remaining = now + period;
             running = true;
             Value::Bool(true) // Void in M1; we return a benign value.
         }
         "Stop" => {
+            if running {
+                remaining = (remaining - now).max(0.0);
+            }
             running = false;
             Value::Bool(true)
         }
@@ -245,18 +260,20 @@ pub fn timer(
             Value::Bool(true)
         }
         "Remaining" => {
-            // Advance the countdown one tick on read, clamped at zero.
-            if running {
-                remaining = reduce_time(remaining, dt);
-                if remaining == 0.0 {
-                    running = false;
-                }
-            }
-            Value::m1_float(remaining as f32)
+            let observed = if running {
+                (remaining - now).max(0.0)
+            } else {
+                remaining
+            };
+            Value::m1_float(observed as f32)
         }
         _ => unreachable!("guarded above"),
     };
-    *slot = OpState::Timer { remaining, running };
+    // A read must not advance, decrement, stop, or otherwise rewrite the timer.
+    // Start/Stop/Reset are the only state transitions.
+    if method != "Remaining" {
+        *ctx.state.entry(object_key) = OpState::Timer { remaining, running };
+    }
     Ok(Some(result))
 }
 
@@ -1926,10 +1943,54 @@ mod tests {
     // ---- Task 18: Timer object ----
 
     #[test]
-    fn timer_counts_down_on_read_and_stops_at_zero() {
+    fn fresh_timer_remaining_does_not_create_state() {
+        let mut h = Harness::new(0.1);
+        let key = CallSite::new("Root.Demo.FreshTimer", 0);
+        let legacy_key = CallSite::new("Root.Demo.LegacyTimer", 0);
+        let mut ctx = EvalCtx {
+            project: &h.project,
+            calib: &h.calib,
+            env: &mut h.env,
+            state: &mut h.state,
+            group: Some("Root.Demo"),
+            fn_symbol: Some("Root.Demo.Update"),
+            script_name: "Demo.Update.m1scr",
+            dt: h.dt,
+            scripts: &[],
+            signature_m1_types: None,
+            object_rules: None,
+            depth: 0,
+            trace: None,
+        };
+
+        assert_eq!(
+            timer_at(
+                "Remaining",
+                &[],
+                key.clone(),
+                EvalTime::periodic(25, 2.5, h.dt, h.dt),
+                &mut ctx,
+            )
+            .unwrap(),
+            Some(Value::m1_float(0.0))
+        );
+        assert!(ctx.state.get(&key).is_none());
+
+        // The original public signature remains callable as a tick-zero
+        // compatibility wrapper and observes the same empty state.
+        assert_eq!(
+            timer("Remaining", &[], legacy_key.clone(), &mut ctx).unwrap(),
+            Some(Value::m1_float(0.0))
+        );
+        assert!(ctx.state.get(&legacy_key).is_none());
+        assert!(ctx.state.0.is_empty());
+    }
+
+    #[test]
+    fn timer_remaining_observes_the_evaluator_timeline_without_mutating_state() {
         let mut h = Harness::new(0.1);
         let key = CallSite::new("Root.Demo.MyTimer", 0);
-        let run = |h: &mut Harness, method: &str, args: &[Value]| -> Value {
+        let run = |h: &mut Harness, at: f64, method: &str, args: &[Value]| -> Value {
             let mut ctx = EvalCtx {
                 project: &h.project,
                 calib: &h.calib,
@@ -1945,33 +2006,52 @@ mod tests {
                 depth: 0,
                 trace: None,
             };
-            timer(method, args, key.clone(), &mut ctx).unwrap().unwrap()
+            let time = EvalTime::periodic(0, at, h.dt, h.dt);
+            timer_at(method, args, key.clone(), time, &mut ctx)
+                .unwrap()
+                .unwrap()
         };
-        // Start counting down from 0.25.
-        run(&mut h, "Start", &[n(0.25)]);
+        // Start after the run is already five seconds old. The deadline must be
+        // relative to this execution, not to tick zero.
+        run(&mut h, 5.0, "Start", &[n(0.25)]);
         approx(
-            run(&mut h, "Remaining", &[]).m1_scalar().unwrap().as_f64(),
+            run(&mut h, 5.0, "Remaining", &[])
+                .m1_scalar()
+                .unwrap()
+                .as_f64(),
+            0.25,
+        );
+        let before_reads = h.state.get(&key).cloned();
+        approx(
+            run(&mut h, 5.1, "Remaining", &[])
+                .m1_scalar()
+                .unwrap()
+                .as_f64(),
             0.15,
         );
         approx(
-            run(&mut h, "Remaining", &[]).m1_scalar().unwrap().as_f64(),
-            0.05,
+            run(&mut h, 5.1, "Remaining", &[])
+                .m1_scalar()
+                .unwrap()
+                .as_f64(),
+            0.15,
         );
+        assert_eq!(h.state.get(&key).cloned(), before_reads);
         approx(
-            run(&mut h, "Remaining", &[]).m1_scalar().unwrap().as_f64(),
+            run(&mut h, 5.25, "Remaining", &[])
+                .m1_scalar()
+                .unwrap()
+                .as_f64(),
             0.0,
-        ); // clamps
-        approx(
-            run(&mut h, "Remaining", &[]).m1_scalar().unwrap().as_f64(),
-            0.0,
-        ); // stays
+        );
+        assert_eq!(h.state.get(&key).cloned(), before_reads);
     }
 
     #[test]
     fn timer_progresses_when_dt_is_smaller_than_a_binary32_ulp() {
         let mut h = Harness::new(0.01);
         let key = CallSite::new("Root.Demo.LargeTimer", 0);
-        let run = |h: &mut Harness, method: &str, args: &[Value]| -> Value {
+        let run = |h: &mut Harness, at: f64, method: &str, args: &[Value]| -> Value {
             let mut ctx = EvalCtx {
                 project: &h.project,
                 calib: &h.calib,
@@ -1987,19 +2067,41 @@ mod tests {
                 depth: 0,
                 trace: None,
             };
-            timer(method, args, key.clone(), &mut ctx).unwrap().unwrap()
+            let time = EvalTime::periodic(0, at, h.dt, h.dt);
+            timer_at(method, args, key.clone(), time, &mut ctx)
+                .unwrap()
+                .unwrap()
         };
 
         let initial = f64::from(1_000_000_000_f32);
-        run(&mut h, "Start", &[n(initial)]);
-        run(&mut h, "Remaining", &[]);
+        run(&mut h, 0.0, "Start", &[n(initial)]);
+        let before_read = h.state.get(&key).cloned();
+        let observed = run(&mut h, 0.01, "Remaining", &[])
+            .m1_scalar()
+            .unwrap()
+            .as_f64();
+        // The public M1 result narrows back to binary32, whose ULP is larger
+        // than 10 ms here. The host-width deadline nevertheless retains the
+        // exact elapsed interval without a read-driven state update.
+        assert_eq!(observed, initial);
+        assert_eq!(h.state.get(&key).cloned(), before_read);
         match h.state.0.get(&key) {
             Some(OpState::Timer { remaining, running }) => {
                 assert!(*running);
-                assert!(*remaining < initial, "large timer did not advance");
-                assert!((initial - remaining - 0.01).abs() < 1e-6);
+                assert_eq!(*remaining, initial);
             }
             other => panic!("expected running timer state, got {other:?}"),
+        }
+        run(&mut h, 0.01, "Stop", &[]);
+        match h.state.0.get(&key) {
+            Some(OpState::Timer {
+                remaining, running, ..
+            }) => {
+                assert!(!running);
+                assert!(*remaining < initial, "large timer did not elapse");
+                assert!((initial - remaining - 0.01).abs() < 1e-6);
+            }
+            other => panic!("expected stopped timer state, got {other:?}"),
         }
     }
 
@@ -2007,7 +2109,7 @@ mod tests {
     fn timer_stop_and_reset() {
         let mut h = Harness::new(0.1);
         let key = CallSite::new("Root.Demo.MyTimer", 0);
-        let run = |h: &mut Harness, method: &str, args: &[Value]| -> Value {
+        let run = |h: &mut Harness, at: f64, method: &str, args: &[Value]| -> Value {
             let mut ctx = EvalCtx {
                 project: &h.project,
                 calib: &h.calib,
@@ -2023,19 +2125,75 @@ mod tests {
                 depth: 0,
                 trace: None,
             };
-            timer(method, args, key.clone(), &mut ctx).unwrap().unwrap()
+            let time = EvalTime::periodic(0, at, h.dt, h.dt);
+            timer_at(method, args, key.clone(), time, &mut ctx)
+                .unwrap()
+                .unwrap()
         };
-        run(&mut h, "Start", &[n(1.0)]);
-        run(&mut h, "Stop", &[]);
-        // Stopped: reading does not decrement.
+        run(&mut h, 0.0, "Start", &[n(1.0)]);
+        run(&mut h, 0.3, "Stop", &[]);
+        // Stopped at 0.3 s: later reads hold the frozen 0.7 s.
         approx(
-            run(&mut h, "Remaining", &[]).m1_scalar().unwrap().as_f64(),
-            1.0,
+            run(&mut h, 10.0, "Remaining", &[])
+                .m1_scalar()
+                .unwrap()
+                .as_f64(),
+            0.7,
         );
-        run(&mut h, "Reset", &[]);
+        run(&mut h, 10.0, "Reset", &[]);
         approx(
-            run(&mut h, "Remaining", &[]).m1_scalar().unwrap().as_f64(),
+            run(&mut h, 100.0, "Remaining", &[])
+                .m1_scalar()
+                .unwrap()
+                .as_f64(),
             0.0,
+        );
+    }
+
+    #[test]
+    fn timer_objects_keep_independent_deadlines() {
+        let mut h = Harness::new(0.1);
+        let first = CallSite::new("Root.Demo.FirstTimer", 0);
+        let second = CallSite::new("Root.Demo.SecondTimer", 0);
+        let run =
+            |h: &mut Harness, key: &CallSite, at: f64, method: &str, args: &[Value]| -> Value {
+                let mut ctx = EvalCtx {
+                    project: &h.project,
+                    calib: &h.calib,
+                    env: &mut h.env,
+                    state: &mut h.state,
+                    group: Some("Root.Demo"),
+                    fn_symbol: Some("Root.Demo.Update"),
+                    script_name: "Demo.Update.m1scr",
+                    dt: h.dt,
+                    scripts: &[],
+                    signature_m1_types: None,
+                    object_rules: None,
+                    depth: 0,
+                    trace: None,
+                };
+                let time = EvalTime::periodic(0, at, h.dt, h.dt);
+                timer_at(method, args, key.clone(), time, &mut ctx)
+                    .unwrap()
+                    .unwrap()
+            };
+
+        run(&mut h, &first, 0.0, "Start", &[n(1.0)]);
+        run(&mut h, &second, 0.0, "Start", &[n(2.0)]);
+        run(&mut h, &first, 0.5, "Stop", &[]);
+        approx(
+            run(&mut h, &first, 1.5, "Remaining", &[])
+                .m1_scalar()
+                .unwrap()
+                .as_f64(),
+            0.5,
+        );
+        approx(
+            run(&mut h, &second, 1.5, "Remaining", &[])
+                .m1_scalar()
+                .unwrap()
+                .as_f64(),
+            0.5,
         );
     }
 
