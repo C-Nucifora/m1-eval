@@ -770,6 +770,9 @@ fn classify_project_method(canon: &str, method: &str, project: &Project) -> Call
     if method == "Set" && object::writable_value_path(canon, project).is_some() {
         return capability(BuiltinSupport::Direct, CallRoute::ChannelSet);
     }
+    if method == "GetUnscheduled" && object::unscheduled_value_path(canon, project).is_some() {
+        return capability(BuiltinSupport::Direct, CallRoute::ObjectGetUnscheduled);
+    }
     if object::is_numeric_source(canon, project) {
         match method {
             "Validate" => {
@@ -777,9 +780,6 @@ fn classify_project_method(canon: &str, method: &str, project: &Project) -> Call
             }
             "Constrain" => {
                 return capability(BuiltinSupport::Direct, CallRoute::ObjectConstrain);
-            }
-            "GetUnscheduled" => {
-                return capability(BuiltinSupport::Direct, CallRoute::ObjectGetUnscheduled);
             }
             // A typed hardware object also carries a numeric value. Core value
             // methods claim only their exact names; every other method must
@@ -1544,6 +1544,24 @@ mod tests {
     }
 
     #[test]
+    fn dispatch_as_string_rejects_an_invalid_seeded_member() {
+        let mut h = EnumHarness::new();
+        let id = h.enum_id();
+        h.env.set(
+            "Root.Demo.Mode",
+            Value::Enum {
+                id,
+                member: "Bogus".to_string(),
+            },
+        );
+
+        let error = h.call("Mode", "AsString", &[]).unwrap_err();
+        assert!(matches!(error, EvalError::TypeError { .. }));
+        assert!(error.to_string().contains("Bogus"), "{error}");
+        assert!(error.to_string().contains("Drive State"), "{error}");
+    }
+
+    #[test]
     fn dispatch_as_integer_on_non_enum_fails_loud() {
         let mut h = EnumHarness::new();
         // A name that is neither an enum literal nor an enum-typed project symbol:
@@ -1854,11 +1872,13 @@ mod tests {
             Some(&Value::m1_float(-1.5))
         );
 
-        h.call("Positive Float", "Set", &[Value::m1_float(-2.0)])
-            .unwrap();
         assert_eq!(
-            h.env.get("Root.Demo.Positive Float"),
-            Some(&Value::m1_float(0.0))
+            h.call("Positive Float", "Set", &[Value::m1_float(-2.0)]),
+            Err(EvalError::UnsupportedBuiltin {
+                object: "Positive Float".to_string(),
+                method: "Set".to_string(),
+            }),
+            "parameters are calibration-owned and not firmware-writable"
         );
     }
 
@@ -1885,11 +1905,13 @@ mod tests {
                 .unwrap(),
             Value::m1_unsigned(4)
         );
-        h.env
-            .set("Root.Demo.Limited Compound.Value", Value::m1_unsigned(3));
         assert_eq!(
-            h.call("Limited Compound", "GetUnscheduled", &[]).unwrap(),
-            Value::m1_unsigned(3)
+            h.call("Limited Compound", "GetUnscheduled", &[]),
+            Err(EvalError::UnsupportedBuiltin {
+                object: "Limited Compound".to_string(),
+                method: "GetUnscheduled".to_string(),
+            }),
+            "GetUnscheduled belongs to channels and generated table values"
         );
         h.call("Limited Compound", "Set", &[Value::m1_unsigned(9)])
             .unwrap();
@@ -1916,6 +1938,10 @@ mod tests {
         for (object, method, args) in [
             ("Mode", "Validate", vec![Value::m1_integer(1)]),
             ("Limited Signed", "AsString", vec![]),
+            ("Limited Compound", "GetUnscheduled", vec![]),
+            ("Positive Float", "GetUnscheduled", vec![]),
+            ("Numeric Constant", "GetUnscheduled", vec![]),
+            ("Typed IO", "GetUnscheduled", vec![]),
             ("Startup Delay", "GetUnscheduled", vec![]),
             ("Drive State.Idle", "Set", vec![Value::m1_integer(1)]),
         ] {
@@ -1976,7 +2002,6 @@ mod tests {
             ("Limited Signed", "GetUnscheduled"),
             ("Limited Compound", "Validate"),
             ("Limited Compound", "Constrain"),
-            ("Limited Compound", "GetUnscheduled"),
             ("Limited Compound", "Set"),
             ("Limited Signed", "Set"),
         ] {
@@ -1995,6 +2020,11 @@ mod tests {
         for (object, method) in [
             ("Mode", "Constrain"),
             ("Limited Signed", "AsString"),
+            ("Limited Compound", "GetUnscheduled"),
+            ("Positive Float", "GetUnscheduled"),
+            ("Positive Float", "Set"),
+            ("Numeric Constant", "GetUnscheduled"),
+            ("Typed IO", "GetUnscheduled"),
             ("Startup Delay", "GetUnscheduled"),
         ] {
             assert_eq!(

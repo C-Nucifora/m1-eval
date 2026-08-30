@@ -58,6 +58,10 @@ pub fn as_string(object: &str, ctx: &mut EvalCtx) -> Result<Option<Value>, EvalE
     let Some(value) = enum_value(object, ctx)? else {
         return Ok(None);
     };
+    // Match AsInteger's fail-loud membership contract. `Value::Enum` is public,
+    // so a caller can seed a structurally valid value whose member does not
+    // belong to its declared enum; never echo that corrupt member as a string.
+    value.as_enum_int(ctx.project)?;
     let Value::Enum { member, .. } = value else {
         unreachable!("enum_value only returns Value::Enum");
     };

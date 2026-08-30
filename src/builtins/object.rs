@@ -120,11 +120,24 @@ pub(crate) fn numeric_value_path(canon: &str, project: &Project) -> Option<Strin
     numeric_value_path_inner(canon, project, &mut HashSet::new())
 }
 
-/// Resolve a writable value object to the channel or parameter that stores it.
-/// A direct channel/parameter stores itself. A value compound follows its
-/// declared default, then its generated `.Value` child. Tables and package IO
-/// objects retain their dedicated dispatch rather than becoming arbitrary
-/// writable channels through this helper.
+/// Resolve the receiver classes whose read is explicitly excluded from M1's
+/// scheduling dependency analysis. The method belongs to channels and to a
+/// tuning table's generated numeric value, not to parameters, constants, or
+/// arbitrary typed package objects.
+pub(crate) fn unscheduled_value_path(canon: &str, project: &Project) -> Option<String> {
+    let symbol = project.symbols().get(canon)?;
+    match symbol.kind {
+        SymbolKind::Channel if is_numeric_source(canon, project) => Some(canon.to_string()),
+        SymbolKind::Table => numeric_value_path(canon, project),
+        _ => None,
+    }
+}
+
+/// Resolve a firmware-writable value object to the channel that stores it. A
+/// direct channel stores itself. A value compound follows its declared default,
+/// then its generated `.Value` child. Parameters remain calibration-owned, and
+/// tables and package IO objects retain their dedicated dispatch rather than
+/// becoming arbitrary writable channels through this helper.
 pub(crate) fn writable_value_path(canon: &str, project: &Project) -> Option<String> {
     writable_value_path_inner(canon, project, &mut HashSet::new())
 }
@@ -138,7 +151,7 @@ fn writable_value_path_inner(
         return None;
     }
     let symbol = project.symbols().get(canon)?;
-    if matches!(symbol.kind, SymbolKind::Channel | SymbolKind::Parameter) {
+    if symbol.kind == SymbolKind::Channel {
         return Some(canon.to_string());
     }
     if symbol.kind != SymbolKind::Group {
@@ -257,12 +270,23 @@ pub(crate) fn constrain(
 /// distinction lives in `summary`; runtime uses the same read semantics as the
 /// source object itself.
 pub(crate) fn get_unscheduled(object: &str, ctx: &mut EvalCtx) -> Result<Value, EvalError> {
-    let (_, value_path) = resolve_numeric_source(object, "GetUnscheduled", ctx)?;
+    let Target::Symbol(canon) = classify(
+        object,
+        ctx.group,
+        ctx.fn_symbol,
+        ctx.project,
+        &ctx.env.locals,
+    ) else {
+        return Err(unsupported(object, "GetUnscheduled"));
+    };
+    let value_path = unscheduled_value_path(&canon, ctx.project)
+        .ok_or_else(|| unsupported(object, "GetUnscheduled"))?;
     crate::expr::read_symbol(&value_path, ctx)
 }
 
-/// Set a writable channel, parameter, or value compound after target-type
-/// conversion and range clamping.
+/// Set a writable channel or channel-backed value compound after target-type
+/// conversion and range clamping. Parameters are calibration-owned and cannot
+/// be mutated by ECU firmware.
 pub(crate) fn set(object: &str, args: &[Value], ctx: &mut EvalCtx) -> Result<Value, EvalError> {
     let Target::Symbol(canon) = classify(
         object,
@@ -323,64 +347,65 @@ fn constrain_value(
     };
     let scalar = value.m1_scalar()?;
     let x = scalar.as_f64();
-    let (min, max) = rule_bounds(rule, canon)?;
+    let (min, max) = converted_rule_bounds(rule, scalar.kind(), canon)?;
 
     if x.is_nan() {
         return Ok(value);
     }
-    if min.is_some_and(|bound| x < bound) {
-        let constrained = bound_value(
-            min.expect("checked above"),
-            scalar.kind(),
-            BoundSide::Lower,
-            canon,
-        )?;
-        return ensure_in_range(constrained, rule, canon, min, max);
+    if min.is_some_and(|bound| x < bound.as_f64()) {
+        return Ok(Value::M1(min.expect("checked above")));
     }
-    if max.is_some_and(|bound| x > bound) {
-        let constrained = bound_value(
-            max.expect("checked above"),
-            scalar.kind(),
-            BoundSide::Upper,
-            canon,
-        )?;
-        return ensure_in_range(constrained, rule, canon, min, max);
+    if max.is_some_and(|bound| x > bound.as_f64()) {
+        return Ok(Value::M1(max.expect("checked above")));
     }
     Ok(value)
 }
 
-fn ensure_in_range(
-    value: Value,
+fn rule_accepts(rule: &ValidationRule, scalar: M1Scalar, canon: &str) -> Result<bool, EvalError> {
+    let x = scalar.as_f64();
+    let (min, max) = converted_rule_bounds(rule, scalar.kind(), canon)?;
+    if x.is_nan() {
+        return Ok(false);
+    }
+    Ok(min.is_none_or(|bound| x >= bound.as_f64()) && max.is_none_or(|bound| x <= bound.as_f64()))
+}
+
+fn converted_rule_bounds(
     rule: &ValidationRule,
+    kind: M1ScalarKind,
     canon: &str,
+) -> Result<(Option<M1Scalar>, Option<M1Scalar>), EvalError> {
+    let (raw_min, raw_max) = rule_bounds(rule, canon)?;
+    let min = raw_min
+        .map(|bound| bound_scalar(bound, kind, BoundSide::Lower, canon))
+        .transpose()?;
+    let max = raw_max
+        .map(|bound| bound_scalar(bound, kind, BoundSide::Upper, canon))
+        .transpose()?;
+    if min
+        .zip(max)
+        .is_some_and(|(min, max)| min.as_f64() > max.as_f64())
+    {
+        return Err(no_value_in_range(canon, kind, raw_min, raw_max));
+    }
+    Ok((min, max))
+}
+
+fn no_value_in_range(
+    canon: &str,
+    kind: M1ScalarKind,
     min: Option<f64>,
     max: Option<f64>,
-) -> Result<Value, EvalError> {
-    let scalar = value.m1_scalar()?;
-    if rule_accepts(rule, scalar, canon)? {
-        return Ok(value);
-    }
+) -> EvalError {
     let range = match (min, max) {
         (Some(min), Some(max)) => format!("[{min}, {max}]"),
         (Some(min), None) => format!("[{min}, +infinity)"),
         (None, Some(max)) => format!("(-infinity, {max}]"),
         (None, None) => "unbounded".to_string(),
     };
-    Err(EvalError::TypeError {
-        detail: format!(
-            "validation range {range} on {canon:?} has no value in M1 {:?}",
-            scalar.kind()
-        ),
-    })
-}
-
-fn rule_accepts(rule: &ValidationRule, scalar: M1Scalar, canon: &str) -> Result<bool, EvalError> {
-    let x = scalar.as_f64();
-    if x.is_nan() {
-        return Ok(false);
+    EvalError::TypeError {
+        detail: format!("validation range {range} on {canon:?} has no value in M1 {kind:?}"),
     }
-    let (min, max) = rule_bounds(rule, canon)?;
-    Ok(min.is_none_or(|bound| x >= bound) && max.is_none_or(|bound| x <= bound))
 }
 
 fn rule_bounds(
@@ -402,25 +427,20 @@ enum BoundSide {
     Upper,
 }
 
-fn bound_value(
+fn bound_scalar(
     bound: f64,
     kind: M1ScalarKind,
     side: BoundSide,
     canon: &str,
-) -> Result<Value, EvalError> {
+) -> Result<M1Scalar, EvalError> {
     let invalid = || EvalError::TypeError {
         detail: format!("validation bound {bound} on {canon:?} has no value in M1 {kind:?}"),
     };
     let scalar = match kind {
         M1ScalarKind::FloatingPoint => {
-            let mut value = bound as f32;
+            let value = bound as f32;
             if !value.is_finite() {
                 return Err(invalid());
-            }
-            match side {
-                BoundSide::Lower if f64::from(value) < bound => value = value.next_up(),
-                BoundSide::Upper if f64::from(value) > bound => value = value.next_down(),
-                _ => {}
             }
             M1Scalar::FloatingPoint(value)
         }
@@ -478,7 +498,7 @@ fn bound_value(
             M1Scalar::FixedPoint7dps(FixedPoint7dps::from_raw(raw))
         }
     };
-    Ok(Value::M1(scalar))
+    Ok(scalar)
 }
 
 fn bad_arity(object: &str, method: &str, got: usize, expected: usize) -> EvalError {
@@ -549,13 +569,6 @@ mod tests {
                 Value::m1_unsigned(1),
             ),
             (
-                "float",
-                1.000_000_01,
-                1.000_000_02,
-                Value::m1_float(1.0),
-                Value::m1_float(f32::from_bits(1.0f32.to_bits() + 1)),
-            ),
-            (
                 "fixed",
                 0.000_000_01,
                 0.000_000_02,
@@ -579,6 +592,30 @@ mod tests {
                 );
             }
         }
+    }
+
+    #[test]
+    fn float_validation_uses_binary32_endpoints() {
+        let min = "0.0100000000000000002".parse::<f64>().unwrap();
+        let max = "4.40000000000000036".parse::<f64>().unwrap();
+        let rules = ObjectRules {
+            validation: HashMap::from([("float".to_string(), ValidationRule::MinMax { min, max })]),
+        };
+        let rule = rules.validation.get("float").unwrap();
+        for endpoint in [0.01f32, 4.4f32] {
+            assert!(
+                rule_accepts(rule, M1Scalar::FloatingPoint(endpoint), "float").unwrap(),
+                "binary32 endpoint {endpoint:?} must validate"
+            );
+        }
+        assert_eq!(
+            constrain_value("float", "float", Value::m1_float(0.0), Some(&rules),).unwrap(),
+            Value::m1_float(0.01)
+        );
+        assert_eq!(
+            constrain_value("float", "float", Value::m1_float(5.0), Some(&rules),).unwrap(),
+            Value::m1_float(4.4)
+        );
     }
 
     #[test]

@@ -19,6 +19,7 @@
    <Component Classname="BuiltIn.Channel" Name="Root.Demo.Limited Unsigned"><Props Type="u32" Validation="MinMax" ValMin="2" ValMax="10"/></Component>
    <Component Classname="BuiltIn.Parameter" Name="Root.Demo.Positive Float"><Props Type="f32" Validation="Positive"/></Component>
    <Component Classname="BuiltIn.Channel" Name="Root.Demo.Free Unsigned"><Props Type="u32"/></Component>
+   <Component Classname="BuiltIn.Constant" Name="Root.Demo.Numeric Constant"><Props Type="f32" Value="1.0"/></Component>
    <Component Classname="BuiltIn.GroupCompound" Name="Root.Demo.Limited Compound"><Props UseDefValue="true" DefValue="This.Value" Validation="MinMax" ValMin="1" ValMax="4"/></Component>
    <Component Classname="BuiltIn.Channel" Name="Root.Demo.Limited Compound.Value"><Props Type="u32"/></Component>
    <Component Classname="BuiltIn.Timer" Name="Root.Demo.Startup Delay"/>

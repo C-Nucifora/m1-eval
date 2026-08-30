@@ -96,12 +96,12 @@ impl Walker<'_> {
     }
 
     /// Account the *receiver* of a method call's callee. Mirrors `m1-typecheck`
-    /// schedule.rs: when the receiver resolves to a writable project value,
-    /// `Value.Set*(…)` is an imperative **write** of its concrete channel, and
-    /// any other value method is a **read**, except `GetUnscheduled`, whose
-    /// contract explicitly omits the scheduling edge. A library/object callee
-    /// (`Calculate.Max`) has no channel receiver and is ignored. The arguments
-    /// are handled by the caller, not here.
+    /// schedule.rs: `Value.Set*(…)` is an imperative **write** only when its
+    /// receiver resolves to a firmware-writable channel. Other value methods
+    /// are **reads**, except a supported `GetUnscheduled`, whose contract
+    /// explicitly omits the scheduling edge. A library/object callee
+    /// (`Calculate.Max`) has no project-value receiver and is ignored. The
+    /// arguments are handled by the caller, not here.
     fn account_call_callee(&mut self, call_node: &Node) {
         let Some(callee) = call_node.child_by_field(Field::Function) else {
             return;
@@ -115,21 +115,29 @@ impl Walker<'_> {
         ) else {
             return;
         };
-        // Resolve the receiver to the concrete channel/parameter it stores.
-        // A value compound may write/read through its declared default child.
         let Some(path) = self.canonical_symbol(&receiver) else {
             return;
         };
-        let Some(value_path) = crate::builtins::object::writable_value_path(&path, self.project)
-        else {
-            return;
-        };
-        if method.text() == "GetUnscheduled" {
+
+        if method.text() == "GetUnscheduled"
+            && crate::builtins::object::unscheduled_value_path(&path, self.project).is_some()
+        {
+            // Only channels and generated table values own this method. Its
+            // entire purpose is to suppress the receiver's scheduling edge.
             return;
         }
         if method.text().starts_with("Set") {
-            self.sets.writes.insert(value_path);
-        } else {
+            if let Some(value_path) =
+                crate::builtins::object::writable_value_path(&path, self.project)
+            {
+                self.sets.writes.insert(value_path);
+            }
+            return;
+        }
+
+        // Parameters are readable even though they are calibration-owned and
+        // therefore excluded from `writable_value_path`.
+        if let Some(value_path) = crate::builtins::object::numeric_value_path(&path, self.project) {
             self.sets.reads.insert(value_path);
         }
     }
@@ -358,6 +366,24 @@ mod tests {
             sets.reads.contains("Root.Demo.Gain"),
             "call arguments remain ordinary reads: {sets:?}"
         );
+    }
+
+    #[test]
+    fn parameter_value_method_is_a_read_but_set_is_not_a_write() {
+        let project = mini_project();
+        let script = script_from("local valid = Gain.Validate(Speed);\nGain.Set(Output);\n");
+        let sets = io_sets(&script, &project, Some("Root.Demo"));
+
+        assert!(
+            sets.reads.contains("Root.Demo.Gain"),
+            "parameter validation still reads its receiver: {sets:?}"
+        );
+        assert!(
+            !sets.writes.contains("Root.Demo.Gain"),
+            "parameters remain calibration-owned: {sets:?}"
+        );
+        assert!(sets.reads.contains("Root.Demo.Speed"), "{sets:?}");
+        assert!(sets.reads.contains("Root.Demo.Output"), "{sets:?}");
     }
 
     #[test]
