@@ -39,10 +39,12 @@ A run requires `--scenario` (to evaluate), `--log` (to replay a log), or
 declared in the scenario file; at most one may be given (combining two is a usage
 error, exit `2`). `--override` and `--diff` require `--log`.
 
-The `Supported` bucket from `--coverage` means the evaluator has an
-implementation. It does not mean the behavior has been verified against M1.
-See the [README maturity contract](../README.md#maturity-contract) for the
-evidence labels and current status of each evaluator area.
+The `Supported` and `Assumed` buckets from `--coverage` distinguish a direct
+implementation from an explicit offline model. They are execution-route labels,
+not evidence maturity: both remain **Assumed** maturity until compared with
+captured M1 output. See the
+[README maturity contract](../README.md#maturity-contract) for the evidence
+labels and current status of each evaluator area.
 
 ## Scenario file
 

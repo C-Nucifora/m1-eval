@@ -191,9 +191,10 @@ silently-wrong number):
   real EV-M1 scripts, using tolerance-based floating-point comparison; divergences
   documented.
 - **`m1-eval --coverage <project>`** reports, before running, which builtins/constructs
-  each script uses and whether the engine implements them directly, evaluates them under
-  a documented assumption, stubs them, or has no implementation. `Supported` does not
-  imply M1 verification.
+  each script uses and whether the engine dispatches them through a direct
+  implementation, an explicit offline model, a hardware stub, or no implementation.
+  Those operational categories are separate from evidence maturity: neither a
+  `Supported` nor an `Assumed` coverage entry implies M1 verification.
 
 ## Interfaces & ecosystem integration
 
