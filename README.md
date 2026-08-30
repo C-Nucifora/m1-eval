@@ -134,11 +134,13 @@ The multi-rate model:
 ### `--coverage`
 
 Before running, `m1-eval --coverage` reports, per project, which builtins and
-constructs each script uses and whether the engine **implements** them directly,
-evaluates them under a documented **assumption** that still needs M1 conformance
-evidence, **stubs** them (Tier-3 IO, externally driven), or does **not support**
-them (would fail loud at runtime). `Supported` is an implementation label, not a
-**Verified** maturity claim.
+constructs each script uses and whether the engine dispatches them through a
+**direct implementation**, an explicit offline **model**, a hardware **stub**
+(Tier-3 IO, externally driven), or no implementation (would fail loud at
+runtime). The rendered labels are `Supported`, `Assumed`, `Stubbed`, and
+`Unsupported`, respectively. These are execution-route labels, separate from the
+evidence maturity contract above: both `Supported` and `Assumed` coverage entries
+remain **Assumed** maturity until captured M1 output verifies them.
 
 The report also prints a **`Schedule:`** section: every script-backed function
 with its execution rate (`@ 500 Hz`, `@ 50 Hz`, …), `startup, runs once`, or

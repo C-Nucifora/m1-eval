@@ -21,7 +21,7 @@ use crate::loader::Loaded;
 use m1_core::{Field, Kind, Node};
 use m1_typecheck::Project;
 use m1_typecheck::parsed::ParsedScript;
-use std::collections::BTreeSet;
+use std::collections::{BTreeSet, HashMap};
 
 /// One thing a script uses, with where it was found. `name` is a `Object.Method`
 /// for a builtin call or a construct kind for a language construct.
@@ -46,10 +46,9 @@ pub enum ItemKind {
 /// unsupported. Each list is de-duplicated and sorted for a deterministic report.
 #[derive(Debug, Clone, Default, PartialEq)]
 pub struct CoverageReport {
-    /// Items the engine implements under its documented maturity contract.
+    /// Items dispatched through a direct evaluator implementation.
     pub supported: Vec<CoverageItem>,
-    /// Items the engine evaluates deterministically from a documented assumption
-    /// that still needs M1 conformance evidence.
+    /// Items dispatched through an explicit deterministic offline model.
     pub assumed: Vec<CoverageItem>,
     /// Items handled as documented/scenario-fed stubs (Tier-3 IO).
     pub stubbed: Vec<CoverageItem>,
@@ -119,9 +118,11 @@ impl CoverageReport {
                 fn_symbol: fn_symbol.as_deref(),
                 scripts,
             };
+            let mut locals = HashMap::new();
             walk(
                 &script.cst.root(),
                 &cx,
+                &mut locals,
                 &mut supported,
                 &mut assumed,
                 &mut stubbed,
@@ -308,6 +309,7 @@ struct WalkCtx<'a> {
 fn walk(
     node: &Node,
     cx: &WalkCtx,
+    locals: &mut HashMap<String, crate::value::Value>,
     supported: &mut BTreeSet<CoverageItem>,
     assumed: &mut BTreeSet<CoverageItem>,
     stubbed: &mut BTreeSet<CoverageItem>,
@@ -321,7 +323,7 @@ fn walk(
             project: cx.project,
             group: cx.group,
             fn_symbol: cx.fn_symbol,
-            locals: None,
+            locals: Some(locals),
             scripts: cx.scripts,
         };
         let classified = match callee.kind() {
@@ -343,8 +345,8 @@ fn walk(
                 kind: ItemKind::Builtin,
             };
             match support {
-                BuiltinSupport::Supported => supported.insert(item),
-                BuiltinSupport::Assumed => assumed.insert(item),
+                BuiltinSupport::Direct => supported.insert(item),
+                BuiltinSupport::Modeled => assumed.insert(item),
                 BuiltinSupport::Stubbed => stubbed.insert(item),
                 BuiltinSupport::Unsupported => unsupported.insert(item),
             };
@@ -364,8 +366,28 @@ fn walk(
         }
     }
 
+    // Runtime evaluates a local declaration's initializer before adding the
+    // local to the active frame. Mirror that source-order behavior so subsequent
+    // bare and member calls see the same shadowing that dispatch does.
+    if node.kind() == Kind::LocalDeclaration {
+        for child in node.named_children() {
+            walk(&child, cx, locals, supported, assumed, stubbed, unsupported);
+        }
+        let is_static = node
+            .children()
+            .iter()
+            .any(|child| child.kind() == Kind::Static);
+        if !is_static && let Some(name) = node.child_by_field(Field::Name) {
+            locals.insert(
+                name.text().trim().to_string(),
+                crate::value::Value::Bool(false),
+            );
+        }
+        return;
+    }
+
     for child in node.named_children() {
-        walk(&child, cx, supported, assumed, stubbed, unsupported);
+        walk(&child, cx, locals, supported, assumed, stubbed, unsupported);
     }
 }
 
@@ -645,6 +667,62 @@ Output = i;
             "unsupported={unsupported:?}"
         );
         assert!(!stubbed.contains(&"Helper.Compute"), "stubbed={stubbed:?}");
+    }
+
+    #[test]
+    fn local_shadowing_keeps_coverage_aligned_with_runtime_resolution() {
+        let dir = std::path::Path::new(env!("CARGO_MANIFEST_DIR")).join("tests/fixtures/userfn");
+        let loaded =
+            crate::loader::load(&dir.join("Project.m1prj"), None).expect("userfn fixture loads");
+        let mut sources: Vec<(String, String)> = loaded
+            .scripts
+            .iter()
+            .filter(|script| script.name != "Caller.Update.m1scr")
+            .map(|script| (script.name.clone(), script.cst.root().text().to_string()))
+            .collect();
+        sources.push((
+            "Caller.Update.m1scr".to_string(),
+            "local Kick = 0;\nKick();\nlocal Output = 0;\nOutput.Set(1);\n".to_string(),
+        ));
+        let scripts = parse_all(&sources);
+        let report = CoverageReport::analyse_in(&scripts, Some(&loaded.project));
+
+        for name in ["Kick", "Output.Set"] {
+            assert!(
+                report.unsupported.iter().any(|item| item.name == name),
+                "a local-shadowed call must match runtime's fail-loud route: {name}: {report:?}"
+            );
+            assert!(
+                !report.supported.iter().any(|item| item.name == name),
+                "a local-shadowed call cannot remain supported: {name}: {report:?}"
+            );
+        }
+
+        let mut env = crate::env::Env::new();
+        env.set_local("Kick", crate::value::Value::Int(0));
+        let mut state = crate::env::StateStore::new();
+        let mut ctx = crate::expr::EvalCtx {
+            project: &loaded.project,
+            calib: &loaded.calib,
+            env: &mut env,
+            state: &mut state,
+            group: Some("Root.Caller"),
+            fn_symbol: Some("Root.Caller.Update"),
+            script_name: "Caller.Update.m1scr",
+            dt: 0.01,
+            scripts: &scripts,
+            depth: 0,
+            trace: None,
+        };
+        assert!(matches!(
+            crate::builtins::dispatch_bare(
+                "Kick",
+                &[],
+                crate::env::CallSite::new("Caller.Update.m1scr", 0),
+                &mut ctx
+            ),
+            Err(crate::error::EvalError::UnsupportedConstruct { .. })
+        ));
     }
 
     #[test]
