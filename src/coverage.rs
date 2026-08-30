@@ -769,7 +769,7 @@ Output = i;
         }
 
         let mut env = crate::env::Env::new();
-        env.set_local("Kick", crate::value::Value::Int(0));
+        env.set_local("Kick", crate::value::Value::m1_integer(0));
         let mut state = crate::env::StateStore::new();
         let mut ctx = crate::expr::EvalCtx {
             project: &loaded.project,

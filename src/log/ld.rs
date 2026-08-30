@@ -677,7 +677,7 @@ mod tests {
         let points = super::decode_channel_points(&bytes, sensor).expect("sensor data");
         let values: Vec<f64> = points
             .iter()
-            .map(|(_, v)| v.as_f64().expect("numeric"))
+            .map(|(_, v)| v.m1_scalar().expect("numeric").as_f64())
             .collect();
         for (got, want) in values.iter().zip([10.0_f64, 20.0, 30.0, 40.0].iter()) {
             assert!((got - want).abs() < 1e-9, "decoded {got} != {want}");
@@ -686,8 +686,8 @@ mod tests {
         // Other: F32 {1.5, 2.5}, unit scaling -> identity.
         let other = &channels[1];
         let other_points = super::decode_channel_points(&bytes, other).expect("other data");
-        assert!((other_points[0].1.as_f64().unwrap() - 1.5).abs() < 1e-9);
-        assert!((other_points[1].1.as_f64().unwrap() - 2.5).abs() < 1e-9);
+        assert!((other_points[0].1.m1_scalar().unwrap().as_f64() - 1.5).abs() < 1e-9);
+        assert!((other_points[1].1.m1_scalar().unwrap().as_f64() - 2.5).abs() < 1e-9);
     }
 
     /// Build a synthetic single-channel `.ld` image from a fully-specified metadata
@@ -758,7 +758,7 @@ mod tests {
         };
         let values: Vec<f64> = points
             .iter()
-            .map(|(_, v)| v.as_f64().expect("numeric"))
+            .map(|(_, v)| v.m1_scalar().expect("numeric").as_f64())
             .collect();
         for (got, want) in values.iter().zip([10.0_f64, 20.0, 30.0, 40.0].iter()) {
             assert!((got - want).abs() < 1e-9, "decoded {got} != {want}");

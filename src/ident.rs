@@ -145,7 +145,7 @@ mod tests {
     fn local_variable_is_local() {
         let project = mini_project();
         let mut locals = HashMap::new();
-        locals.insert("scaled".to_string(), Value::Float(0.0));
+        locals.insert("scaled".to_string(), Value::m1_float(0.0));
         // A bare local name shadows project lookup per the M1 scope order.
         let t = classify("scaled", Some("Root.Demo"), None, &project, &locals);
         assert_eq!(t, Target::Local("scaled".to_string()));
@@ -181,7 +181,7 @@ mod tests {
     fn local_only_shadows_a_single_segment_not_a_builtin_callee() {
         let project = mini_project();
         let mut locals = HashMap::new();
-        locals.insert("Calculate".to_string(), Value::Int(0));
+        locals.insert("Calculate".to_string(), Value::m1_integer(0));
 
         assert_eq!(
             classify("Calculate.Max", Some("Root.Demo"), None, &project, &locals,),

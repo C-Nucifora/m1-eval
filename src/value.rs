@@ -2,14 +2,10 @@
 //! Runtime value types and strict coercions.
 //!
 //! M1 is strongly typed: there is no implicit `int -> bool` or `bool -> int`
-//! coercion. [`M1Scalar`] holds the actual M1-width numeric forms. The legacy
-//! `i64`/`u64`/`f64` variants on [`Value`] remain temporarily so the evaluator
-//! can migrate one boundary at a time without changing existing callers.
-//!
-//! The numeric coercions here exist only to drive code that has not migrated
-//! yet. Anything non-numeric (`Bool`, `Enum`, `Str`) is an explicit
-//! `EvalError::TypeError` rather than a silent fallback. The evaluator never
-//! substitutes a guessed numeric value.
+//! coercion. [`M1Scalar`] is the evaluator's only numeric runtime form. Its four
+//! variants match the widths and signedness used by M1. Host-width numbers may
+//! appear while parsing wire formats, measuring time, interpolating tables, or
+//! rendering reports, but they never enter script execution as [`Value`]s.
 
 use crate::error::EvalError;
 use m1_typecheck::Project;
@@ -39,9 +35,77 @@ impl FixedPoint7dps {
         self.0
     }
 
-    /// Convert to a host float for temporary compatibility boundaries.
+    /// Widen exactly for table interpolation, timing comparisons, or reporting.
     pub fn as_f64(self) -> f64 {
         f64::from(self.0) / Self::SCALE as f64
+    }
+
+    /// Parse an exact decimal or scientific-notation value into scaled storage.
+    ///
+    /// The parser uses integer decimal arithmetic. It rejects values with a
+    /// non-zero digit beyond seven decimal places and values outside the signed
+    /// 32-bit raw range, rather than rounding through a host float.
+    pub fn parse_decimal(text: &str) -> Option<Self> {
+        let text = text.trim();
+        let (negative, unsigned) = match text.as_bytes().first() {
+            Some(b'-') => (true, &text[1..]),
+            Some(b'+') => (false, &text[1..]),
+            _ => (false, text),
+        };
+        if unsigned.is_empty() {
+            return None;
+        }
+
+        let mut exponent_split = unsigned.split(['e', 'E']);
+        let mantissa = exponent_split.next()?;
+        let exponent = match exponent_split.next() {
+            Some(value) if !value.is_empty() => value.parse::<i32>().ok()?,
+            Some(_) => return None,
+            None => 0,
+        };
+        if exponent_split.next().is_some() {
+            return None;
+        }
+
+        let mut decimal_split = mantissa.split('.');
+        let whole = decimal_split.next()?;
+        let fractional = decimal_split.next().unwrap_or("");
+        if decimal_split.next().is_some()
+            || (whole.is_empty() && fractional.is_empty())
+            || !whole.bytes().all(|byte| byte.is_ascii_digit())
+            || !fractional.bytes().all(|byte| byte.is_ascii_digit())
+        {
+            return None;
+        }
+
+        let mut digits = format!("{whole}{fractional}");
+        let decimal_shift = exponent
+            .checked_add(7)
+            .and_then(|value| value.checked_sub(i32::try_from(fractional.len()).ok()?))?;
+
+        if digits.bytes().all(|byte| byte == b'0') {
+            return Some(Self::ZERO);
+        }
+        if decimal_shift < 0 {
+            let discarded = usize::try_from(decimal_shift.unsigned_abs()).ok()?;
+            let kept = digits.len().checked_sub(discarded)?;
+            if !digits[kept..].bytes().all(|byte| byte == b'0') {
+                return None;
+            }
+            digits.truncate(kept);
+        }
+
+        let significant = digits.trim_start_matches('0');
+        let coefficient = significant.parse::<u128>().ok()?;
+        let magnitude = if decimal_shift > 0 {
+            coefficient.checked_mul(10_u128.checked_pow(decimal_shift as u32)?)?
+        } else {
+            coefficient
+        };
+
+        let signed = i128::try_from(magnitude).ok()?;
+        let signed = if negative { -signed } else { signed };
+        i32::try_from(signed).ok().map(Self::from_raw)
     }
 }
 
@@ -98,7 +162,7 @@ impl M1Scalar {
         }
     }
 
-    /// Widen to the host numeric format used by the temporary evaluator path.
+    /// Widen for exact interpolation, timing comparisons, or reporting.
     pub fn as_f64(self) -> f64 {
         match self {
             Self::FloatingPoint(value) => f64::from(value),
@@ -121,46 +185,12 @@ impl M1Scalar {
             Self::FixedPoint7dps(value) => value.as_f64() as f32,
         }
     }
-
-    /// Convert to one of the legacy numeric [`Value`] variants.
-    ///
-    /// This is an explicit compatibility boundary scheduled for removal with
-    /// the legacy execution path. Widening the three binary forms is lossless;
-    /// fixed point is represented by its scaled decimal value as an `f64`.
-    /// [`Value::try_as_m1_scalar_for`] restores the original scalar when the
-    /// caller supplies this value's [`M1ScalarKind`].
-    pub fn into_legacy_value(self) -> Value {
-        match self {
-            Self::FloatingPoint(value) => Value::Float(f64::from(value)),
-            Self::Integer(value) => Value::Int(i64::from(value)),
-            Self::UnsignedInteger(value) => Value::Uint(u64::from(value)),
-            Self::FixedPoint7dps(value) => Value::Float(value.as_f64()),
-        }
-    }
-}
-
-/// Identifies a temporary host-width numeric variant so migration code can
-/// count the legacy values still crossing a boundary.
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
-pub enum LegacyNumericKind {
-    Int64,
-    Uint64,
-    Float64,
 }
 
 #[derive(Debug, Clone, PartialEq)]
 pub enum Value {
     Bool(bool),
-    /// Temporary signed host-width representation. Use [`Value::M1`] for new
-    /// M1-width values.
-    Int(i64),
-    /// Temporary unsigned host-width representation. Use [`Value::M1`] for new
-    /// M1-width values.
-    Uint(u64),
-    /// Temporary host-width floating representation. Use [`Value::M1`] for new
-    /// M1-width values.
-    Float(f64),
-    /// A numeric value represented with its actual M1 width and signedness.
+    /// A numeric value represented with its M1 width and signedness.
     M1(M1Scalar),
     Enum {
         id: usize,
@@ -186,148 +216,18 @@ impl Value {
     }
 
     /// Return the M1 scalar held by this value.
-    ///
-    /// Unlike [`Value::try_as_m1_scalar`], this rejects every legacy numeric
-    /// variant. Core evaluator paths use this accessor so a host-width value
-    /// cannot silently re-enter script execution outside a named boundary.
     pub fn m1_scalar(&self) -> Result<M1Scalar, EvalError> {
         match self {
             Self::M1(value) => Ok(*value),
-            Self::Int(_) | Self::Uint(_) | Self::Float(_) => Err(EvalError::TypeError {
-                detail: format!("legacy numeric value {self:?} reached an M1-only evaluator path"),
-            }),
             other => Err(EvalError::TypeError {
                 detail: format!("{other:?} is not numeric"),
             }),
         }
     }
 
-    /// Narrow a legacy builtin result to its corresponding M1 scalar family.
-    ///
-    /// This is the named output boundary for builtin implementations that are
-    /// migrated by issue #38. Signed and unsigned results are range checked;
-    /// legacy floats round to binary32 and reject finite overflow. Non-numeric
-    /// results already use their final representation and pass through.
-    pub(crate) fn restore_legacy_builtin_result(self) -> Result<Self, EvalError> {
-        match self {
-            Self::Int(value) => i32::try_from(value)
-                .map(Self::m1_integer)
-                .map_err(|_| numeric_width_error(&Self::Int(value), "Integer (i32)")),
-            Self::Uint(value) => u32::try_from(value)
-                .map(Self::m1_unsigned)
-                .map_err(|_| numeric_width_error(&Self::Uint(value), "UnsignedInteger (u32)")),
-            Self::Float(value) => Self::Float(value)
-                .try_as_m1_scalar_for(M1ScalarKind::FloatingPoint)
-                .map(Self::M1),
-            value => Ok(value),
-        }
-    }
-
-    /// Widen an M1 scalar for a legacy builtin implementation.
-    ///
-    /// This is the named input boundary paired with
-    /// [`Value::restore_legacy_builtin_result`]. It is deliberately unavailable as
-    /// a general evaluator coercion.
-    pub(crate) fn into_legacy_builtin_argument(self) -> Self {
-        match self {
-            Self::M1(value) => value.into_legacy_value(),
-            value => value,
-        }
-    }
-
-    /// Coerce a numeric value to `f64`. Non-numeric values are a `TypeError`;
-    /// we never invent a default number.
-    pub fn as_f64(&self) -> Result<f64, EvalError> {
-        match self {
-            Value::Float(x) => Ok(*x),
-            Value::Int(x) => Ok(*x as f64),
-            Value::Uint(x) => Ok(*x as f64),
-            Value::M1(value) => Ok(value.as_f64()),
-            other => Err(EvalError::TypeError {
-                detail: format!("{other:?} is not numeric"),
-            }),
-        }
-    }
-
-    /// Convert a numeric value to its unambiguous M1-width representation.
-    ///
-    /// Existing M1 values pass through unchanged. Legacy `Int` and `Uint` values
-    /// map to their matching M1 integer types. A legacy [`Value::Float`] is
-    /// ambiguous because it may represent either M1 `FloatingPoint` or
-    /// `FixedPoint7dps`, so this convenience method rejects it. Use
-    /// [`Value::try_as_m1_scalar_for`] at typed migration boundaries.
-    pub fn try_as_m1_scalar(&self) -> Result<M1Scalar, EvalError> {
-        match self {
-            Value::M1(value) => Ok(*value),
-            Value::Int(_) => self.try_as_m1_scalar_for(M1ScalarKind::Integer),
-            Value::Uint(_) => self.try_as_m1_scalar_for(M1ScalarKind::UnsignedInteger),
-            Value::Float(_) => Err(EvalError::TypeError {
-                detail: format!(
-                    "{self:?} is ambiguous between M1 FloatingPoint and FixedPoint7dps; use Value::try_as_m1_scalar_for"
-                ),
-            }),
-            other => Err(EvalError::TypeError {
-                detail: format!("{other:?} is not numeric"),
-            }),
-        }
-    }
-
-    /// Restore a value at a typed legacy-to-M1 compatibility boundary.
-    ///
-    /// This conversion restores storage identity; it is not a language cast.
-    /// Legacy `Int`, `Uint`, and `Float` values must target their corresponding
-    /// storage family. `Float` may target either `FloatingPoint` or
-    /// `FixedPoint7dps`, which resolves the ambiguity in the legacy model.
-    /// Fixed Point restoration accepts only values exactly produced by the 7dps
-    /// scale, so it recovers the original raw `i32` without applying the rounding
-    /// or range-validation rules owned by `Convert.ToFixed7DP`.
-    pub fn try_as_m1_scalar_for(&self, target: M1ScalarKind) -> Result<M1Scalar, EvalError> {
-        match (self, target) {
-            (Value::M1(value), target) if value.kind() == target => Ok(*value),
-            (Value::M1(value), target) => Err(incompatible_scalar_kind(*value, target)),
-            (Value::Int(value), M1ScalarKind::Integer) => i32::try_from(*value)
-                .map(M1Scalar::Integer)
-                .map_err(|_| numeric_width_error(self, "Integer (i32)")),
-            (Value::Uint(value), M1ScalarKind::UnsignedInteger) => u32::try_from(*value)
-                .map(M1Scalar::UnsignedInteger)
-                .map_err(|_| numeric_width_error(self, "UnsignedInteger (u32)")),
-            (Value::Float(value), M1ScalarKind::FloatingPoint) => {
-                let narrowed = *value as f32;
-                if value.is_finite() && narrowed.is_infinite() {
-                    Err(numeric_width_error(self, "FloatingPoint (binary32)"))
-                } else {
-                    Ok(M1Scalar::FloatingPoint(narrowed))
-                }
-            }
-            (Value::Float(value), M1ScalarKind::FixedPoint7dps) => {
-                restore_fixed_point_7dps(self, *value).map(M1Scalar::FixedPoint7dps)
-            }
-            (Value::Int(_) | Value::Uint(_) | Value::Float(_), target) => {
-                Err(incompatible_legacy_kind(self, target))
-            }
-            (other, _) => Err(EvalError::TypeError {
-                detail: format!("{other:?} is not numeric"),
-            }),
-        }
-    }
-
-    /// Identify the temporary host-width numeric form, if this value uses one.
-    /// This makes remaining legacy traffic countable during the migration.
-    pub const fn legacy_numeric_kind(&self) -> Option<LegacyNumericKind> {
-        match self {
-            Value::Int(_) => Some(LegacyNumericKind::Int64),
-            Value::Uint(_) => Some(LegacyNumericKind::Uint64),
-            Value::Float(_) => Some(LegacyNumericKind::Float64),
-            _ => None,
-        }
-    }
-
-    /// Whether this is either an M1-width or temporary legacy numeric value.
+    /// Whether this value is numeric.
     pub const fn is_numeric(&self) -> bool {
-        matches!(
-            self,
-            Value::Int(_) | Value::Uint(_) | Value::Float(_) | Value::M1(_)
-        )
+        matches!(self, Value::M1(_))
     }
 
     /// Extract a boolean. M1 has no truthiness on numbers, so only `Bool`
@@ -376,48 +276,6 @@ impl Value {
     }
 }
 
-fn numeric_width_error(value: &Value, target: &str) -> EvalError {
-    EvalError::TypeError {
-        detail: format!("{value:?} is outside the range of M1 {target}"),
-    }
-}
-
-fn incompatible_scalar_kind(value: M1Scalar, target: M1ScalarKind) -> EvalError {
-    EvalError::TypeError {
-        detail: format!(
-            "M1 {:?} cannot be restored as M1 {target:?}; language casts are not compatibility conversions",
-            value.kind()
-        ),
-    }
-}
-
-fn incompatible_legacy_kind(value: &Value, target: M1ScalarKind) -> EvalError {
-    EvalError::TypeError {
-        detail: format!(
-            "{value:?} cannot restore M1 {target:?}; language casts are not compatibility conversions"
-        ),
-    }
-}
-
-fn restore_fixed_point_7dps(source: &Value, value: f64) -> Result<FixedPoint7dps, EvalError> {
-    if !value.is_finite() {
-        return Err(numeric_width_error(source, "FixedPoint7dps"));
-    }
-
-    let scaled = value * FixedPoint7dps::SCALE as f64;
-    if scaled < f64::from(i32::MIN) || scaled > f64::from(i32::MAX) {
-        return Err(numeric_width_error(source, "FixedPoint7dps"));
-    }
-
-    let restored = FixedPoint7dps::from_raw(scaled.round() as i32);
-    if restored.as_f64().to_bits() != value.to_bits() {
-        return Err(EvalError::TypeError {
-            detail: format!("{source:?} is not an exact M1 FixedPoint7dps compatibility value"),
-        });
-    }
-    Ok(restored)
-}
-
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -431,8 +289,6 @@ mod tests {
             .expect("enums fixture loads")
             .project
     }
-
-    // ---- as_enum_int (.AsInteger over EnumType.members) ----
 
     #[test]
     fn as_enum_int_returns_container_order_not_ordinal() {
@@ -473,157 +329,14 @@ mod tests {
     #[test]
     fn as_enum_int_on_non_enum_fails_loud() {
         let project = enums_project();
-        match Value::Int(3).as_enum_int(&project) {
+        match Value::m1_integer(3).as_enum_int(&project) {
             Err(EvalError::TypeError { .. }) => {}
             other => panic!("expected TypeError on non-enum value, got {other:?}"),
         }
     }
 
     #[test]
-    fn float_and_int_coerce_to_f64() {
-        assert_eq!(Value::Float(2.5).as_f64().unwrap(), 2.5);
-        assert_eq!(Value::Int(-3).as_f64().unwrap(), -3.0);
-        assert_eq!(Value::Uint(7).as_f64().unwrap(), 7.0);
-        assert_eq!(
-            Value::M1(M1Scalar::FloatingPoint(2.5)).as_f64().unwrap(),
-            2.5
-        );
-        assert_eq!(
-            Value::M1(M1Scalar::FixedPoint7dps(FixedPoint7dps::from_raw(
-                12_345_678
-            )))
-            .as_f64()
-            .unwrap(),
-            1.2345678
-        );
-        assert!(Value::Str("x".into()).as_f64().is_err());
-    }
-
-    #[test]
-    fn m1_scalar_boundaries_are_explicit() {
-        assert_eq!(
-            Value::Int(i64::from(i32::MIN)).try_as_m1_scalar().unwrap(),
-            M1Scalar::Integer(i32::MIN)
-        );
-        assert_eq!(
-            Value::Int(i64::from(i32::MAX)).try_as_m1_scalar().unwrap(),
-            M1Scalar::Integer(i32::MAX)
-        );
-        assert!(
-            Value::Int(i64::from(i32::MIN) - 1)
-                .try_as_m1_scalar()
-                .is_err()
-        );
-        assert!(
-            Value::Int(i64::from(i32::MAX) + 1)
-                .try_as_m1_scalar()
-                .is_err()
-        );
-
-        assert_eq!(
-            Value::Uint(0).try_as_m1_scalar().unwrap(),
-            M1Scalar::UnsignedInteger(0)
-        );
-        assert_eq!(
-            Value::Uint(u64::from(u32::MAX)).try_as_m1_scalar().unwrap(),
-            M1Scalar::UnsignedInteger(u32::MAX)
-        );
-        assert!(
-            Value::Uint(u64::from(u32::MAX) + 1)
-                .try_as_m1_scalar()
-                .is_err()
-        );
-    }
-
-    #[test]
-    fn binary32_conversion_exposes_precision_and_range() {
-        let narrowed = Value::Float(16_777_217.0)
-            .try_as_m1_scalar_for(M1ScalarKind::FloatingPoint)
-            .unwrap();
-        assert_eq!(narrowed, M1Scalar::FloatingPoint(16_777_216.0));
-        assert_eq!(narrowed.into_legacy_value(), Value::Float(16_777_216.0));
-
-        assert_eq!(
-            Value::Float(f64::from(f32::MIN))
-                .try_as_m1_scalar_for(M1ScalarKind::FloatingPoint)
-                .unwrap(),
-            M1Scalar::FloatingPoint(f32::MIN)
-        );
-        assert_eq!(
-            Value::Float(f64::from(f32::MAX))
-                .try_as_m1_scalar_for(M1ScalarKind::FloatingPoint)
-                .unwrap(),
-            M1Scalar::FloatingPoint(f32::MAX)
-        );
-        let smallest_subnormal = f32::from_bits(1);
-        assert_eq!(
-            Value::Float(f64::from(smallest_subnormal))
-                .try_as_m1_scalar_for(M1ScalarKind::FloatingPoint)
-                .unwrap(),
-            M1Scalar::FloatingPoint(smallest_subnormal)
-        );
-        let negative_zero = Value::Float(-0.0)
-            .try_as_m1_scalar_for(M1ScalarKind::FloatingPoint)
-            .unwrap();
-        assert!(matches!(
-            negative_zero,
-            M1Scalar::FloatingPoint(value) if value.to_bits() == (-0.0_f32).to_bits()
-        ));
-        assert!(
-            Value::Float(f64::MAX)
-                .try_as_m1_scalar_for(M1ScalarKind::FloatingPoint)
-                .is_err()
-        );
-        assert!(matches!(
-            Value::Float(f64::NAN).try_as_m1_scalar_for(M1ScalarKind::FloatingPoint),
-            Ok(M1Scalar::FloatingPoint(value)) if value.is_nan()
-        ));
-        assert_eq!(
-            Value::Float(f64::NEG_INFINITY)
-                .try_as_m1_scalar_for(M1ScalarKind::FloatingPoint)
-                .unwrap(),
-            M1Scalar::FloatingPoint(f32::NEG_INFINITY)
-        );
-    }
-
-    #[test]
-    fn inferred_conversion_rejects_ambiguous_legacy_float_storage() {
-        assert!(Value::Float(1.0).try_as_m1_scalar().is_err());
-        assert_eq!(
-            Value::Int(-1).try_as_m1_scalar().unwrap(),
-            M1Scalar::Integer(-1)
-        );
-        assert_eq!(
-            Value::Uint(1).try_as_m1_scalar().unwrap(),
-            M1Scalar::UnsignedInteger(1)
-        );
-
-        let fixed = M1Scalar::FixedPoint7dps(FixedPoint7dps::from_raw(1));
-        assert_eq!(Value::M1(fixed).try_as_m1_scalar().unwrap(), fixed);
-    }
-
-    #[test]
-    fn every_m1_scalar_has_an_explicit_legacy_compatibility_conversion() {
-        assert_eq!(
-            M1Scalar::Integer(i32::MIN).into_legacy_value(),
-            Value::Int(i64::from(i32::MIN))
-        );
-        assert_eq!(
-            M1Scalar::UnsignedInteger(u32::MAX).into_legacy_value(),
-            Value::Uint(u64::from(u32::MAX))
-        );
-        assert_eq!(
-            M1Scalar::FloatingPoint(f32::MIN_POSITIVE).into_legacy_value(),
-            Value::Float(f64::from(f32::MIN_POSITIVE))
-        );
-        assert_eq!(
-            M1Scalar::FixedPoint7dps(FixedPoint7dps::from_raw(-1)).into_legacy_value(),
-            Value::Float(-0.0000001)
-        );
-    }
-
-    #[test]
-    fn every_m1_scalar_kind_round_trips_through_legacy_storage() {
+    fn every_m1_scalar_family_keeps_its_runtime_width() {
         let scalars = [
             M1Scalar::FloatingPoint(-0.0),
             M1Scalar::FloatingPoint(f32::from_bits(1)),
@@ -638,52 +351,45 @@ mod tests {
         ];
 
         for scalar in scalars {
-            let legacy = scalar.into_legacy_value();
-            let restored = legacy.try_as_m1_scalar_for(scalar.kind()).unwrap();
-            assert_eq!(restored, scalar, "failed to restore {scalar:?}");
+            let value = Value::M1(scalar);
+            assert_eq!(value.m1_scalar().unwrap(), scalar);
+            assert!(value.is_numeric());
         }
     }
 
     #[test]
-    fn fixed_point_legacy_round_trip_restores_exact_raw_storage() {
-        for raw in [i32::MIN, -12_345_678, -1, 0, 1, 12_345_678, i32::MAX] {
-            let scalar = M1Scalar::FixedPoint7dps(FixedPoint7dps::from_raw(raw));
-            let legacy = scalar.into_legacy_value();
-            assert_eq!(
-                legacy
-                    .try_as_m1_scalar_for(M1ScalarKind::FixedPoint7dps)
-                    .unwrap(),
-                scalar,
-                "failed to restore fixed-point raw value {raw}"
-            );
+    fn fixed_point_decimal_parser_is_exact_at_storage_boundaries() {
+        for (text, raw) in [
+            ("-214.7483648", i32::MIN),
+            ("-1.2345678", -12_345_678),
+            ("-0.0000001", -1),
+            ("0", 0),
+            (".0000001", 1),
+            ("1.234567800", 12_345_678),
+            ("1.0000000000000000000000000000000000000000", 10_000_000),
+            ("12345678e-7", 12_345_678),
+            ("214.7483647", i32::MAX),
+        ] {
+            assert_eq!(FixedPoint7dps::parse_decimal(text).unwrap().raw(), raw);
         }
-    }
-
-    #[test]
-    fn fixed_point_compatibility_restore_rejects_lossy_values_and_language_casts() {
-        for value in [1.23456789, -0.0, 214.7483648, f64::NAN, f64::INFINITY] {
+        for text in [
+            "214.7483648",
+            "-214.7483649",
+            "1.23456781",
+            "1e1000",
+            "NaN",
+            "Infinity",
+            "",
+        ] {
             assert!(
-                Value::Float(value)
-                    .try_as_m1_scalar_for(M1ScalarKind::FixedPoint7dps)
-                    .is_err(),
-                "unexpectedly restored {value:?} as exact fixed point"
+                FixedPoint7dps::parse_decimal(text).is_none(),
+                "accepted {text:?}"
             );
         }
-
-        assert!(
-            Value::Int(1)
-                .try_as_m1_scalar_for(M1ScalarKind::FloatingPoint)
-                .is_err()
-        );
-        assert!(
-            Value::M1(M1Scalar::Integer(1))
-                .try_as_m1_scalar_for(M1ScalarKind::UnsignedInteger)
-                .is_err()
-        );
     }
 
     #[test]
-    fn fixed_point_7dps_uses_signed_scaled_i32_storage() {
+    fn fixed_point_storage_formats_and_widens_exactly() {
         let positive = FixedPoint7dps::from_raw(12_345_678);
         let negative = FixedPoint7dps::from_raw(-12_345_678);
         assert_eq!(positive.raw(), 12_345_678);
@@ -692,38 +398,20 @@ mod tests {
         assert_eq!(FixedPoint7dps::ZERO.as_f64(), 0.0);
         assert_eq!(FixedPoint7dps::MIN.as_f64(), -214.7483648);
         assert_eq!(FixedPoint7dps::MAX.as_f64(), 214.7483647);
-
-        assert_eq!(
-            M1Scalar::FixedPoint7dps(positive).into_legacy_value(),
-            Value::Float(1.2345678)
-        );
+        assert_eq!(positive.to_string(), "1.2345678");
+        assert_eq!(FixedPoint7dps::MIN.to_string(), "-214.7483648");
+        assert_eq!(FixedPoint7dps::MAX.to_string(), "214.7483647");
     }
 
     #[test]
-    fn legacy_numeric_forms_are_measurable() {
-        assert_eq!(
-            Value::Int(0).legacy_numeric_kind(),
-            Some(LegacyNumericKind::Int64)
-        );
-        assert_eq!(
-            Value::Uint(0).legacy_numeric_kind(),
-            Some(LegacyNumericKind::Uint64)
-        );
-        assert_eq!(
-            Value::Float(0.0).legacy_numeric_kind(),
-            Some(LegacyNumericKind::Float64)
-        );
-        assert_eq!(Value::M1(M1Scalar::Integer(0)).legacy_numeric_kind(), None);
-        assert_eq!(Value::Bool(false).legacy_numeric_kind(), None);
-    }
-
-    #[test]
-    fn enum_is_not_numeric() {
+    fn non_numeric_values_fail_numeric_access() {
         let v = Value::Enum {
             id: 1,
             member: "On".into(),
         };
-        assert!(v.as_f64().is_err());
+        assert!(v.m1_scalar().is_err());
+        assert!(!v.is_numeric());
+        assert!(Value::Str("x".into()).m1_scalar().is_err());
     }
 
     #[test]
@@ -731,22 +419,14 @@ mod tests {
         assert!(Value::Bool(true).as_bool().unwrap());
         assert!(!Value::Bool(false).as_bool().unwrap());
         // M1 is strongly typed: no int->bool.
-        assert!(Value::Int(1).as_bool().is_err());
-        assert!(Value::Float(0.0).as_bool().is_err());
+        assert!(Value::m1_integer(1).as_bool().is_err());
+        assert!(Value::m1_float(0.0).as_bool().is_err());
     }
 
     #[test]
     fn truthy_forwards_to_as_bool() {
         assert!(Value::Bool(true).truthy().unwrap());
         assert!(!Value::Bool(false).truthy().unwrap());
-        assert!(Value::Uint(0).truthy().is_err());
-    }
-
-    #[test]
-    fn as_f64_error_is_type_error() {
-        match Value::Str("nope".into()).as_f64() {
-            Err(EvalError::TypeError { .. }) => {}
-            other => panic!("expected TypeError, got {other:?}"),
-        }
+        assert!(Value::m1_unsigned(0).truthy().is_err());
     }
 }

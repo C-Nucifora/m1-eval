@@ -210,16 +210,16 @@ pub fn project_object_call(
     let v = match method {
         // A CAN message `.TxOpen()` returns an opaque transmit handle; offline it
         // is the determinate zero handle.
-        "TxOpen" => Value::Uint(0),
+        "TxOpen" => Value::m1_unsigned(0),
         // A CAN signal `.Receive()` is false offline — no frame has arrived.
         "Receive" => Value::Bool(false),
         // A scaled or floating-point CAN signal read has no offline value; the
         // documented stub is 0.
-        "GetScaled" | "GetFloat" => Value::Float(0.0),
+        "GetScaled" | "GetFloat" => Value::m1_float(0.0),
         // A raw unsigned CAN signal read stubs to 0.
-        "GetUnsignedInteger" => Value::Uint(0),
+        "GetUnsignedInteger" => Value::m1_unsigned(0),
         // A raw signed CAN signal read stubs to 0.
-        "GetInteger" => Value::Int(0),
+        "GetInteger" => Value::m1_integer(0),
         // A single bus bit read is false offline — no frame has set it.
         "GetBit" => Value::Bool(false),
         // Void writers: a CAN transmit / bit set / service-bits push / output set
@@ -281,7 +281,7 @@ fn documented_stub(
 ) -> Result<Option<Value>, EvalError> {
     let v = match (object, method) {
         // The scheduler tick period is exactly the evaluator's tick step.
-        ("System", "TickPeriod") => Value::Float(ctx.dt),
+        ("System", "TickPeriod") => Value::m1_float(ctx.dt as f32),
         // No tuning tool (XCP) is connected during offline evaluation.
         ("System", "XcpConnected") => Value::Bool(false),
         // Void side-effects: no observable result offline. Return a benign value

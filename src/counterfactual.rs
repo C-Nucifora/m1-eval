@@ -127,29 +127,18 @@ fn parse_const_rhs(rhs: &str) -> Result<Option<Value>, EvalError> {
         return Ok(Some(Value::Bool(false)));
     }
     if is_decimal_integer_literal(rhs) {
-        let i = rhs.parse::<i64>().map_err(|_| EvalError::TypeError {
+        let i = rhs.parse::<i32>().map_err(|_| EvalError::TypeError {
             detail: format!("override integer {rhs:?} is outside the M1 i32 range"),
         })?;
-        return i32::try_from(i)
-            .map(Value::m1_integer)
-            .map(Some)
-            .map_err(|_| EvalError::TypeError {
-                detail: format!("override integer {rhs:?} is outside the M1 i32 range"),
-            });
+        return Ok(Some(Value::m1_integer(i)));
     }
-    if let Ok(f) = rhs.parse::<f64>() {
+    if let Ok(f) = rhs.parse::<f32>() {
         // Reject non-finite "numbers" (`inf`, `nan`) as constants: a logged
         // channel literal is never infinite/NaN, and treating those words as
         // numeric would silently swallow what was almost certainly a typo'd
         // expression. They fall through to the Expr arm, which fails loud later.
         if f.is_finite() {
-            let narrowed = f as f32;
-            if narrowed.is_infinite() {
-                return Err(EvalError::TypeError {
-                    detail: format!("override float {rhs:?} is outside the M1 binary32 range"),
-                });
-            }
-            return Ok(Some(Value::m1_float(narrowed)));
+            return Ok(Some(Value::m1_float(f)));
         }
         if is_decimal_numeric_literal(rhs) {
             return Err(EvalError::TypeError {
@@ -181,7 +170,7 @@ mod tests {
 
     #[test]
     fn const_integer_rhs_is_int_const() {
-        // A bare integer literal -> Const(Value::Int), channel verbatim.
+        // A bare integer literal becomes an M1 Integer; channel text is verbatim.
         let ov = Override::parse("Root.CF.Sensor=5").expect("parses");
         assert_eq!(
             ov,
@@ -195,7 +184,7 @@ mod tests {
 
     #[test]
     fn const_float_rhs_is_float_const() {
-        // A literal with a decimal point -> Const(Value::Float).
+        // A literal with a decimal point becomes M1 binary32.
         let ov = Override::parse("Root.CF.Sensor=5.0").expect("parses");
         assert_eq!(
             ov,

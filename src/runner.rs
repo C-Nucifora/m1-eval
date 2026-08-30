@@ -1405,7 +1405,12 @@ mod tests {
         };
         let trace = run(&loaded, &scenario).expect("enum-seeded run evaluates");
         let flag = trace.channels.get("Root.Demo.Flag").expect("Flag traced");
-        assert_eq!(flag.last().and_then(|v| v.as_f64().ok()), Some(1.0));
+        assert_eq!(
+            flag.last()
+                .and_then(|value| value.m1_scalar().ok())
+                .map(|value| value.as_f64()),
+            Some(1.0)
+        );
     }
 
     #[test]
@@ -1546,10 +1551,9 @@ const = 3.0
         // scheduler ran the 200 Hz function 167 times (round(500/200) = 3) on a
         // 500 Hz base. Each function counts its own invocations.
         //
-        // Exact dt: trapezoidal Integral.Normal of a constant Seed = 3 advances
-        // by Seed*dt per run from the second run on (run k holds 3*dt*k), so
-        // after 200 runs Mid Total = 3.0 * 0.005 * 199 = 2.985 exactly — only
-        // when dt is exactly 5 ms AND the invocation count is exactly 200.
+        // `Integral.Normal` accumulates in M1 binary32. Reproduce those 199
+        // additions here so the assertion checks both the exact 5 ms schedule
+        // and binary32 rounding at every state update.
         let loaded = ratemix();
         let toml = r#"
 mode = "whole-project"
@@ -1572,10 +1576,9 @@ const = 3.0
         assert_eq!(last_f64("Root.RX.Fast Count"), 500.0, "500 Hz runs/second");
         assert_eq!(last_f64("Root.RX.Mid Count"), 200.0, "200 Hz runs/second");
         let total = last_f64("Root.RX.Mid Total");
-        assert!(
-            (total - 2.985).abs() < 1e-6,
-            "exact dt=5 ms trapezoidal accumulation, got {total}"
-        );
+        let dt = 0.005_f32;
+        let expected = (1..200).fold(0.0_f32, |acc, _| acc + (3.0 + 3.0) * 0.5 * dt);
+        assert_eq!(total, f64::from(expected));
     }
 
     #[test]

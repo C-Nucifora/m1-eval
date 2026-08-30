@@ -4,7 +4,7 @@ pub mod error;
 pub use error::EvalError;
 
 pub mod value;
-pub use value::{FixedPoint7dps, LegacyNumericKind, M1Scalar, M1ScalarKind, Value};
+pub use value::{FixedPoint7dps, M1Scalar, M1ScalarKind, Value};
 
 pub mod calib;
 pub use calib::{CalTable, Calibration};

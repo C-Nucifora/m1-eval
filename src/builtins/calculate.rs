@@ -177,12 +177,20 @@ fn average(args: &[Value]) -> Result<Value, EvalError> {
             Ok(Value::m1_float(left.midpoint(right)))
         }
         ValueType::Unsigned => {
-            let sum = u64::from(as_u32_bits(left)?) + u64::from(as_u32_bits(right)?);
-            Ok(Value::m1_unsigned((sum / 2) as u32))
+            let left = as_u32_bits(left)?;
+            let right = as_u32_bits(right)?;
+            Ok(Value::m1_unsigned((left & right) + ((left ^ right) >> 1)))
         }
         ValueType::Integer => {
-            let sum = i64::from(as_i32(left)?) + i64::from(as_i32(right)?);
-            Ok(Value::m1_integer((sum / 2) as i32))
+            let left = as_i32(left)?;
+            let right = as_i32(right)?;
+            let average = if left.signum() != right.signum() {
+                // Opposite signs cannot overflow when added.
+                (left + right) / 2
+            } else {
+                left / 2 + right / 2 + (left % 2 + right % 2) / 2
+            };
+            Ok(Value::m1_integer(average))
         }
         _ => Err(non_numeric("Average", left, right)),
     }
@@ -204,7 +212,6 @@ fn value_type(value: &Value) -> ValueType {
         Value::Bool(_) => ValueType::Boolean,
         Value::Enum { id, .. } => ValueType::Enum(*id),
         Value::Str(_) => ValueType::String,
-        Value::Int(_) | Value::Uint(_) | Value::Float(_) => ValueType::Unknown,
     }
 }
 
@@ -414,6 +421,20 @@ mod tests {
             ),
             Value::m1_unsigned(u32::MAX)
         );
+        assert_eq!(
+            ok(
+                "Average",
+                &[Value::m1_integer(i32::MIN), Value::m1_integer(i32::MAX)]
+            ),
+            Value::m1_integer(0)
+        );
+        assert_eq!(
+            ok(
+                "Average",
+                &[Value::m1_unsigned(0), Value::m1_unsigned(u32::MAX)]
+            ),
+            Value::m1_unsigned(u32::MAX / 2)
+        );
 
         for value in [f32::from_bits(1), -f32::from_bits(1)] {
             assert_eq!(
@@ -524,9 +545,9 @@ mod tests {
     }
 
     #[test]
-    fn rejects_legacy_numeric_arguments() {
+    fn rejects_non_numeric_arguments() {
         assert!(matches!(
-            call("Average", &[Value::Int(1), Value::Int(2)]),
+            call("Average", &[Value::Bool(true), Value::Bool(false)]),
             Err(EvalError::TypeError { .. })
         ));
     }

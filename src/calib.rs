@@ -35,9 +35,7 @@
 //! kept out of this pure reader.
 
 use crate::error::EvalError;
-#[cfg(test)]
-use crate::value::FixedPoint7dps;
-use crate::value::{M1Scalar, M1ScalarKind, Value};
+use crate::value::{FixedPoint7dps, M1Scalar};
 use std::collections::HashMap;
 
 /// A calibration table's concrete numbers: one breakpoint vector per input
@@ -117,9 +115,8 @@ impl Calibration {
 }
 
 /// Parse one calibration cell according to its declared M1 storage type.
-/// Enum and Boolean cells are non-numeric and return `None`. An absent type uses the named
-/// legacy-untyped compatibility rule: old configuration files treated every
-/// numeric cell as floating point, so the value is narrowed to binary32.
+/// Enum and Boolean cells are non-numeric and return `None`. An absent type uses
+/// the historical untyped-cell rule: numeric cells are parsed as binary32.
 fn cell_value(
     cell: roxmltree::Node<'_, '_>,
     declared_type: Option<&str>,
@@ -128,38 +125,32 @@ fn cell_value(
     let Some(text) = cell.text().map(str::trim).filter(|text| !text.is_empty()) else {
         return Ok(None);
     };
-    let ty = declared_type.unwrap_or("legacy-untyped-f32");
+    let ty = declared_type.unwrap_or("untyped-f32");
     let width_error = || EvalError::MissingCalibration {
         path: format!("calibration cell in {context} does not fit M1 type {ty}: {text:?}"),
     };
 
     let scalar = match ty {
         "enum" | "bool" => return Ok(None),
-        "f32" | "f64" | "legacy-untyped-f32" => {
-            let host = text.parse::<f64>().map_err(|_| width_error())?;
-            let narrowed = host as f32;
-            if !host.is_finite() || narrowed.is_infinite() {
+        "f32" | "f64" | "untyped-f32" => {
+            let narrowed = text.parse::<f32>().map_err(|_| width_error())?;
+            if !narrowed.is_finite() {
                 return Err(width_error());
             }
             M1Scalar::FloatingPoint(narrowed)
         }
         "s8" | "s16" | "s32" | "s64" => text
-            .parse::<i64>()
+            .parse::<i32>()
             .ok()
-            .and_then(|value| i32::try_from(value).ok())
             .map(M1Scalar::Integer)
             .ok_or_else(width_error)?,
         "u8" | "u16" | "u32" | "u64" => text
-            .parse::<u64>()
+            .parse::<u32>()
             .ok()
-            .and_then(|value| u32::try_from(value).ok())
             .map(M1Scalar::UnsignedInteger)
             .ok_or_else(width_error)?,
         "FixedPoint7dps" | "fixed7dps" => {
-            let host = text.parse::<f64>().map_err(|_| width_error())?;
-            Value::Float(host)
-                .try_as_m1_scalar_for(M1ScalarKind::FixedPoint7dps)
-                .map_err(|_| width_error())?
+            M1Scalar::FixedPoint7dps(FixedPoint7dps::parse_decimal(text).ok_or_else(width_error)?)
         }
         other => {
             return Err(EvalError::MissingCalibration {

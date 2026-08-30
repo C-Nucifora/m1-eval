@@ -51,8 +51,10 @@ fn to_unsigned_integer(argument: &Value) -> Result<Value, EvalError> {
 
 fn to_fixed_7dps(argument: &Value) -> Result<Value, EvalError> {
     let integer = match argument.m1_scalar()? {
-        M1Scalar::Integer(value) => i64::from(value),
-        M1Scalar::UnsignedInteger(value) => i64::from(value),
+        M1Scalar::Integer(value) => value,
+        M1Scalar::UnsignedInteger(value) => {
+            i32::try_from(value).map_err(|_| fixed_range_error(value))?
+        }
         other => {
             return Err(EvalError::TypeError {
                 detail: format!(
@@ -61,15 +63,20 @@ fn to_fixed_7dps(argument: &Value) -> Result<Value, EvalError> {
             });
         }
     };
-    let scaled = integer * FixedPoint7dps::SCALE;
-    let raw = i32::try_from(scaled).map_err(|_| EvalError::TypeError {
-        detail: format!(
-            "Convert.ToFixed7DP input {integer} is outside the Fixed Point 7dps range; integral inputs must be between -214 and 214"
-        ),
-    })?;
+    let raw = integer
+        .checked_mul(10_000_000)
+        .ok_or_else(|| fixed_range_error(integer))?;
     Ok(Value::M1(M1Scalar::FixedPoint7dps(
         FixedPoint7dps::from_raw(raw),
     )))
+}
+
+fn fixed_range_error(value: impl std::fmt::Display) -> EvalError {
+    EvalError::TypeError {
+        detail: format!(
+            "Convert.ToFixed7DP input {value} is outside the Fixed Point 7dps range; integral inputs must be between -214 and 214"
+        ),
+    }
 }
 
 fn round_f32_to_i32(value: f32) -> Result<i32, EvalError> {
@@ -90,15 +97,16 @@ fn round_f32_to_u32(value: f32) -> Result<u32, EvalError> {
 /// division truncates toward zero, so adding one unit when the remainder is at
 /// least half the scale implements halfway-away-from-zero without a float.
 fn round_fixed_to_i32(value: FixedPoint7dps) -> i32 {
-    let raw = i64::from(value.raw());
-    let whole = raw / FixedPoint7dps::SCALE;
-    let remainder = raw % FixedPoint7dps::SCALE;
-    let adjustment = if remainder.abs() * 2 >= FixedPoint7dps::SCALE {
+    let raw = value.raw();
+    let scale = 10_000_000_i32;
+    let whole = raw / scale;
+    let remainder = raw % scale;
+    let adjustment = if remainder.unsigned_abs() * 2 >= scale as u32 {
         remainder.signum()
     } else {
         0
     };
-    (whole + adjustment) as i32
+    whole + adjustment
 }
 
 fn not_convertible(target: &str, value: f32) -> EvalError {
@@ -246,10 +254,6 @@ mod tests {
         ));
         assert!(matches!(
             call("ToInteger", &[Value::Str("x".into())]),
-            Err(EvalError::TypeError { .. })
-        ));
-        assert!(matches!(
-            call("ToInteger", &[Value::Float(1.0)]),
             Err(EvalError::TypeError { .. })
         ));
     }
