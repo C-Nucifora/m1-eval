@@ -136,8 +136,16 @@ impl Walker<'_> {
         }
 
         // Parameters are readable even though they are calibration-owned and
-        // therefore excluded from `writable_value_path`.
-        if let Some(value_path) = crate::builtins::object::numeric_value_path(&path, self.project) {
+        // therefore excluded from `writable_value_path`. Enum conversions use
+        // their parallel typed resolver so their receiver edges are retained.
+        let value_path = match method.text() {
+            "AsInteger" | "AsString" => {
+                crate::builtins::enum_conv::enum_value_path(&path, self.project)
+                    .or_else(|| crate::builtins::object::numeric_value_path(&path, self.project))
+            }
+            _ => crate::builtins::object::numeric_value_path(&path, self.project),
+        };
+        if let Some(value_path) = value_path {
             self.sets.reads.insert(value_path);
         }
     }
@@ -257,6 +265,13 @@ mod tests {
         )
         .expect("mini fixture loads")
         .project
+    }
+
+    fn enum_project() -> Project {
+        let dir = Path::new(env!("CARGO_MANIFEST_DIR")).join("tests/fixtures/enums");
+        crate::loader::load(&dir.join("Project.m1prj"), None)
+            .expect("enum fixture loads")
+            .project
     }
 
     /// Parse a synthetic script body under the `Demo.Update.m1scr` name so it
@@ -384,6 +399,37 @@ mod tests {
         );
         assert!(sets.reads.contains("Root.Demo.Speed"), "{sets:?}");
         assert!(sets.reads.contains("Root.Demo.Output"), "{sets:?}");
+    }
+
+    #[test]
+    fn parameter_backed_compound_set_is_not_a_scheduler_write() {
+        let project = mini_project();
+        let script = script_from("Calibration Compound.Set(Output);\n");
+        let sets = io_sets(&script, &project, Some("Root.Demo"));
+
+        assert!(
+            !sets
+                .writes
+                .contains("Root.Demo.Calibration Compound.Calibration"),
+            "the declared Parameter default is calibration-owned: {sets:?}"
+        );
+        assert!(
+            !sets.writes.contains("Root.Demo.Calibration Compound.Value"),
+            "the generated sibling must not bypass the declared default: {sets:?}"
+        );
+        assert!(sets.reads.contains("Root.Demo.Output"), "{sets:?}");
+    }
+
+    #[test]
+    fn enum_conversions_read_channel_and_compound_receivers() {
+        let project = enum_project();
+        let script = script_from(
+            "local direct = Mode.AsString();\nlocal compound = Compound.AsInteger();\n",
+        );
+        let sets = io_sets(&script, &project, Some("Root.Demo"));
+
+        assert!(sets.reads.contains("Root.Demo.Mode"), "{sets:?}");
+        assert!(sets.reads.contains("Root.Demo.Compound.Value"), "{sets:?}");
     }
 
     #[test]

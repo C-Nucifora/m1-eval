@@ -160,11 +160,13 @@ fn writable_value_path_inner(
 
     if let Some(default) = symbol.default_value.as_deref() {
         let locals = HashMap::new();
-        if let Target::Symbol(path) = classify(default, Some(canon), None, project, &locals)
-            && let Some(value_path) = writable_value_path_inner(&path, project, seen)
-        {
-            return Some(value_path);
-        }
+        // A declared default is the compound's authoritative value provider.
+        // Do not silently switch to a generated `.Value` sibling when that
+        // provider is a calibration-owned Parameter (or otherwise unwritable).
+        return match classify(default, Some(canon), None, project, &locals) {
+            Target::Symbol(path) => writable_value_path_inner(&path, project, seen),
+            _ => None,
+        };
     }
 
     let value_path = format!("{canon}.Value");
@@ -438,10 +440,15 @@ fn bound_scalar(
     };
     let scalar = match kind {
         M1ScalarKind::FloatingPoint => {
-            let value = bound as f32;
-            if !value.is_finite() {
-                return Err(invalid());
-            }
+            let family_min = -f64::from(f32::MAX);
+            let family_max = f64::from(f32::MAX);
+            let value = match side {
+                BoundSide::Lower if bound <= family_min => -f32::MAX,
+                BoundSide::Lower if bound > family_max => return Err(invalid()),
+                BoundSide::Upper if bound < family_min => return Err(invalid()),
+                BoundSide::Upper if bound >= family_max => f32::MAX,
+                _ => bound as f32,
+            };
             M1Scalar::FloatingPoint(value)
         }
         M1ScalarKind::Integer => {
@@ -449,20 +456,31 @@ fn bound_scalar(
                 BoundSide::Lower => bound.ceil(),
                 BoundSide::Upper => bound.floor(),
             };
-            if rounded < f64::from(i32::MIN) || rounded > f64::from(i32::MAX) {
-                return Err(invalid());
-            }
-            M1Scalar::Integer(rounded as i32)
+            let family_min = f64::from(i32::MIN);
+            let family_max = f64::from(i32::MAX);
+            let value = match side {
+                BoundSide::Lower if rounded <= family_min => i32::MIN,
+                BoundSide::Lower if rounded > family_max => return Err(invalid()),
+                BoundSide::Upper if rounded < family_min => return Err(invalid()),
+                BoundSide::Upper if rounded >= family_max => i32::MAX,
+                _ => rounded as i32,
+            };
+            M1Scalar::Integer(value)
         }
         M1ScalarKind::UnsignedInteger => {
             let rounded = match side {
                 BoundSide::Lower => bound.ceil(),
                 BoundSide::Upper => bound.floor(),
             };
-            if rounded < 0.0 || rounded > f64::from(u32::MAX) {
-                return Err(invalid());
-            }
-            M1Scalar::UnsignedInteger(rounded as u32)
+            let family_max = f64::from(u32::MAX);
+            let value = match side {
+                BoundSide::Lower if rounded <= 0.0 => 0,
+                BoundSide::Lower if rounded > family_max => return Err(invalid()),
+                BoundSide::Upper if rounded < 0.0 => return Err(invalid()),
+                BoundSide::Upper if rounded >= family_max => u32::MAX,
+                _ => rounded as u32,
+            };
+            M1Scalar::UnsignedInteger(value)
         }
         M1ScalarKind::FixedPoint7dps => {
             let scaled = bound * FixedPoint7dps::SCALE as f64;
@@ -616,6 +634,75 @@ mod tests {
             constrain_value("float", "float", Value::m1_float(5.0), Some(&rules),).unwrap(),
             Value::m1_float(4.4)
         );
+    }
+
+    #[test]
+    fn permissive_out_of_family_bounds_saturate_to_family_endpoints() {
+        let cases = [
+            (
+                "unsigned-lower",
+                ValidationRule::MinMax {
+                    min: -1.0,
+                    max: 2.0,
+                },
+                M1Scalar::UnsignedInteger(1),
+            ),
+            (
+                "unsigned-upper",
+                ValidationRule::MinMax {
+                    min: 0.0,
+                    max: f64::from(u32::MAX) + 1.0,
+                },
+                M1Scalar::UnsignedInteger(u32::MAX),
+            ),
+            (
+                "integer-lower",
+                ValidationRule::MinMax {
+                    min: f64::from(i32::MIN) - 1.0,
+                    max: 0.0,
+                },
+                M1Scalar::Integer(-1),
+            ),
+            (
+                "integer-upper",
+                ValidationRule::MinMax {
+                    min: 0.0,
+                    max: f64::from(i32::MAX) + 1.0,
+                },
+                M1Scalar::Integer(i32::MAX),
+            ),
+            (
+                "fixed",
+                ValidationRule::MinMax {
+                    min: -1_000.0,
+                    max: 1_000.0,
+                },
+                M1Scalar::FixedPoint7dps(FixedPoint7dps::ZERO),
+            ),
+            (
+                "float",
+                ValidationRule::MinMax {
+                    min: -1.0e300,
+                    max: 1.0e300,
+                },
+                M1Scalar::FloatingPoint(0.0),
+            ),
+        ];
+
+        for (name, rule, scalar) in cases {
+            assert!(
+                rule_accepts(&rule, scalar, name).unwrap(),
+                "{name}: an in-family value must remain valid"
+            );
+            let rules = ObjectRules {
+                validation: HashMap::from([(name.to_string(), rule)]),
+            };
+            assert_eq!(
+                constrain_value(name, name, Value::M1(scalar), Some(&rules)).unwrap(),
+                Value::M1(scalar),
+                "{name}: an in-range value must remain unchanged"
+            );
+        }
     }
 
     #[test]

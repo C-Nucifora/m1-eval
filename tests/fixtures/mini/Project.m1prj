@@ -20,6 +20,9 @@
    <Component Classname="BuiltIn.Channel" Caps="AutoCreated" Name="Root.Demo.Map.Value"><Props Type="f32"/></Component>
    <Component Classname="BuiltIn.GroupCompound" Name="Root.Demo.Sensor Compound"><Props UseDefValue="true" DefValue="This.Sensor"/></Component>
    <Component Classname="BuiltIn.Channel" Name="Root.Demo.Sensor Compound.Sensor"><Props Type="f32"/></Component>
+   <Component Classname="BuiltIn.GroupCompound" Name="Root.Demo.Calibration Compound"><Props UseDefValue="true" DefValue="This.Calibration"/></Component>
+   <Component Classname="BuiltIn.Parameter" Name="Root.Demo.Calibration Compound.Calibration"><Props Type="f32"/></Component>
+   <Component Classname="BuiltIn.Channel" Name="Root.Demo.Calibration Compound.Value"><Props Type="f32"/></Component>
    <Component Classname="BuiltIn.FuncUser" Filename="Demo.Update.m1scr" Name="Root.Demo.Update"/>
   </List></ComponentStream>
  </Project>

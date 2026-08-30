@@ -773,6 +773,24 @@ fn classify_project_method(canon: &str, method: &str, project: &Project) -> Call
     if method == "GetUnscheduled" && object::unscheduled_value_path(canon, project).is_some() {
         return capability(BuiltinSupport::Direct, CallRoute::ObjectGetUnscheduled);
     }
+    // GetUnscheduled never falls through to a similarly named hardware stub.
+    if method == "GetUnscheduled" {
+        return unsupported_capability();
+    }
+    // A project value that cannot resolve to a writable Channel must not be
+    // reinterpreted as a generic hardware `Set` call. Non-value package
+    // objects and references retain their separately catalogued IO stubs.
+    let generated_value = format!("{canon}.Value");
+    let is_value_group = symbol.kind == SymbolKind::Group
+        && (symbol.default_value.is_some() || project.symbols().get(&generated_value).is_some());
+    if method == "Set"
+        && (matches!(
+            symbol.kind,
+            SymbolKind::Channel | SymbolKind::Parameter | SymbolKind::Constant | SymbolKind::Table
+        ) || is_value_group)
+    {
+        return unsupported_capability();
+    }
     if object::is_numeric_source(canon, project) {
         match method {
             "Validate" => {
@@ -1883,6 +1901,33 @@ mod tests {
     }
 
     #[test]
+    fn set_does_not_bypass_a_compounds_parameter_default() {
+        let mut h = ProjectObjHarness::new();
+        h.env.set(
+            "Root.Demo.Calibration Compound.Calibration",
+            Value::m1_float(1.0),
+        );
+        h.env
+            .set("Root.Demo.Calibration Compound.Value", Value::m1_float(2.0));
+
+        assert_eq!(
+            h.call("Calibration Compound", "Set", &[Value::m1_float(3.0)]),
+            Err(EvalError::UnsupportedBuiltin {
+                object: "Calibration Compound".to_string(),
+                method: "Set".to_string(),
+            })
+        );
+        assert_eq!(
+            h.env.get("Root.Demo.Calibration Compound.Calibration"),
+            Some(&Value::m1_float(1.0))
+        );
+        assert_eq!(
+            h.env.get("Root.Demo.Calibration Compound.Value"),
+            Some(&Value::m1_float(2.0))
+        );
+    }
+
+    #[test]
     fn get_unscheduled_reads_the_exact_stored_scalar() {
         let mut h = ProjectObjHarness::new();
         h.env.set("Root.Demo.Limited Signed", Value::m1_integer(-1));
@@ -2023,6 +2068,7 @@ mod tests {
             ("Limited Compound", "GetUnscheduled"),
             ("Positive Float", "GetUnscheduled"),
             ("Positive Float", "Set"),
+            ("Calibration Compound", "Set"),
             ("Numeric Constant", "GetUnscheduled"),
             ("Typed IO", "GetUnscheduled"),
             ("Startup Delay", "GetUnscheduled"),

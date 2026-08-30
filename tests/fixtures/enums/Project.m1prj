@@ -22,6 +22,9 @@
    <Component Classname="BuiltIn.Constant" Name="Root.Demo.Numeric Constant"><Props Type="f32" Value="1.0"/></Component>
    <Component Classname="BuiltIn.GroupCompound" Name="Root.Demo.Limited Compound"><Props UseDefValue="true" DefValue="This.Value" Validation="MinMax" ValMin="1" ValMax="4"/></Component>
    <Component Classname="BuiltIn.Channel" Name="Root.Demo.Limited Compound.Value"><Props Type="u32"/></Component>
+   <Component Classname="BuiltIn.GroupCompound" Name="Root.Demo.Calibration Compound"><Props UseDefValue="true" DefValue="This.Calibration"/></Component>
+   <Component Classname="BuiltIn.Parameter" Name="Root.Demo.Calibration Compound.Calibration"><Props Type="f32"/></Component>
+   <Component Classname="BuiltIn.Channel" Name="Root.Demo.Calibration Compound.Value"><Props Type="f32"/></Component>
    <Component Classname="BuiltIn.Timer" Name="Root.Demo.Startup Delay"/>
    <Component Classname="MoTeC Input.Sensor" Name="Root.Demo.Typed IO"><Props Type="f32"/></Component>
    <Component Classname="BuiltIn.GroupCompound" Name="Root.Demo.Service Bits"/>
