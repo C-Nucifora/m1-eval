@@ -3,8 +3,9 @@
 //! engine *supports*.
 //!
 //! Before a run, a user wants to know which parts of their project the evaluator
-//! implements, which hardware metadata needs a scenario or adapter, which calls
-//! have a typed offline fallback, and which it cannot handle at all. This module
+//! implements, which calls use a typed adapter route, which calls have a typed
+//! offline fallback, and which it cannot handle at all. Adapter routes include
+//! both required external metadata and evaluator-owned adapters. This module
 //! walks every script's CST and answers that statically:
 //!
 //! - every call is resolved through the same project-aware capability model as
@@ -63,7 +64,9 @@ pub struct CoverageReport {
     pub supported: Vec<CoverageItem>,
     /// Items dispatched through an explicit deterministic offline model.
     pub assumed: Vec<CoverageItem>,
-    /// Hardware metadata which requires a scenario or adapter value.
+    /// Calls routed through a typed adapter. This includes both user-supplied
+    /// adapters and evaluator-owned adapters such as virtual serial. Required
+    /// external metadata is a subset of this category.
     pub adapter_backed: Vec<CoverageItem>,
     /// Hardware calls handled by documented typed offline fallbacks.
     pub stubbed: Vec<CoverageItem>,

@@ -2493,6 +2493,11 @@ base_rate_hz = 100.0
         load(&dir.join("Project.m1prj"), None).expect("counterfactual fixture loads")
     }
 
+    fn serial_fixture() -> Loaded {
+        let dir = Path::new(env!("CARGO_MANIFEST_DIR")).join("tests/fixtures/serial");
+        load(&dir.join("Project.m1prj"), None).expect("serial fixture loads")
+    }
+
     /// The `fn_symbol` path of each scheduled function in a cone, in order — the
     /// load-bearing observable for the downstream-cone tests.
     fn cone_fn_symbols(cone: &[Scheduled<'_>]) -> Vec<String> {
@@ -2606,6 +2611,53 @@ base_rate_hz = 100.0
                 units: BTreeMap::new(),
             },
         }
+    }
+
+    #[test]
+    fn counterfactual_serial_rejects_a_logged_handle_after_in_cone_port_setup() {
+        let loaded = serial_fixture();
+        let channels = vec![
+            InputSeries {
+                channel: "Root.Serial Test.Counterfactual Gate".to_string(),
+                kind: InputKind::Const(Value::m1_integer(1)),
+            },
+            InputSeries {
+                channel: "Root.Serial Test.Handle A".to_string(),
+                kind: InputKind::Const(Value::m1_unsigned(77)),
+            },
+        ];
+        let log = Log {
+            meta: LogMeta {
+                source: "synthetic-serial-counterfactual".to_string(),
+                duration_s: 0.01,
+                channel_count: channels.len(),
+                units: BTreeMap::new(),
+            },
+            channels,
+        };
+        let overrides = vec![
+            Override::parse("Root.Serial Test.Handle A=Root.Serial Test.Handle A")
+                .expect("identity override parses"),
+        ];
+        let cfg = CounterfactualCfg {
+            base_rate_hz: 100.0,
+            duration_s: 0.01,
+        };
+
+        let error = run_counterfactual(&loaded, &log, &overrides, &cfg)
+            .expect_err("a logged number is not a handle from the fresh virtual adapter");
+        assert_eq!(
+            error.root_cause(),
+            &EvalError::BadCall {
+                detail:
+                    "Serial.Receive: invalid handle 77; handles are nonzero and owned by this run"
+                        .to_string(),
+            }
+        );
+        assert_eq!(
+            error.to_string(),
+            "in Serial Test.Counterfactual Receive.m1scr at t = 0.000 s: bad call: Serial.Receive: invalid handle 77; handles are nonzero and owned by this run"
+        );
     }
 
     fn floats(trace: &Trace, channel: &str) -> Vec<f64> {

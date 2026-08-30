@@ -1,3 +1,4 @@
 // Synthetic virtual-serial fixture. No proprietary or captured data.
 Init OK = Serial.PortInit(0, 115200, 0);
 Diagnostic = Serial.PortDiagnostic(0);
+Counterfactual Gate = 0;

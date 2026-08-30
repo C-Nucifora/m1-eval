@@ -35,6 +35,26 @@ same virtual port therefore observe the same injected stream independently.
 This fan-out is an explicit evaluator contract requested for repeatable tests;
 it is not a claim about a physical port's destructive read behavior.
 
+## Run-mode boundaries
+
+Whole-project mode creates one virtual adapter before the `On Startup` pass and
+shares it with every periodic function. A startup `Serial.PortInit` therefore
+configures the port used by later `Receive` and `Transmit` calls.
+
+Function and cone modes do not run the project's startup functions. The selected
+function or cone must call `PortInit` before it reaches virtual `Receive` or
+`Transmit`. A `[[serial.rx]]` declaration supplies bytes; it does not initialize
+a port. A higher-priority `[[io]]` value or user adapter may replace the serial
+sequence, but it must own every state-dependent call in that sequence.
+
+Counterfactual replay has no `Scenario`, so it has no `[[serial.rx]]` stream. It
+also skips project startup and begins with an empty virtual adapter. A number
+loaded from a log's handle channel is data, not a handle allocated by that
+adapter. Counterfactual cone code must initialize its ports and create its
+handles in the recomputed call chain. A user adapter can instead own the full
+serial sequence. Missing setup fails with the same uninitialized-port or
+invalid-handle error as any other run.
+
 ## Routing
 
 Hardware calls use this precedence:
@@ -50,6 +70,15 @@ Hardware calls use this precedence:
 An external adapter can therefore replace any serial method. Scenario `[[io]]`
 can also replace one method result, while `[[serial.rx]]` supplies the byte
 stream to the built-in virtual adapter.
+
+The first route that returns a value owns the whole call. Lower routes do not
+run for side effects. For example, a `[[io]]` value for `Serial.PortInit` returns
+success without configuring the virtual port, so a later virtual `Receive`
+fails as uninitialized. A supplied `GetHandle` value is likewise unknown to the
+virtual adapter and fails if a later getter falls through to it. A user adapter
+that returns `AdapterReply::Unhandled` lets that call fall through to virtual
+serial. Stateful serial calls should stay on one route unless the higher route
+deliberately implements the entire chain.
 
 ## Handles, ports, and buffers
 
@@ -133,6 +162,36 @@ serial event records.
 
 `Scenario::serial` contains the exported `SerialScenario` and `SerialRx` types.
 `Trace::serial` contains ordered exported `SerialEvent` records with a
-`SerialDirection`. These additions leave the public `EvalCtx` shape unchanged;
-direct `eval` and `exec_script` calls use a fresh virtual adapter without
-scenario RX data.
+`SerialDirection`. `HardwareValueSource` adds `VirtualSerial` for deterministic
+adapter results and `VirtualSerialRx` for scenario-derived results.
+
+Rust callers that construct these public structs or match the provenance enum
+must update their source:
+
+```rust
+let scenario = Scenario {
+    // existing fields
+    serial: Default::default(),
+    // existing fields
+};
+
+let trace = Trace::new(); // `Trace::default()` is equivalent
+```
+
+Code that still builds a `Trace` literal must add `serial: Vec::new()`. Prefer
+`Trace::new()` or `Trace::default()` so metadata fields start empty. Exhaustive
+matches on `HardwareValueSource` need arms for `VirtualSerial` and
+`VirtualSerialRx`. JSON readers must also accept the new top-level `serial`
+array.
+
+These additions leave the public `EvalCtx` shape unchanged. Each direct `eval`
+or `exec` call gets a fresh adapter. `exec_script` keeps one fresh adapter for
+all statements in that script. None of these direct APIs supplies scenario RX
+data. Public builtin-level helpers that receive only an `EvalCtx` also create
+fresh per-call serial state, so handles do not persist across separate helper
+calls.
+
+The sibling `m1-lsp` crate's `src/eval/engine.rs::offline_scenario` literal needs
+`serial: Default::default()` when its m1-eval dependency advances. That is a
+release-coordination follow-up; this m1-eval change does not modify the sibling
+repository.

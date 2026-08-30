@@ -1,7 +1,8 @@
 # m1-eval — Design Spec
 
 **Date:** 2026-06-23
-**Status:** Approved design, pre-implementation
+**Status:** Historical pre-implementation design. The README and current feature
+documentation define the implemented contract.
 **Companion tool:** `m1-visualiser` (separate spec — depends on this engine for its value-overlay feature)
 
 ## Summary
@@ -55,8 +56,9 @@ From surveying the grammar, `m1-typecheck`, the M1 manuals, and ~80 real EV-M1 s
   `Integral`, `Derivative`, `Debounce`, `Delay`, `Limit`, `Convert`, `Change`,
   table lookup, plus IO-ish `CanComms`/`Serial`/`System`). Matching MoTeC's exact
   filter/integral/interpolation semantics is the main correctness risk.
-- **Some builtins touch hardware** (CAN, Serial, System ticks) and cannot be truly
-  evaluated; they are stubbed or fed from the scenario.
+- **Some builtins touch hardware** (CAN, serial devices, System ticks). Live IO
+  cannot be evaluated offline, so the current engine uses typed adapter routes,
+  explicit deterministic models, scenario values, or documented stubs.
 - **Table cell values live outside the scripts**, in `.m1cfg` calibration. Real lookups
   require that file as an input.
 - **Scripts run as scheduled functions at fixed rates** (500/200/50/10/2 Hz); rate
@@ -85,7 +87,9 @@ and scripts have side effects (channel writes, `Output.SetState(...)`).
 
 ### Non-goals (v1, YAGNI)
 - A real-time / hardware-in-the-loop simulator. This is offline, deterministic evaluation.
-- CAN bus / Serial IO emulation. Those are stubbed or scenario-fed.
+- Live CAN bus and serial-device IO. CAN remains stubbed or scenario-fed. The
+  implemented evaluator now includes a deterministic virtual RS232 byte-buffer
+  subset for offline scenarios.
 - Re-implementing or driving MoTeC's GUI tools. (M1 Sim is used only as a validation
   oracle, see Fidelity.)
 - Editing/writing `.m1cfg` or `.m1prj`. The engine reads; it does not mutate the project.
@@ -178,8 +182,9 @@ silently-wrong number):
   `Change.*`, `Filter.{Maximum,Minimum}`, timers, `static local` persistence. Each is a
   small state object keyed by call-site and advanced by `dt`. Fidelity risk concentrates
   here.
-- **Tier 3 (stub / scenario-fed):** `CanComms.*`, `Serial.*`, `System.*`, `Logging.*` —
-  return scenario-provided or documented stub values, flagged as "externally driven."
+- **Tier 3 (adapter / model / stub):** `CanComms.*`, `System.*`, `Logging.*`, and
+  hardware calls use typed adapter routes, explicit models, or documented stubs.
+  `Serial.*` has a deterministic virtual RS232 subset; LIN remains unsupported.
   Real CAN can later be fed from logged CAN channels.
 
 **Fidelity strategy:**
