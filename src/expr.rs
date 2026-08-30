@@ -99,8 +99,14 @@ impl EvalRuntime<'static> {
     /// Such callers supply only `dt`, so the evaluation starts at tick zero and
     /// has no external hardware adapter.
     pub(crate) fn from_public(dt: f64) -> Self {
+        Self::from_time(EvalTime::at_start(dt))
+    }
+
+    /// Runtime for a direct evaluator caller that supplies deterministic time
+    /// but no hardware adapter.
+    pub(crate) fn from_time(time: EvalTime) -> Self {
         EvalRuntime {
-            time: EvalTime::at_start(dt),
+            time,
             hardware: None,
         }
     }
@@ -109,6 +115,16 @@ impl EvalRuntime<'static> {
 /// Evaluate an expression node to a [`Value`].
 pub fn eval(node: &Node, ctx: &mut EvalCtx) -> Result<Value, EvalError> {
     let mut runtime = EvalRuntime::from_public(ctx.dt);
+    eval_with_runtime(node, ctx, &mut runtime)
+}
+
+/// Evaluate an expression at an explicit deterministic evaluator time.
+///
+/// Use this entry point when reusing an [`EvalCtx`] and its [`StateStore`]
+/// across calls outside [`crate::runner`]. The long-standing [`eval`] wrapper
+/// remains source-compatible and represents periodic tick zero.
+pub fn eval_at_time(node: &Node, ctx: &mut EvalCtx, time: EvalTime) -> Result<Value, EvalError> {
+    let mut runtime = EvalRuntime::from_time(time);
     eval_with_runtime(node, ctx, &mut runtime)
 }
 

@@ -195,19 +195,31 @@ fn advance_time(current: f64, dt: f64) -> f64 {
     current + dt
 }
 
-/// Evaluate a `Timer` object method (`Start`/`Stop`/`Reset`/`Remaining`).
-/// Returns `Ok(None)` for a non-Timer method so the caller fails loud.
+/// Source-compatible direct entry for a `Timer` object method.
 ///
-/// A `Timer` is a project *object*, so all four methods on the same object must
-/// share one countdown. We therefore key the state by the **object path**
-/// (`object_key`, a [`CallSite`] with the object path in the script slot and a
-/// zero offset) rather than the individual call site — `Start`/`Remaining`/… on
-/// one Timer all address the same state. `Start(period)` records an absolute
-/// deadline on the evaluator timeline. `Remaining` observes `deadline - now`
-/// without modifying state, so two reads at one instant are identical and a
-/// timer continues to elapse even on ticks where no script reads it. `Stop`
-/// freezes the duration at the current evaluator time; `Reset` clears it.
+/// The original signature has no absolute-time argument, so this wrapper uses
+/// periodic tick zero. Call [`timer_at`] when retaining a
+/// [`StateStore`](crate::env::StateStore) across direct evaluations;
+/// runner-backed calls already supply their current time.
 pub fn timer(
+    method: &str,
+    args: &[Value],
+    object_key: CallSite,
+    ctx: &mut EvalCtx,
+) -> Result<Option<Value>, EvalError> {
+    let time = EvalTime::at_start(ctx.dt);
+    timer_at(method, args, object_key, time, ctx)
+}
+
+/// Evaluate a `Timer` object method at explicit deterministic evaluator time.
+///
+/// A `Timer` is a project object, so all four methods on the same object share
+/// one countdown. State is keyed by the object path rather than the individual
+/// call site. `Start(period)` records an absolute deadline. `Remaining` observes
+/// `deadline - now` without modifying state, so two reads at one instant are
+/// identical and a timer continues to elapse on ticks where no script reads it.
+/// `Stop` freezes the duration at the current time; `Reset` clears it.
+pub fn timer_at(
     method: &str,
     args: &[Value],
     object_key: CallSite,
@@ -219,13 +231,12 @@ pub fn timer(
         return Ok(None);
     }
     let now = time.elapsed_s;
-    let slot = ctx.state.entry(object_key);
     // Read the current countdown (default: stopped at zero). While running,
     // `remaining` stores the absolute deadline; when stopped it stores the
     // frozen duration. This preserves the established public OpState shape.
-    let (mut remaining, mut running) = match slot {
-        OpState::Timer { remaining, running } => (*remaining, *running),
-        _ => (0.0, false),
+    let (mut remaining, mut running) = match ctx.state.get(&object_key) {
+        Some(OpState::Timer { remaining, running }) => (*remaining, *running),
+        Some(_) | None => (0.0, false),
     };
 
     let result = match method {
@@ -261,7 +272,7 @@ pub fn timer(
     // A read must not advance, decrement, stop, or otherwise rewrite the timer.
     // Start/Stop/Reset are the only state transitions.
     if method != "Remaining" {
-        *slot = OpState::Timer { remaining, running };
+        *ctx.state.entry(object_key) = OpState::Timer { remaining, running };
     }
     Ok(Some(result))
 }
@@ -1932,6 +1943,50 @@ mod tests {
     // ---- Task 18: Timer object ----
 
     #[test]
+    fn fresh_timer_remaining_does_not_create_state() {
+        let mut h = Harness::new(0.1);
+        let key = CallSite::new("Root.Demo.FreshTimer", 0);
+        let legacy_key = CallSite::new("Root.Demo.LegacyTimer", 0);
+        let mut ctx = EvalCtx {
+            project: &h.project,
+            calib: &h.calib,
+            env: &mut h.env,
+            state: &mut h.state,
+            group: Some("Root.Demo"),
+            fn_symbol: Some("Root.Demo.Update"),
+            script_name: "Demo.Update.m1scr",
+            dt: h.dt,
+            scripts: &[],
+            signature_m1_types: None,
+            object_rules: None,
+            depth: 0,
+            trace: None,
+        };
+
+        assert_eq!(
+            timer_at(
+                "Remaining",
+                &[],
+                key.clone(),
+                EvalTime::periodic(25, 2.5, h.dt, h.dt),
+                &mut ctx,
+            )
+            .unwrap(),
+            Some(Value::m1_float(0.0))
+        );
+        assert!(ctx.state.get(&key).is_none());
+
+        // The original public signature remains callable as a tick-zero
+        // compatibility wrapper and observes the same empty state.
+        assert_eq!(
+            timer("Remaining", &[], legacy_key.clone(), &mut ctx).unwrap(),
+            Some(Value::m1_float(0.0))
+        );
+        assert!(ctx.state.get(&legacy_key).is_none());
+        assert!(ctx.state.0.is_empty());
+    }
+
+    #[test]
     fn timer_remaining_observes_the_evaluator_timeline_without_mutating_state() {
         let mut h = Harness::new(0.1);
         let key = CallSite::new("Root.Demo.MyTimer", 0);
@@ -1952,7 +2007,7 @@ mod tests {
                 trace: None,
             };
             let time = EvalTime::periodic(0, at, h.dt, h.dt);
-            timer(method, args, key.clone(), time, &mut ctx)
+            timer_at(method, args, key.clone(), time, &mut ctx)
                 .unwrap()
                 .unwrap()
         };
@@ -2013,7 +2068,7 @@ mod tests {
                 trace: None,
             };
             let time = EvalTime::periodic(0, at, h.dt, h.dt);
-            timer(method, args, key.clone(), time, &mut ctx)
+            timer_at(method, args, key.clone(), time, &mut ctx)
                 .unwrap()
                 .unwrap()
         };
@@ -2071,7 +2126,7 @@ mod tests {
                 trace: None,
             };
             let time = EvalTime::periodic(0, at, h.dt, h.dt);
-            timer(method, args, key.clone(), time, &mut ctx)
+            timer_at(method, args, key.clone(), time, &mut ctx)
                 .unwrap()
                 .unwrap()
         };
@@ -2118,7 +2173,7 @@ mod tests {
                     trace: None,
                 };
                 let time = EvalTime::periodic(0, at, h.dt, h.dt);
-                timer(method, args, key.clone(), time, &mut ctx)
+                timer_at(method, args, key.clone(), time, &mut ctx)
                     .unwrap()
                     .unwrap()
             };

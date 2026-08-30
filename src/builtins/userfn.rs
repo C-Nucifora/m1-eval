@@ -84,6 +84,19 @@ pub fn call(
     call_with_runtime(callee_path, args, ctx, &mut runtime)
 }
 
+/// Evaluate an inline user-function call at explicit evaluator time.
+///
+/// The supplied time is retained through the callee body and every nested call.
+pub fn call_at_time(
+    callee_path: &str,
+    args: &[Value],
+    ctx: &mut EvalCtx,
+    time: crate::hardware::EvalTime,
+) -> Result<Option<Value>, EvalError> {
+    let mut runtime = EvalRuntime::from_time(time);
+    call_with_runtime(callee_path, args, ctx, &mut runtime)
+}
+
 pub(crate) fn call_with_runtime(
     callee_path: &str,
     args: &[Value],

@@ -132,7 +132,10 @@ The multi-rate model:
   (`1 / rate_hz`) — a 50 Hz integrator accumulates with `dt = 0.02`, not the
   base `dt`. Timer objects instead retain an absolute deadline on the same
   evaluator timeline, so `Remaining` observes elapsed time without advancing
-  the timer merely because it was read.
+  the timer merely because it was read. Direct library users can carry that
+  timeline through `eval_at_time`, `exec_at_time`, `exec_script_at_time`,
+  `builtins::dispatch_at_time`, or `builtins::userfn::call_at_time`; the older
+  entry points remain tick-zero compatibility wrappers.
 - **Zero-order hold between ticks.** A channel a function did not write this
   tick keeps its last value (the shared value store carries it forward), so a
   slow channel holds steady between its updates while fast channels move every

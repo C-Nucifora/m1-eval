@@ -60,6 +60,22 @@ pub fn dispatch(
     dispatch_with_runtime(object, method, args, site, ctx, &mut runtime)
 }
 
+/// Dispatch one builtin call at an explicit deterministic evaluator time.
+///
+/// This preserves the public [`dispatch`] API while giving direct callers a
+/// way to advance timer and hardware-model time without using the runner.
+pub fn dispatch_at_time(
+    object: &str,
+    method: &str,
+    args: &[Value],
+    site: CallSite,
+    ctx: &mut EvalCtx,
+    time: crate::hardware::EvalTime,
+) -> Result<Value, EvalError> {
+    let mut runtime = EvalRuntime::from_time(time);
+    dispatch_with_runtime(object, method, args, site, ctx, &mut runtime)
+}
+
 /// Internal dispatch path carrying the runner's evaluator timeline and adapter.
 pub(crate) fn dispatch_with_runtime(
     object: &str,
@@ -172,7 +188,7 @@ pub(crate) fn dispatch_with_runtime(
         CallRoute::Timer => {
             validate_object_arity(object, method, args.len())?;
             let object_key = timer_object_key(object, ctx);
-            match stateful::timer(method, args, object_key, runtime.time, ctx)? {
+            match stateful::timer_at(method, args, object_key, runtime.time, ctx)? {
                 Some(value) => Ok(value),
                 None => Err(unsupported(object, method)),
             }
@@ -1798,6 +1814,32 @@ mod tests {
             self.call_with_adapter(object, method, args, None)
         }
 
+        fn call_at_time(
+            &mut self,
+            object: &str,
+            method: &str,
+            args: &[Value],
+            time: crate::hardware::EvalTime,
+        ) -> Result<Value, EvalError> {
+            let site = CallSite::new("Demo.Update.m1scr", 0);
+            let mut ctx = EvalCtx {
+                project: &self.project,
+                calib: &self.calib,
+                env: &mut self.env,
+                state: &mut self.state,
+                group: Some("Root.Demo"),
+                fn_symbol: Some("Root.Demo.Update"),
+                script_name: "Demo.Update.m1scr",
+                dt: 0.01,
+                scripts: &[],
+                signature_m1_types: None,
+                object_rules: Some(&self.object_rules),
+                depth: 0,
+                trace: Some(&mut self.trace),
+            };
+            dispatch_at_time(object, method, args, site, &mut ctx, time)
+        }
+
         fn call_with_adapter(
             &mut self,
             object: &str,
@@ -2223,6 +2265,31 @@ mod tests {
             Err(EvalError::UnsupportedBuiltin { .. }) => {}
             other => panic!("expected channel.Start to be unsupported, got {other:?}"),
         }
+    }
+
+    #[test]
+    fn public_timed_dispatch_advances_a_timer_on_the_supplied_timeline() {
+        let mut h = ProjectObjHarness::new();
+        h.call_at_time(
+            "Startup Delay",
+            "Start",
+            &[Value::m1_float(0.25)],
+            crate::hardware::EvalTime::periodic(500, 5.0, 0.01, 0.01),
+        )
+        .unwrap();
+
+        let remaining = h
+            .call_at_time(
+                "Startup Delay",
+                "Remaining",
+                &[],
+                crate::hardware::EvalTime::periodic(510, 5.1, 0.01, 0.01),
+            )
+            .unwrap()
+            .m1_scalar()
+            .unwrap()
+            .as_f64();
+        assert!((remaining - 0.15).abs() < 1e-6);
     }
 
     #[test]
