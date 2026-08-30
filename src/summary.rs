@@ -134,6 +134,18 @@ impl Walker<'_> {
             }
             return;
         }
+        if matches!(method.text(), "Lookup" | "Get")
+            && self
+                .project
+                .symbols()
+                .get(&path)
+                .is_some_and(|symbol| symbol.kind == m1_typecheck::symbols::SymbolKind::Table)
+        {
+            // Table lookup/indexing reads calibration axes and body cells, not
+            // the generated runtime `.Value` channel. Arguments remain reads
+            // because `walk_call` accounts for them before the receiver.
+            return;
+        }
 
         // Parameters are readable even though they are calibration-owned and
         // therefore excluded from `writable_value_path`. Enum conversions use
@@ -430,6 +442,19 @@ mod tests {
 
         assert!(sets.reads.contains("Root.Demo.Mode"), "{sets:?}");
         assert!(sets.reads.contains("Root.Demo.Compound.Value"), "{sets:?}");
+    }
+
+    #[test]
+    fn table_lookup_and_get_do_not_read_the_generated_value_channel() {
+        let project = mini_project();
+        let script = script_from("local x = Map.Lookup(Speed);\nlocal y = Map.Get(0);\n");
+        let sets = io_sets(&script, &project, Some("Root.Demo"));
+
+        assert!(sets.reads.contains("Root.Demo.Speed"), "{sets:?}");
+        assert!(
+            !sets.reads.contains("Root.Demo.Map.Value"),
+            "calibration-only table calls must not create a runtime channel edge: {sets:?}"
+        );
     }
 
     #[test]
