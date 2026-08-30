@@ -1,21 +1,22 @@
 // SPDX-License-Identifier: GPL-3.0-or-later
 //! The `m1-eval` command-line interface: a thin shell over the [`Engine`].
 //!
-//! Loads a project (and optional `.m1cfg` calibration), then either evaluates a
-//! scenario into a [`Trace`] (written to `--out` as JSON or CSV, or to stdout) or
-//! prints the static `--coverage` report. The heavy lifting lives in the library;
-//! this binary only parses arguments, wires them to the engine, and maps results
-//! onto the shared toolchain exit-code contract.
+//! Loads a project and evaluates a scenario, replays a log, prints static
+//! coverage, or runs one or more self-contained conformance fixtures. The heavy
+//! lifting lives in the library. This binary parses arguments, wires them to the
+//! engine or conformance runner, and maps results onto the shared toolchain
+//! exit-code contract.
 //!
 //! ## Exit codes (shared toolchain contract, see `m1-tools/docs/cli.md`)
 //!
-//! - `0` — success: the run produced a trace, or the coverage report printed.
-//! - `1` — the engine ran and has something to report: a project that would not
-//!   load, a scenario that would not parse, or an evaluation error (a fail-loud
-//!   `EvalError`).
-//! - `2` — a usage error: an unrecognised flag, or arguments that do not name a
-//!   runnable action (no resolvable project, or neither `--scenario` nor
-//!   `--coverage`).
+//! - `0`: success; the run produced a trace, the coverage report printed, or
+//!   every conformance fixture passed.
+//! - `1`: the engine ran and has something to report; a project that would not
+//!   load, a scenario or fixture that would not parse, a fixture integrity or
+//!   comparison failure, or an evaluation error (a fail-loud `EvalError`).
+//! - `2`: a usage error; an unrecognised flag, or arguments that do not name a
+//!   runnable action (no resolvable project, or no scenario, log, coverage, or
+//!   conformance action).
 //!
 //! Counterfactual replay is supported: `--log` attaches a recorded MoTeC log
 //! (CSV, or `.ld` with `--features ld`) as ground truth, `--override CH=expr`
@@ -23,7 +24,7 @@
 //! `--diff` writes the per-channel logged-vs-counterfactual delta.
 
 use clap::{ArgGroup, Parser};
-use m1_eval::{Engine, RunMode, Scenario};
+use m1_eval::{ConformanceOptions, Engine, RunMode, Scenario, run_conformance_suite};
 use std::path::{Path, PathBuf};
 use std::process;
 
@@ -45,6 +46,33 @@ use std::process;
         .multiple(false)
 ))]
 struct Args {
+    /// Run a typed conformance fixture. Repeat to run a suite. Each fixture
+    /// carries its own project paths, hashes, tick grid, and expected values.
+    #[arg(
+        long,
+        value_name = "FIXTURE",
+        conflicts_with_all = [
+            "project",
+            "config",
+            "scenario",
+            "function",
+            "target",
+            "whole_project",
+            "allow_default_inputs",
+            "out",
+            "coverage",
+            "log",
+            "overrides",
+            "diff"
+        ]
+    )]
+    conformance: Vec<PathBuf>,
+
+    /// Fail a conformance suite that contains no passing M1 Sim capture.
+    /// Ordinary CI omits this flag and runs the committed synthetic fixtures.
+    #[arg(long, requires = "conformance")]
+    require_m1_sim_capture: bool,
+
     /// Project.m1prj (defaults to the nearest one upward, or $M1_PROJECT).
     #[arg(long)]
     project: Option<PathBuf>,
@@ -182,6 +210,31 @@ fn apply_mode_override(
 
 fn main() {
     let args = Args::parse();
+
+    if !args.conformance.is_empty() {
+        let options = ConformanceOptions {
+            require_m1_sim_capture: args.require_m1_sim_capture,
+        };
+        match run_conformance_suite(&args.conformance, options) {
+            Ok(reports) => {
+                for report in &reports {
+                    println!(
+                        "PASS {} ({} steps, {} assertions, {})",
+                        report.name,
+                        report.steps_checked,
+                        report.assertions_checked,
+                        report.provenance
+                    );
+                }
+                println!("conformance: {} fixture(s) passed", reports.len());
+            }
+            Err(error) => {
+                eprintln!("m1-eval: {error}");
+                process::exit(1);
+            }
+        }
+        return;
+    }
 
     // Resolve the project; no project at all is a usage error (exit 2).
     let Some(project_path) = resolve_project(args.project) else {

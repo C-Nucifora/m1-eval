@@ -1,0 +1,8 @@
+// Synthetic conformance runner fixture. No proprietary content.
+Bool Out = Bool In;
+Signed Out = Signed In;
+Unsigned Out = Unsigned In;
+Float Out = Float In;
+Fixed Out = Fixed In;
+Enum Out = Enum In;
+String Out = String In;

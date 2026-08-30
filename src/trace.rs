@@ -3,10 +3,12 @@
 //! time axis, plus a per-expression value sink for introspection.
 //!
 //! A `Trace` is column-oriented. One shared [`Trace::time`] axis (`Vec<f64>`)
-//! gives the tick instants; each channel and each recorded expression keeps a
-//! `Vec<Value>` aligned to that axis. The runner calls [`Trace::push_tick`] once
-//! per tick to extend the time axis, then [`Trace::record_channel`] /
-//! [`Trace::record_expr`] for every value produced during that tick.
+//! gives the tick instants; channel and expression values use compatibility
+//! `Vec<Value>` columns. The runner calls [`Trace::push_tick`] once per tick to
+//! extend the time axis, then [`Trace::record_channel`] /
+//! [`Trace::record_expr`] for every value produced during that tick. Channel
+//! records also retain an internal tick index and value provenance so consumers
+//! that require exact alignment do not have to infer it from column length.
 //!
 //! ## Per-expression sink
 //!
@@ -17,10 +19,11 @@
 //!
 //! ## Externally-driven channels
 //!
-//! Scenario values, adapters, and hardware stubs produce values the engine did
-//! not compute. Those call names are flagged in [`Trace::external`].
-//! [`Trace::hardware`] adds the resolved receiver, exact call site, and selected
-//! route. Deterministic `System` calls have provenance but are not external.
+//! Scenario inputs, held initial state, adapters, and hardware stubs produce
+//! values the engine did not compute. Those channel or call names are flagged in
+//! [`Trace::external`]. [`Trace::hardware`] adds the resolved receiver, exact
+//! call site, and selected route. Deterministic `System` calls have provenance
+//! but are not external.
 //!
 //! Internal channel and expression columns retain their M1 scalar family. The
 //! established JSON and CSV formats are untyped compatibility outputs, so they
@@ -37,8 +40,11 @@ use std::collections::{BTreeMap, BTreeSet};
 pub struct Trace {
     /// The shared tick time axis, in seconds. One entry per tick.
     pub time: Vec<f64>,
-    /// Channel value columns, keyed by canonical path. Each column is aligned to
-    /// [`Trace::time`]. A `BTreeMap` keeps channel order deterministic.
+    /// Channel value columns, keyed by canonical path. Runner-held columns are
+    /// dense after their first value; a channel first written mid-run cannot
+    /// represent its empty prefix in this compatibility shape. A `BTreeMap`
+    /// keeps channel order deterministic, while internal tick metadata retains
+    /// exact alignment.
     pub channels: BTreeMap<String, Vec<Value>>,
     /// Per-expression value columns, keyed by `(script_name, byte_offset)`. Used
     /// by the value overlay; sparse (only expressions the sink recorded appear).
@@ -56,6 +62,16 @@ pub struct Trace {
     /// Structured source records for hardware-backed call sites. A set keeps
     /// repeated ticks compact while retaining every route a site used.
     pub hardware: BTreeSet<HardwareProvenance>,
+    /// Final channel value and provenance for each tick that recorded one.
+    /// Kept separately from the compatibility columns, whose public shape
+    /// cannot represent a missing value before a channel first appears.
+    channel_ticks: BTreeMap<String, BTreeMap<usize, ChannelTick>>,
+}
+
+#[derive(Debug, Clone, PartialEq)]
+struct ChannelTick {
+    value: Value,
+    external: bool,
 }
 
 /// One reported default substitution: what value was substituted and which
@@ -80,12 +96,95 @@ impl Trace {
         self.time.push(t);
     }
 
-    /// Record a channel value for the current (most recent) tick. A channel seen
-    /// for the first time mid-run is back-filled so its column stays aligned to
-    /// the time axis: earlier ticks get no entry, so we left-pad nothing and
-    /// simply append; callers that need dense columns record every tick.
+    /// Record an evaluator-computed channel value for the current tick. Multiple
+    /// assignments on one tick replace that tick's prior value, leaving the
+    /// final assignment as the observable end-of-tick value. A channel first
+    /// seen mid-run remains sparse in the public compatibility column; exact
+    /// consumers use the retained tick index through the crate-private accessors.
     pub fn record_channel(&mut self, path: impl Into<String>, value: Value) {
-        self.channels.entry(path.into()).or_default().push(value);
+        self.record_channel_tick(path.into(), value, false);
+    }
+
+    /// Record an externally supplied channel value for the current tick.
+    pub(crate) fn record_external_channel(&mut self, path: impl Into<String>, value: Value) {
+        let path = path.into();
+        self.record_channel_tick(path.clone(), value, true);
+        self.mark_external(path);
+    }
+
+    /// Record a zero-order hold, preserving the most recent value's provenance.
+    /// With no prior sample, the value came from an executed startup function:
+    /// scenario inputs and initial state are recorded explicitly before holds.
+    pub(crate) fn record_held_channel(&mut self, path: impl Into<String>, value: Value) {
+        let path = path.into();
+        let tick = self.time.len().checked_sub(1);
+        let external = tick
+            .and_then(|tick| {
+                self.channel_ticks
+                    .get(&path)
+                    .and_then(|samples| samples.range(..tick).next_back())
+                    .map(|(_, sample)| sample.external)
+            })
+            .unwrap_or_else(|| self.external.contains(&path));
+        self.record_channel_tick(path, value, external);
+    }
+
+    fn record_channel_tick(&mut self, path: String, value: Value, external: bool) {
+        let Some(tick) = self.time.len().checked_sub(1) else {
+            // Direct evaluator unit harnesses can record without opening a tick.
+            self.channels.entry(path).or_default().push(value);
+            return;
+        };
+        let replaced = self
+            .channel_ticks
+            .entry(path.clone())
+            .or_default()
+            .insert(
+                tick,
+                ChannelTick {
+                    value: value.clone(),
+                    external,
+                },
+            )
+            .is_some();
+        let column = self.channels.entry(path).or_default();
+        if replaced && let Some(previous) = column.last_mut() {
+            *previous = value;
+        } else {
+            column.push(value);
+        }
+    }
+
+    /// Whether the channel already has a final value for the open tick.
+    pub(crate) fn has_channel_value_at_current_tick(&self, path: &str) -> bool {
+        self.time.len().checked_sub(1).is_some_and(|tick| {
+            self.channel_ticks
+                .get(path)
+                .is_some_and(|samples| samples.contains_key(&tick))
+        })
+    }
+
+    /// The final channel value recorded at one exact tick.
+    pub(crate) fn channel_value_at_tick(&self, path: &str, tick: usize) -> Option<&Value> {
+        self.channel_ticks
+            .get(path)
+            .and_then(|samples| samples.get(&tick))
+            .map(|sample| &sample.value)
+            .or_else(|| {
+                self.channels
+                    .get(path)
+                    .filter(|column| column.len() == self.time.len())
+                    .and_then(|column| column.get(tick))
+            })
+    }
+
+    /// Whether the exact tick value came from an external source.
+    pub(crate) fn channel_is_external_at_tick(&self, path: &str, tick: usize) -> bool {
+        self.channel_ticks
+            .get(path)
+            .and_then(|samples| samples.get(&tick))
+            .map(|sample| sample.external)
+            .unwrap_or_else(|| self.external.contains(path))
     }
 
     /// Record the value of one expression occurrence (keyed by its
@@ -107,7 +206,16 @@ impl Trace {
 
     /// Flag a channel or hardware call name as externally driven.
     pub fn mark_external(&mut self, path: impl Into<String>) {
-        self.external.insert(path.into());
+        let path = path.into();
+        self.external.insert(path.clone());
+        if let Some(tick) = self.time.len().checked_sub(1)
+            && let Some(sample) = self
+                .channel_ticks
+                .get_mut(&path)
+                .and_then(|samples| samples.get_mut(&tick))
+        {
+            sample.external = true;
+        }
     }
 
     /// Whether a channel is flagged externally driven.

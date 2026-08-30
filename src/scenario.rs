@@ -91,6 +91,20 @@ pub struct InputSeries {
     pub kind: InputKind,
 }
 
+/// One value present in the evaluator's channel store before startup code or
+/// the first periodic tick runs.
+///
+/// Unlike an [`InputSeries`], this value is seeded once. It can initialise a
+/// channel that the evaluated scripts later update without pinning that channel
+/// back to the captured value on every tick.
+#[derive(Debug, Clone, PartialEq)]
+pub struct InitialValue {
+    /// The channel path to seed.
+    pub channel: String,
+    /// Its typed initial value.
+    pub value: Value,
+}
+
 /// A constant value or a `(t, value)` time series.
 #[derive(Debug, Clone, PartialEq)]
 pub enum InputKind {
@@ -175,6 +189,10 @@ fn sample_series(points: &[(f64, Value)], t: f64) -> Value {
 pub struct Scenario {
     /// Which runner and target.
     pub mode: RunMode,
+    /// Values seeded once before startup code and the first tick. These model a
+    /// captured evaluator state, while [`Scenario::inputs`] model values driven
+    /// throughout the run.
+    pub initial_state: Vec<InitialValue>,
     /// Externally-driven input sources (constants + series).
     pub inputs: Vec<InputSeries>,
     /// Total run duration in seconds. Ticks span `[0, duration_s)`.
@@ -479,6 +497,8 @@ struct RawScenario {
     #[serde(default)]
     base_rate_hz: f64,
     #[serde(default)]
+    initial_state: Vec<RawInitialValue>,
+    #[serde(default)]
     inputs: Vec<RawInput>,
     #[serde(default)]
     overrides: Vec<RawInput>,
@@ -488,6 +508,13 @@ struct RawScenario {
     /// fail-loud when absent/false).
     #[serde(default)]
     allow_default_inputs: bool,
+}
+
+/// A raw one-time channel seed.
+#[derive(Debug, Deserialize)]
+struct RawInitialValue {
+    channel: String,
+    value: RawValue,
 }
 
 /// A raw input/override entry: a channel plus exactly one of `const`/`series`.
@@ -673,6 +700,16 @@ impl RawScenario {
             .into_iter()
             .map(RawInput::into_input)
             .collect::<Result<Vec<_>, _>>()?;
+        let initial_state = self
+            .initial_state
+            .into_iter()
+            .map(|initial| {
+                initial.value.into_value().map(|value| InitialValue {
+                    channel: initial.channel,
+                    value,
+                })
+            })
+            .collect::<Result<Vec<_>, _>>()?;
         let overrides = self
             .overrides
             .into_iter()
@@ -703,6 +740,7 @@ impl RawScenario {
         }
         Ok(Scenario {
             mode,
+            initial_state,
             inputs,
             duration_s: self.duration_s,
             base_rate_hz: self.base_rate_hz,
@@ -1227,6 +1265,30 @@ const = { fixed_raw = 12345678 }
                 12_345_678
             )))
         );
+    }
+
+    #[test]
+    fn initial_state_is_typed_and_kept_separate_from_inputs() {
+        let scenario = Scenario::from_toml_str(
+            r#"
+mode = "whole-project"
+duration_s = 0.1
+
+[[initial_state]]
+channel = "Counter"
+value = { integer = 10 }
+
+[[inputs]]
+channel = "Sensor"
+const = { unsigned = 20 }
+"#,
+        )
+        .expect("scenario with initial state parses");
+        assert_eq!(scenario.initial_state.len(), 1);
+        assert_eq!(scenario.initial_state[0].channel, "Counter");
+        assert_eq!(scenario.initial_state[0].value, Value::m1_integer(10));
+        assert_eq!(scenario.inputs.len(), 1);
+        assert_eq!(scenario.inputs[0].sample(0.0), Value::m1_unsigned(20));
     }
 
     #[test]

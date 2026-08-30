@@ -1,0 +1,60 @@
+# SPDX-License-Identifier: GPL-3.0-or-later
+# Hand-derived fixture for runner tests. This is not M1 Sim evidence.
+schema_version = 1
+name = "synthetic mini calculation"
+calculation_rate_hz = 100.0
+
+[project]
+root = "../mini"
+project = "Project.m1prj"
+config = "parameters.m1cfg"
+
+[[project.files]]
+path = "Project.m1prj"
+sha256 = "9e9dcd16bd3f11a2347b8d273ee1932fd02aa78e54e57ce312b11e605e2f6607"
+
+[[project.files]]
+path = "Scripts/Demo.Update.m1scr"
+sha256 = "687fb0e0ac83f5a0c689a9769d82fbf97de4f3250216ea2e5947a4c18b936f09"
+
+[[project.files]]
+path = "parameters.m1cfg"
+sha256 = "d81ad7d8f6df9ae33b199425a663e2f08a428e0e60433d3e1dc3f6a945d5c664"
+
+[provenance]
+kind = "synthetic"
+source = "tests/fixtures/mini, Output = Speed * calibrated Gain"
+procedure = "docs/conformance.md#synthetic-runner-fixtures"
+notes = "Expected values are hand-derived and do not establish M1 compatibility."
+
+[run]
+mode = "function"
+target = "Demo.Update"
+
+[[steps]]
+time_s = 0.0
+
+[[steps.inputs]]
+channel = "Root.Demo.Speed"
+value = { type = "floating-point", value = "20" }
+
+[[steps.expected]]
+channel = "Root.Demo.Output"
+value = { type = "floating-point", value = "50" }
+tolerance = { type = "floating-point", absolute = "0", relative = "0" }
+
+[[steps]]
+time_s = 0.01
+
+[[steps.expected]]
+channel = "Root.Demo.Output"
+value = { type = "floating-point", value = "50" }
+tolerance = { type = "floating-point", absolute = "0", relative = "0" }
+
+[[steps]]
+time_s = 0.02
+
+[[steps.expected]]
+channel = "Root.Demo.Output"
+value = { type = "floating-point", value = "50" }
+tolerance = { type = "floating-point", absolute = "0", relative = "0" }

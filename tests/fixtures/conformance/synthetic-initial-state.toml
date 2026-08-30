@@ -1,0 +1,150 @@
+# SPDX-License-Identifier: GPL-3.0-or-later
+# Hand-derived fixture for initial-state and scheduler tests. Not M1 Sim evidence.
+schema_version = 1
+name = "synthetic initial-state counters"
+calculation_rate_hz = 1000.0
+
+[project]
+root = "../ratemix"
+project = "Project.m1prj"
+
+[[project.files]]
+path = "Project.m1prj"
+sha256 = "c111e89d023ac75a29dcbe7324a2b48f8b3e2f1000bd39282046ed35b5656521"
+
+[[project.files]]
+path = "Scripts/RX.Fast Counter.m1scr"
+sha256 = "c8a17f4ee666506236a82cbee625f9ba533bfd24b5eb0ed64e968eae921eb262"
+
+[[project.files]]
+path = "Scripts/RX.Mid Counter.m1scr"
+sha256 = "c24ec37f34eb727f2349b41b934f5e25f1246887422f8f7738e9c7e6a6c7ec57"
+
+[provenance]
+kind = "synthetic"
+source = "tests/fixtures/ratemix, counters seeded at non-zero values"
+procedure = "docs/conformance.md#synthetic-runner-fixtures"
+notes = "Expected values test one-time state seeding and do not establish M1 compatibility."
+
+[run]
+mode = "whole-project"
+
+[[initial_state]]
+channel = "Root.RX.Fast Count"
+value = { type = "floating-point", value = "10" }
+
+[[initial_state]]
+channel = "Root.RX.Mid Count"
+value = { type = "floating-point", value = "20" }
+
+[[initial_state]]
+channel = "Root.RX.Seed"
+value = { type = "floating-point", value = "2" }
+
+[[steps]]
+time_s = 0.0
+
+[[steps.expected]]
+channel = "Root.RX.Fast Count"
+value = { type = "floating-point", value = "11" }
+tolerance = { type = "floating-point", absolute = "0" }
+
+[[steps.expected]]
+channel = "Root.RX.Mid Count"
+value = { type = "floating-point", value = "21" }
+tolerance = { type = "floating-point", absolute = "0" }
+
+[[steps.expected]]
+channel = "Root.RX.Mid Total"
+value = { type = "floating-point", value = "0" }
+tolerance = { type = "floating-point", absolute = "0" }
+
+[[steps]]
+time_s = 0.001
+
+[[steps.expected]]
+channel = "Root.RX.Fast Count"
+value = { type = "floating-point", value = "11" }
+tolerance = { type = "floating-point", absolute = "0" }
+
+[[steps.expected]]
+channel = "Root.RX.Mid Count"
+value = { type = "floating-point", value = "21" }
+tolerance = { type = "floating-point", absolute = "0" }
+
+[[steps.expected]]
+channel = "Root.RX.Mid Total"
+value = { type = "floating-point", value = "0" }
+tolerance = { type = "floating-point", absolute = "0" }
+
+[[steps]]
+time_s = 0.002
+
+[[steps.expected]]
+channel = "Root.RX.Fast Count"
+value = { type = "floating-point", value = "12" }
+tolerance = { type = "floating-point", absolute = "0" }
+
+[[steps.expected]]
+channel = "Root.RX.Mid Count"
+value = { type = "floating-point", value = "21" }
+tolerance = { type = "floating-point", absolute = "0" }
+
+[[steps.expected]]
+channel = "Root.RX.Mid Total"
+value = { type = "floating-point", value = "0" }
+tolerance = { type = "floating-point", absolute = "0" }
+
+[[steps]]
+time_s = 0.003
+
+[[steps.expected]]
+channel = "Root.RX.Fast Count"
+value = { type = "floating-point", value = "12" }
+tolerance = { type = "floating-point", absolute = "0" }
+
+[[steps.expected]]
+channel = "Root.RX.Mid Count"
+value = { type = "floating-point", value = "21" }
+tolerance = { type = "floating-point", absolute = "0" }
+
+[[steps.expected]]
+channel = "Root.RX.Mid Total"
+value = { type = "floating-point", value = "0" }
+tolerance = { type = "floating-point", absolute = "0" }
+
+[[steps]]
+time_s = 0.004
+
+[[steps.expected]]
+channel = "Root.RX.Fast Count"
+value = { type = "floating-point", value = "13" }
+tolerance = { type = "floating-point", absolute = "0" }
+
+[[steps.expected]]
+channel = "Root.RX.Mid Count"
+value = { type = "floating-point", value = "21" }
+tolerance = { type = "floating-point", absolute = "0" }
+
+[[steps.expected]]
+channel = "Root.RX.Mid Total"
+value = { type = "floating-point", value = "0" }
+tolerance = { type = "floating-point", absolute = "0" }
+
+[[steps]]
+time_s = 0.005
+
+[[steps.expected]]
+channel = "Root.RX.Fast Count"
+value = { type = "floating-point", value = "13" }
+tolerance = { type = "floating-point", absolute = "0" }
+
+[[steps.expected]]
+channel = "Root.RX.Mid Count"
+value = { type = "floating-point", value = "22" }
+tolerance = { type = "floating-point", absolute = "0" }
+
+[[steps.expected]]
+channel = "Root.RX.Mid Total"
+value = { type = "floating-point", value = "0.01" }
+tolerance = { type = "floating-point", absolute = "0.0000001" }

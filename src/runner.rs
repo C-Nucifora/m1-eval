@@ -48,7 +48,7 @@ use crate::hardware::{EvalTime, HardwareAdapter};
 use crate::ident::{Target, classify};
 use crate::loader::Loaded;
 use crate::log::Log;
-use crate::scenario::{InputSeries, IoSeries, RunMode, Scenario};
+use crate::scenario::{InitialValue, InputSeries, IoSeries, RunMode, Scenario};
 use crate::stmt::exec_script_with_runtime;
 use crate::summary::io_sets;
 use crate::trace::Trace;
@@ -489,6 +489,17 @@ fn tick_loop(
     let scope_fn = schedule.first().and_then(|s| s.sched.fn_symbol.as_deref());
     let inputs = canonicalise(&scenario.inputs, loaded, scope_group, scope_fn);
     let overrides = canonicalise(&scenario.overrides, loaded, scope_group, scope_fn);
+    let initial_state =
+        canonicalise_initial(&scenario.initial_state, loaded, scope_group, scope_fn);
+
+    // Initial state is a one-time seed. It is present for On-Startup code and
+    // the first periodic tick, but unlike a scenario input it is not written
+    // back on every tick. Scripts may therefore advance a captured accumulator
+    // or counter from this value.
+    for (path, initial) in &initial_state {
+        let value = crate::expr::coerce_for_channel(path, initial.value.clone(), &loaded.project)?;
+        env.set(path.clone(), value);
+    }
 
     // Run every On-Startup function exactly once, before the periodic grid —
     // the ECU's initialisation pass. Inputs/overrides are seeded at t = 0 first
@@ -496,6 +507,7 @@ fn tick_loop(
     // shared env (no trace tick is open yet) and surface via the zero-order
     // hold from tick 0 on. dt is the base period — startup code has no rate of
     // its own, and its stateful operators see one nominal step.
+    let mut startup_written = BTreeSet::new();
     if !startup.is_empty() {
         // Startup has no time-axis row. Capture hardware metadata separately so
         // its provenance survives while startup channel/expression samples do
@@ -525,6 +537,9 @@ fn tick_loop(
                 signature_m1_types: Some(&loaded.signature_m1_types),
                 object_rules: Some(&loaded.object_rules),
                 depth: 0,
+                // A throwaway startup sink captures which assignments actually
+                // executed. Their values surface on the real tick-0 trace
+                // through the zero-order hold below.
                 trace: Some(&mut startup_trace),
             };
             let mut runtime = EvalRuntime {
@@ -537,6 +552,7 @@ fn tick_loop(
             exec_script_with_runtime(&root, &mut ctx, &mut runtime)
                 .map_err(|e| e.in_script(&sched.script.name, None))?;
         }
+        startup_written.extend(startup_trace.channels.keys().cloned());
         trace.external.extend(startup_trace.external);
         trace.hardware.extend(startup_trace.hardware);
     }
@@ -601,31 +617,41 @@ fn tick_loop(
                 .map_err(|e| e.in_script(&sched.script.name, Some(t)))?;
         }
 
-        // 4. Record any channel a scheduled function *holds* this tick (it did not
-        //    run, so the executor wrote nothing) by repeating its current env
-        //    value, plus the seeded inputs/overrides. This keeps every column
-        //    aligned to the time axis with the zero-order-hold value. Two passes:
-        //    the static scheduled-write set, then every channel that already has a
-        //    trace column — the latter catches channels written only by *inline*
-        //    user-function callees (e.g. a `Service Bits.Update` push, whose backing
-        //    function carries no schedule rate), which are not in the static set but
-        //    must still hold dense once they have appeared.
-        hold_unwritten_channels(&scheduled_writes, &env, &mut trace);
-        hold_trace_channels(&env, &mut trace);
+        // 4. Preserve value provenance before filling scheduled zero-order holds.
+        //    A statically known assignment may be conditional and may not have run
+        //    on this tick. In that case an input or as-yet-uncomputed initial seed
+        //    remains external even though the channel appears in `scheduled_writes`.
         for (path, series) in inputs.iter().chain(overrides.iter()) {
             // Only record if the executor did not already record this channel this
             // tick (assignment targets are recorded by the statement executor).
-            let already = trace
-                .channels
-                .get(path)
-                .map(|c| c.len() == trace.time.len())
-                .unwrap_or(false);
+            let already = trace.has_channel_value_at_current_tick(path);
             if !already {
                 let v = env.get(path).cloned().unwrap_or_else(|| series.sample(t));
-                trace.record_channel(path.clone(), v);
-                trace.mark_external(path.clone());
+                trace.record_external_channel(path.clone(), v);
             }
         }
+        // Initial state is only external until the evaluator first computes the
+        // channel. Later non-running ticks hold that computed value rather than
+        // reverting its provenance to the one-time seed.
+        for (path, _) in &initial_state {
+            if !trace.has_channel_value_at_current_tick(path)
+                && let Some(value) = env.get(path).cloned()
+            {
+                if i == 0 && startup_written.contains(path) {
+                    trace.record_channel(path.clone(), value);
+                } else if i > 0 && trace.channel_value_at_tick(path, i - 1).is_some() {
+                    trace.record_held_channel(path.clone(), value);
+                } else {
+                    trace.record_external_channel(path.clone(), value);
+                }
+            }
+        }
+
+        // 5. Record any channel a scheduled function *holds* this tick (it did not
+        //    run, so the executor wrote nothing) by repeating its current env
+        //    value. Two passes keep static scheduled writes and inline callees dense.
+        hold_unwritten_channels(&scheduled_writes, &env, &mut trace);
+        hold_trace_channels(&env, &mut trace);
     }
 
     Ok(trace)
@@ -708,16 +734,12 @@ fn schedule_writes(loaded: &Loaded, schedule: &[ScheduledRated]) -> BTreeSet<Str
 /// (never written) is skipped — it simply has no column until first written.
 fn hold_unwritten_channels(writes: &BTreeSet<String>, env: &Env, trace: &mut Trace) {
     for path in writes {
-        let already = trace
-            .channels
-            .get(path)
-            .map(|c| c.len() == trace.time.len())
-            .unwrap_or(false);
+        let already = trace.has_channel_value_at_current_tick(path);
         if already {
             continue;
         }
         if let Some(v) = env.get(path).cloned() {
-            trace.record_channel(path.clone(), v);
+            trace.record_held_channel(path.clone(), v);
         }
     }
 }
@@ -729,18 +751,17 @@ fn hold_unwritten_channels(writes: &BTreeSet<String>, env: &Env, trace: &mut Tra
 /// functions carry no schedule rate, so they are not in the static set — once they
 /// have first appeared, keeping every column dense over the tick grid.
 fn hold_trace_channels(env: &Env, trace: &mut Trace) {
-    let len = trace.time.len();
     // Collect the lagging channels first to avoid borrowing `trace.channels` while
     // recording into it.
     let lagging: Vec<String> = trace
         .channels
         .iter()
-        .filter(|(_, col)| col.len() < len)
+        .filter(|(path, _)| !trace.has_channel_value_at_current_tick(path))
         .map(|(path, _)| path.clone())
         .collect();
     for path in lagging {
         if let Some(v) = env.get(&path).cloned() {
-            trace.record_channel(path, v);
+            trace.record_held_channel(path, v);
         }
     }
 }
@@ -768,13 +789,41 @@ fn canonicalise<'a>(
     series
         .iter()
         .map(|s| {
-            let canon = match classify(&s.channel, group, fn_symbol, &loaded.project, &no_locals) {
-                Target::Symbol(p) => p,
-                _ => s.channel.clone(),
-            };
+            let canon = canonical_channel(&s.channel, loaded, group, fn_symbol, &no_locals);
             (canon, s)
         })
         .collect()
+}
+
+/// Canonicalise one-time initial-state entries with the same path rules used by
+/// continuously-driven inputs.
+fn canonicalise_initial<'a>(
+    values: &'a [InitialValue],
+    loaded: &Loaded,
+    group: Option<&str>,
+    fn_symbol: Option<&str>,
+) -> Vec<(String, &'a InitialValue)> {
+    let no_locals = HashMap::new();
+    values
+        .iter()
+        .map(|value| {
+            let canon = canonical_channel(&value.channel, loaded, group, fn_symbol, &no_locals);
+            (canon, value)
+        })
+        .collect()
+}
+
+fn canonical_channel(
+    channel: &str,
+    loaded: &Loaded,
+    group: Option<&str>,
+    fn_symbol: Option<&str>,
+    no_locals: &HashMap<String, Value>,
+) -> String {
+    match classify(channel, group, fn_symbol, &loaded.project, no_locals) {
+        Target::Symbol(path) => path,
+        _ => channel.to_string(),
+    }
 }
 
 /// Resolve a function-mode target name to its scheduled function. The name may be
@@ -1291,32 +1340,22 @@ fn run_counterfactual_inner(
         //    the logged channels and the overrides — so the trace is a dense grid
         //    with the logged value on every pass-through channel and the recomputed
         //    value on every cone channel.
-        hold_unwritten_channels(&scheduled_writes, &env, &mut trace);
-        hold_trace_channels(&env, &mut trace);
         for (path, series) in &log_inputs {
-            let already = trace
-                .channels
-                .get(path)
-                .map(|c| c.len() == trace.time.len())
-                .unwrap_or(false);
+            let already = trace.has_channel_value_at_current_tick(path);
             if !already {
                 let v = env.get(path).cloned().unwrap_or_else(|| series.sample(t));
-                trace.record_channel(path.clone(), v);
-                trace.mark_external(path.clone());
+                trace.record_external_channel(path.clone(), v);
             }
         }
         for ov in &prepared {
             let path = ov.channel();
-            let already = trace
-                .channels
-                .get(path)
-                .map(|c| c.len() == trace.time.len())
-                .unwrap_or(false);
+            let already = trace.has_channel_value_at_current_tick(path);
             if !already && let Some(v) = env.get(path).cloned() {
-                trace.record_channel(path.to_string(), v);
-                trace.mark_external(path.to_string());
+                trace.record_external_channel(path.to_string(), v);
             }
         }
+        hold_unwritten_channels(&scheduled_writes, &env, &mut trace);
+        hold_trace_channels(&env, &mut trace);
     }
 
     Ok(trace)
@@ -1493,6 +1532,7 @@ mod tests {
         let loaded = load(&dir.join("Project.m1prj"), None).expect("enums fixture loads");
         let scenario = Scenario {
             mode: RunMode::Function("Demo.Report".to_string()),
+            initial_state: vec![],
             duration_s: 0.02,
             base_rate_hz: 100.0,
             inputs: vec![InputSeries {
@@ -1521,6 +1561,7 @@ mod tests {
         let loaded = mini();
         let scenario = Scenario {
             mode: RunMode::Function("Demo.Update".to_string()),
+            initial_state: vec![],
             duration_s: 1.0,
             base_rate_hz: 10.0,
             inputs: vec![InputSeries {
@@ -1550,6 +1591,7 @@ mod tests {
         let loaded = mini();
         let scenario = Scenario {
             mode: RunMode::Function("Demo.Update".to_string()),
+            initial_state: vec![],
             duration_s: 0.02,
             base_rate_hz: 100.0,
             inputs: vec![],
@@ -1748,6 +1790,10 @@ mode = "whole-project"
 duration_s = 0.05
 base_rate_hz = 100.0
 
+[[initial_state]]
+channel = "Root.MR.Started"
+value = { floating_point = 99.0 }
+
 [[inputs]]
 channel = "Root.MR.Seed"
 const = 3.0
@@ -1765,7 +1811,63 @@ const = 6.0
         assert_eq!(started.len(), 5, "held across every tick");
         assert!(
             started.iter().all(|v| *v == Value::m1_float(1.0)),
-            "startup ran once and its output holds: {started:?}"
+            "startup overwrote the seed once and its output holds: {started:?}"
+        );
+        assert!(
+            (0..trace.time.len())
+                .all(|tick| !trace.channel_is_external_at_tick("Root.MR.Started", tick)),
+            "startup-written values retain computed provenance"
+        );
+    }
+
+    #[test]
+    fn startup_external_hardware_sources_are_retained_on_the_real_trace() {
+        let temp = tempfile::tempdir().expect("temp project");
+        let scripts = temp.path().join("Scripts");
+        std::fs::create_dir(&scripts).expect("create scripts directory");
+        std::fs::write(
+            temp.path().join("Project.m1prj"),
+            r#"<?xml version="1.0"?>
+<MoTeCM1BuildSession>
+ <Project Name="Startup External" TargetHardware="ecu120">
+  <ComponentStream><List>
+   <Component Classname="BuiltIn.GroupCompound" Name="Root.T"/>
+   <Component Classname="BuiltIn.GroupCompound" Name="Root.Events"/>
+   <Component Classname="BuiltIn.EventKernel" Name="Root.Events.On Startup"/>
+   <Component Classname="BuiltIn.Channel" Name="Root.T.Started"><Props Type="f32"/></Component>
+   <Component Classname="BuiltIn.FuncUser" Filename="T.Init.m1scr" Name="Root.T.Init">
+    <Props SelectedTrigger="Root.Events.On Startup"/>
+   </Component>
+  </List></ComponentStream>
+ </Project>
+</MoTeCM1BuildSession>
+"#,
+        )
+        .expect("write project");
+        std::fs::write(
+            scripts.join("T.Init.m1scr"),
+            "Started = CanComms.GetFloat(1u, 2);\n",
+        )
+        .expect("write startup script");
+        let loaded = load(&temp.path().join("Project.m1prj"), None).expect("project loads");
+        let scenario = Scenario::from_toml_str(
+            r#"
+mode = "whole-project"
+duration_s = 0.01
+base_rate_hz = 100.0
+"#,
+        )
+        .expect("scenario parses");
+
+        let trace = run(&loaded, &scenario).expect("startup run succeeds");
+        assert!(trace.external.contains("CanComms.GetFloat"));
+        assert!(trace.hardware.iter().any(|item| {
+            item.source_call == "CanComms.GetFloat"
+                && item.source == crate::hardware::HardwareValueSource::GenericStub
+        }));
+        assert_eq!(
+            trace.channel_value_at_tick("Root.T.Started", 0),
+            Some(&Value::m1_float(0.0))
         );
     }
 

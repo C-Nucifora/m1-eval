@@ -2,8 +2,8 @@
 # m1-eval — CLI reference
 
 `m1-eval` is a thin command-line shell over the evaluator library. It loads a
-project (and optional `.m1cfg` calibration), then either evaluates a scenario
-into a `Trace` or prints the static coverage report.
+project and evaluates a scenario, replays a counterfactual log, reports static
+coverage, or runs typed conformance fixtures.
 
 ```
 m1-eval [--project P] [--config C]
@@ -12,12 +12,16 @@ m1-eval [--project P] [--config C]
         [--log L.csv|L.ld [--override CH=expr]... [--diff diff.json|diff.csv]
                           [--out trace.json|trace.csv]]
         [--coverage]
+m1-eval --conformance FIXTURE [--conformance FIXTURE]...
+        [--require-m1-sim-capture]
 ```
 
 ## Flags
 
 | Flag | Meaning |
 | --- | --- |
+| `--conformance <PATH>` | Run a typed TOML or JSON golden-vector fixture. Repeatable. The fixture supplies its project paths and hashes, so this action conflicts with the ordinary project/run/report flags. |
+| `--require-m1-sim-capture` | Fail a conformance suite that contains no passing fixture with `m1-sim` provenance. Requires `--conformance`. |
 | `--project <PATH>` | The `Project.m1prj`. Defaults to the nearest one upward from the cwd, or `$M1_PROJECT`. |
 | `--config <PATH>` | The calibration file (`.m1cfg`) supplying parameter values and table cells. Required for actual tunable and table values. Without it, parameters use externally-driven type defaults; table reads fail unless whole-project mode opts in to default inputs, which supplies an external `0.0`. |
 | `--scenario <PATH>` | The scenario file (TOML or JSON; parser chosen by extension) describing how to drive the run. |
@@ -33,8 +37,10 @@ m1-eval [--project P] [--config C]
 | `--version`, `-V` | Print the version and exit `0`. |
 | `--help`, `-h` | Print usage and exit `0`. |
 
-A run requires `--scenario` (to evaluate), `--log` (to replay a log), or
-`--coverage` (to report); with none, the invocation is incomplete and exits `2`.
+A normal project action requires `--scenario` (to evaluate), `--log` (to replay
+a log), or `--coverage` (to report). A conformance suite is a separate action
+and carries its own project bundle. With no action, the invocation is incomplete
+and exits `2`.
 `--function` / `--target` / `--whole-project` override the `mode`/`target`
 declared in the scenario file; at most one may be given (combining two is a usage
 error, exit `2`). `--override` and `--diff` require `--log`.
@@ -64,6 +70,12 @@ base_rate_hz = 100.0         # base tick rate; dt = 1 / base_rate_hz. In
 allow_default_inputs = false # whole-project only: opt-in default substitution
                              # for unseeded channel reads (reported; strict
                              # fail-loud when absent/false)
+
+# Seed a channel once before startup code and tick zero. Unlike an input, this
+# is not written back every tick, so a script may advance it.
+[[initial_state]]
+channel = "Root.Engine.Counter"
+value = { integer = 10 }
 
 # Inputs the engine is *given* rather than computes. Each entry is a constant
 # or a (t_seconds, value) time series sampled by zero-order hold.
@@ -110,6 +122,17 @@ const = 1048576
 Identifiers may contain spaces (e.g. `Cooling Fan.Output`); channel names are
 used verbatim and never split on whitespace, only on `.` for path segments.
 
+## Conformance fixtures
+
+Conformance fixtures use a stricter typed wire format than scenarios. They
+record project hashes, provenance, the calculation rate, initial state, every
+tick's input changes, expected outputs, and type-specific tolerances. The runner
+starts with fresh evaluator state for every fixture and reports the first
+meaningful mismatch.
+
+See [`conformance.md`](conformance.md) for the schema, comparison rules, M1 Sim
+capture procedure, synthetic examples, and the optional private-capture gate.
+
 ## Output
 
 - **JSON** (`--out trace.json`, or no `--out`):
@@ -118,10 +141,10 @@ used verbatim and never split on whitespace, only on `.` for path segments.
   script, byte offset, and selected route (`scenario-exact`,
   `scenario-wildcard`, `adapter`, `system-model`, or `generic-stub`). The
   `external` list names channels whose values were externally driven rather than
-  computed, including scenario inputs, Tier-3 stubs, parameter defaults, opt-in
-  table fallbacks, and opt-in defaults for unseeded channels. JSON has no
-  non-finite numeric values, so NaN and positive or negative infinity are written
-  as `null`.
+  computed, including scenario inputs, held initial state, Tier-3 stubs,
+  parameter defaults, opt-in table fallbacks, and opt-in defaults for unseeded
+  channels. JSON has no non-finite numeric values, so NaN and positive or
+  negative infinity are written as `null`.
 - **CSV** (`--out trace.csv`): a `time` header column followed by one column per
   channel in sorted-name order, one row per tick.
 
@@ -133,9 +156,9 @@ These follow the shared toolchain contract (`m1-tools/docs/cli.md`):
 
 | Code | Meaning |
 | --- | --- |
-| `0` | Success — the run produced a trace, or the coverage report printed. |
-| `1` | The engine ran and **has something to report**: a project/calibration that would not load, a scenario that would not parse, or a fail-loud evaluation error (an unsupported builtin, missing hardware metadata, a missing calibration value, an unresolved symbol, or a missing input). |
-| `2` | A **usage error** — an unrecognised flag, no resolvable project, or neither `--scenario` nor `--coverage` given. |
+| `0` | Success. The run produced a trace, the coverage report printed, or every conformance fixture passed. |
+| `1` | The engine has something to report: a load, parse, integrity, evaluation, or conformance mismatch, including missing hardware metadata. |
+| `2` | A usage error: an unrecognised or conflicting flag, no resolvable project for a normal action, or no action. |
 
 So `$? != 0` means "do not trust the output." Unsupported behavior fails loud.
 The documented hardware stubs, parameter defaults, opt-in table fallbacks, and

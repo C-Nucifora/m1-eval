@@ -1,0 +1,149 @@
+# SPDX-License-Identifier: GPL-3.0-or-later
+# Hand-derived typed-value fixture. This is not M1 Sim evidence.
+schema_version = 1
+name = "synthetic typed scalar round trip"
+calculation_rate_hz = 10.0
+
+[project]
+root = "../conformance-types"
+project = "Project.m1prj"
+
+[[project.files]]
+path = "Project.m1prj"
+sha256 = "f22426477608d06a7f508236b20de5a19176b42316973d9718812ee4f0fa07f4"
+
+[[project.files]]
+path = "Scripts/Types.Update.m1scr"
+sha256 = "92fbc654654c8a77d1dde4e11488347c1fa08c6720cdff64819a44602d217aa4"
+
+[provenance]
+kind = "synthetic"
+source = "tests/fixtures/conformance-types, direct typed channel copies"
+procedure = "docs/conformance.md#synthetic-runner-fixtures"
+notes = "Expected values test the wire and comparison rules, not M1 compatibility."
+
+[run]
+mode = "function"
+target = "Types.Update"
+
+[[steps]]
+time_s = 0.0
+
+[[steps.inputs]]
+channel = "Root.Types.Bool In"
+value = { type = "boolean", value = true }
+
+[[steps.inputs]]
+channel = "Root.Types.Signed In"
+value = { type = "integer", value = -2147483648 }
+
+[[steps.inputs]]
+channel = "Root.Types.Unsigned In"
+value = { type = "unsigned-integer", value = 4294967295 }
+
+[[steps.inputs]]
+channel = "Root.Types.Float In"
+value = { type = "floating-point", value = "-0" }
+
+[[steps.inputs]]
+channel = "Root.Types.Fixed In"
+value = { type = "fixed-point-7dps", raw = -2147483648 }
+
+[[steps.inputs]]
+channel = "Root.Types.Enum In"
+value = { type = "enum", enum_type = "Test State", member = "Idle" }
+
+[[steps.inputs]]
+channel = "Root.Types.String In"
+value = { type = "string", value = "tick zero" }
+
+[[steps.expected]]
+channel = "Root.Types.Bool Out"
+value = { type = "boolean", value = true }
+
+[[steps.expected]]
+channel = "Root.Types.Signed Out"
+value = { type = "integer", value = -2147483648 }
+
+[[steps.expected]]
+channel = "Root.Types.Unsigned Out"
+value = { type = "unsigned-integer", value = 4294967295 }
+
+[[steps.expected]]
+channel = "Root.Types.Float Out"
+value = { type = "floating-point", value = "-0" }
+tolerance = { type = "floating-point", absolute = "0" }
+
+[[steps.expected]]
+channel = "Root.Types.Fixed Out"
+value = { type = "fixed-point-7dps", raw = -2147483648 }
+tolerance = { type = "fixed-point-7dps", raw = 0 }
+
+[[steps.expected]]
+channel = "Root.Types.Enum Out"
+value = { type = "enum", enum_type = "Test State", member = "Idle" }
+
+[[steps.expected]]
+channel = "Root.Types.String Out"
+value = { type = "string", value = "tick zero" }
+
+[[steps]]
+time_s = 0.1
+
+[[steps.inputs]]
+channel = "Root.Types.Bool In"
+value = { type = "boolean", value = false }
+
+[[steps.inputs]]
+channel = "Root.Types.Signed In"
+value = { type = "integer", value = 2147483647 }
+
+[[steps.inputs]]
+channel = "Root.Types.Unsigned In"
+value = { type = "unsigned-integer", value = 0 }
+
+[[steps.inputs]]
+channel = "Root.Types.Float In"
+value = { type = "floating-point", value = "NaN" }
+
+[[steps.inputs]]
+channel = "Root.Types.Fixed In"
+value = { type = "fixed-point-7dps", raw = 2147483647 }
+
+[[steps.inputs]]
+channel = "Root.Types.Enum In"
+value = { type = "enum", enum_type = "Test State", member = "Active" }
+
+[[steps.inputs]]
+channel = "Root.Types.String In"
+value = { type = "string", value = "tick one" }
+
+[[steps.expected]]
+channel = "Root.Types.Bool Out"
+value = { type = "boolean", value = false }
+
+[[steps.expected]]
+channel = "Root.Types.Signed Out"
+value = { type = "integer", value = 2147483647 }
+
+[[steps.expected]]
+channel = "Root.Types.Unsigned Out"
+value = { type = "unsigned-integer", value = 0 }
+
+[[steps.expected]]
+channel = "Root.Types.Float Out"
+value = { type = "floating-point", value = "NaN" }
+tolerance = { type = "floating-point", absolute = "0" }
+
+[[steps.expected]]
+channel = "Root.Types.Fixed Out"
+value = { type = "fixed-point-7dps", raw = 2147483647 }
+tolerance = { type = "fixed-point-7dps", raw = 0 }
+
+[[steps.expected]]
+channel = "Root.Types.Enum Out"
+value = { type = "enum", enum_type = "Test State", member = "Active" }
+
+[[steps.expected]]
+channel = "Root.Types.String Out"
+value = { type = "string", value = "tick one" }
