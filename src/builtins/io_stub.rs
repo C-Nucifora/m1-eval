@@ -939,11 +939,11 @@ mod tests {
     }
 
     #[test]
-    fn adapter_then_system_elapsed_time_share_one_50hz_site_clock() {
+    fn system_adapter_system_elapsed_time_share_one_50hz_site_clock() {
         let mut h = Harness::new();
         let site = CallSite::new("Demo.Update.m1scr", 20);
         let mut adapter = RecordingAdapter {
-            reply: AdapterReply::Value(Value::m1_float(7.0)),
+            reply: AdapterReply::Unhandled,
             calls: Vec::new(),
         };
 
@@ -957,11 +957,11 @@ mod tests {
                 Some(&mut adapter),
             )
             .unwrap(),
-            Value::m1_float(7.0),
-            "the adapter owns the initial result"
+            Value::m1_float(0.0),
+            "the deterministic model handles the first execution"
         );
 
-        adapter.reply = AdapterReply::Unhandled;
+        adapter.reply = AdapterReply::Value(Value::m1_float(7.0));
         assert_eq!(
             h.io_at(
                 "System",
@@ -972,29 +972,36 @@ mod tests {
                 Some(&mut adapter),
             )
             .unwrap(),
-            Value::m1_float(0.02),
-            "the deterministic model measures from the adapter-backed execution"
+            Value::m1_float(7.0),
+            "the adapter owns the second result"
         );
+
+        adapter.reply = AdapterReply::Unhandled;
         assert_eq!(
             h.io_at(
                 "System",
                 "ElapsedTime",
                 &[],
-                site,
+                site.clone(),
                 crate::hardware::EvalTime::periodic(2, 0.04, 0.02, 0.02),
                 Some(&mut adapter),
             )
             .unwrap(),
-            Value::m1_float(0.02)
+            Value::m1_float(0.02),
+            "the deterministic model measures from the adapter-backed execution"
         );
+        assert!(h.trace.hardware.iter().any(|record| {
+            record.site == site && record.source == HardwareValueSource::SystemModel
+        }));
+        assert!(h.trace.hardware.iter().any(|record| {
+            record.site == site && record.source == HardwareValueSource::Adapter
+        }));
     }
 
     #[test]
-    fn exact_scenario_then_system_elapsed_time_share_one_50hz_site_clock() {
+    fn system_exact_scenario_system_elapsed_time_share_one_50hz_site_clock() {
         let mut h = Harness::new();
         let site = CallSite::new("Demo.Update.m1scr", 20);
-        h.env
-            .set_io_override_at("System.ElapsedTime", site.clone(), Value::m1_float(9.0));
 
         assert_eq!(
             h.io_at(
@@ -1006,11 +1013,12 @@ mod tests {
                 None,
             )
             .unwrap(),
-            Value::m1_float(9.0),
-            "the exact scenario owns the initial result"
+            Value::m1_float(0.0),
+            "the deterministic model handles the first execution"
         );
 
-        h.env.io_overrides.clear();
+        h.env
+            .set_io_override_at("System.ElapsedTime", site.clone(), Value::m1_float(9.0));
         assert_eq!(
             h.io_at(
                 "System",
@@ -1021,21 +1029,30 @@ mod tests {
                 None,
             )
             .unwrap(),
-            Value::m1_float(0.02),
-            "the deterministic model measures from the scenario-backed execution"
+            Value::m1_float(9.0),
+            "the exact scenario owns the second result"
         );
+
+        h.env.io_overrides.clear();
         assert_eq!(
             h.io_at(
                 "System",
                 "ElapsedTime",
                 &[],
-                site,
+                site.clone(),
                 crate::hardware::EvalTime::periodic(2, 0.04, 0.02, 0.02),
                 None,
             )
             .unwrap(),
-            Value::m1_float(0.02)
+            Value::m1_float(0.02),
+            "the deterministic model measures from the scenario-backed execution"
         );
+        assert!(h.trace.hardware.iter().any(|record| {
+            record.site == site && record.source == HardwareValueSource::SystemModel
+        }));
+        assert!(h.trace.hardware.iter().any(|record| {
+            record.site == site && record.source == HardwareValueSource::ScenarioExact
+        }));
     }
 
     #[test]
