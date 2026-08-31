@@ -458,6 +458,9 @@ fn tick_loop(
     let mut env = Env::new();
     let mut state = StateStore::new();
     let mut trace = Trace::new();
+    // A virtual serial adapter is run-local state. Repeating the same scenario
+    // starts with fresh ports, handles, cursors, and buffers.
+    let mut serial = crate::virtual_serial::VirtualSerial::new(&scenario.serial)?;
 
     // Unseeded-channel defaulting is the scenario's EXPLICIT opt-in
     // (`allow_default_inputs = true`, whole-project mode only): an unseeded
@@ -548,6 +551,7 @@ fn tick_loop(
                     Some(hardware) => Some(&mut **hardware),
                     None => None,
                 },
+                serial: crate::expr::SerialRuntime::Shared(&mut serial),
             };
             exec_script_with_runtime(&root, &mut ctx, &mut runtime)
                 .map_err(|e| e.in_script(&sched.script.name, None))?;
@@ -555,6 +559,7 @@ fn tick_loop(
         startup_written.extend(startup_trace.channels.keys().cloned());
         trace.external.extend(startup_trace.external);
         trace.hardware.extend(startup_trace.hardware);
+        trace.serial.extend(startup_trace.serial);
     }
 
     for i in 0..ticks {
@@ -612,6 +617,7 @@ fn tick_loop(
                     Some(hardware) => Some(&mut **hardware),
                     None => None,
                 },
+                serial: crate::expr::SerialRuntime::Shared(&mut serial),
             };
             exec_script_with_runtime(&root, &mut ctx, &mut runtime)
                 .map_err(|e| e.in_script(&sched.script.name, Some(t)))?;
@@ -1208,6 +1214,7 @@ fn run_counterfactual_inner(
     let mut env = Env::new();
     let mut state = StateStore::new();
     let mut trace = Trace::new();
+    let mut serial = crate::virtual_serial::VirtualSerial::empty();
     // A counterfactual seeds every logged channel as ground truth, so an unseeded
     // *channel* read still fails loud (like function/cone mode): a cone function
     // reading a channel the log does not carry is a genuine error, not a guess.
@@ -1283,6 +1290,7 @@ fn run_counterfactual_inner(
                             Some(hardware) => Some(&mut **hardware),
                             None => None,
                         },
+                        serial: crate::expr::SerialRuntime::Shared(&mut serial),
                     };
                     crate::expr::eval_with_runtime(&value_node, &mut ctx, &mut runtime)?
                 }
@@ -1291,6 +1299,7 @@ fn run_counterfactual_inner(
         }
         trace.external.extend(override_trace.external);
         trace.hardware.extend(override_trace.hardware);
+        trace.serial.extend(override_trace.serial);
         for (path, value) in pending {
             let value = crate::expr::coerce_for_channel(&path, value, &loaded.project)?;
             env.set(path, value);
@@ -1330,6 +1339,7 @@ fn run_counterfactual_inner(
                     Some(hardware) => Some(&mut **hardware),
                     None => None,
                 },
+                serial: crate::expr::SerialRuntime::Shared(&mut serial),
             };
             exec_script_with_runtime(&root, &mut ctx, &mut runtime)
                 .map_err(|e| e.in_script(&sched.script.name, Some(t)))?;
@@ -1541,6 +1551,7 @@ mod tests {
             }],
             overrides: vec![],
             io: vec![],
+            serial: Default::default(),
             allow_default_inputs: false,
         };
         let trace = run(&loaded, &scenario).expect("enum-seeded run evaluates");
@@ -1573,6 +1584,7 @@ mod tests {
             }],
             overrides: vec![],
             io: vec![],
+            serial: Default::default(),
             allow_default_inputs: false,
         };
         let err = run(&loaded, &scenario).expect_err("string input fails loud");
@@ -1597,6 +1609,7 @@ mod tests {
             inputs: vec![],
             overrides: vec![],
             io: vec![],
+            serial: Default::default(),
             allow_default_inputs: false,
         };
         let err = run(&loaded, &scenario).expect_err("unseeded input fails loud");
@@ -2480,6 +2493,11 @@ base_rate_hz = 100.0
         load(&dir.join("Project.m1prj"), None).expect("counterfactual fixture loads")
     }
 
+    fn serial_fixture() -> Loaded {
+        let dir = Path::new(env!("CARGO_MANIFEST_DIR")).join("tests/fixtures/serial");
+        load(&dir.join("Project.m1prj"), None).expect("serial fixture loads")
+    }
+
     /// The `fn_symbol` path of each scheduled function in a cone, in order — the
     /// load-bearing observable for the downstream-cone tests.
     fn cone_fn_symbols(cone: &[Scheduled<'_>]) -> Vec<String> {
@@ -2593,6 +2611,96 @@ base_rate_hz = 100.0
                 units: BTreeMap::new(),
             },
         }
+    }
+
+    #[test]
+    fn counterfactual_serial_override_does_not_run_startup_port_initialization() {
+        let loaded = serial_fixture();
+        // Tx Offset selects only the Transmit function downstream, and that
+        // function does not call PortInit. Any initialized port here would have
+        // leaked from the whole-project startup schedule.
+        let channels = vec![InputSeries {
+            channel: "Root.Serial Test.Tx Offset".to_string(),
+            kind: InputKind::Const(Value::m1_integer(0)),
+        }];
+        let log = Log {
+            meta: LogMeta {
+                source: "synthetic-serial-counterfactual".to_string(),
+                duration_s: 0.01,
+                channel_count: channels.len(),
+                units: BTreeMap::new(),
+            },
+            channels,
+        };
+        let overrides = vec![
+            Override::parse("Root.Serial Test.Tx Offset=Serial.Receive(Serial.GetHandle(true), 0)")
+                .expect("serial override expression parses"),
+        ];
+        let cfg = CounterfactualCfg {
+            base_rate_hz: 100.0,
+            duration_s: 0.01,
+        };
+
+        let error = run_counterfactual(&loaded, &log, &overrides, &cfg)
+            .expect_err("counterfactual mode must not borrow whole-project startup state");
+        assert_eq!(
+            error.root_cause(),
+            &EvalError::BadCall {
+                detail: "Serial.Receive: port 0 is not initialized; call Serial.PortInit first"
+                    .to_string(),
+            }
+        );
+        assert_eq!(
+            error.to_string(),
+            "bad call: Serial.Receive: port 0 is not initialized; call Serial.PortInit first"
+        );
+    }
+
+    #[test]
+    fn counterfactual_serial_rejects_a_logged_handle_after_in_cone_port_setup() {
+        let loaded = serial_fixture();
+        let channels = vec![
+            InputSeries {
+                channel: "Root.Serial Test.Counterfactual Gate".to_string(),
+                kind: InputKind::Const(Value::m1_integer(1)),
+            },
+            InputSeries {
+                channel: "Root.Serial Test.Handle A".to_string(),
+                kind: InputKind::Const(Value::m1_unsigned(77)),
+            },
+        ];
+        let log = Log {
+            meta: LogMeta {
+                source: "synthetic-serial-counterfactual".to_string(),
+                duration_s: 0.01,
+                channel_count: channels.len(),
+                units: BTreeMap::new(),
+            },
+            channels,
+        };
+        let overrides = vec![
+            Override::parse("Root.Serial Test.Handle A=Root.Serial Test.Handle A")
+                .expect("identity override parses"),
+        ];
+        let cfg = CounterfactualCfg {
+            base_rate_hz: 100.0,
+            duration_s: 0.01,
+        };
+
+        let error = run_counterfactual(&loaded, &log, &overrides, &cfg)
+            .expect_err("a logged number is not a handle from the fresh virtual adapter");
+        assert_eq!(
+            error.root_cause(),
+            &EvalError::BadCall {
+                detail:
+                    "Serial.Receive: invalid handle 77; handles are nonzero and owned by this run"
+                        .to_string(),
+            }
+        );
+        assert_eq!(
+            error.to_string(),
+            "in Serial Test.Counterfactual Receive.m1scr at t = 0.000 s: bad call: Serial.Receive: invalid handle 77; handles are nonzero and owned by this run"
+        );
     }
 
     fn floats(trace: &Trace, channel: &str) -> Vec<f64> {

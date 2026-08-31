@@ -46,10 +46,12 @@ declared in the scenario file; at most one may be given (combining two is a usag
 error, exit `2`). `--override` and `--diff` require `--log`.
 
 The `Supported`, `Assumed`, `Adapter-backed`, and `Stubbed` buckets distinguish a
-direct implementation, an explicit offline model, required external hardware
-metadata, and a typed offline fallback. They are execution-route labels, not
-evidence maturity. `Supported` and `Assumed` remain **Assumed** maturity until
-compared with captured M1 output. See the
+direct implementation, an explicit offline model, a typed adapter route, and a
+typed offline fallback. An adapter route may use a user `HardwareAdapter` or an
+evaluator-owned adapter such as virtual serial. Required external hardware
+metadata is only a subset of `Adapter-backed`. These are execution-route labels,
+not evidence maturity. `Supported` and `Assumed` remain **Assumed** maturity
+until compared with captured M1 output. See the
 [README maturity contract](../README.md#maturity-contract) for the evidence
 labels and current status of each evaluator area.
 
@@ -117,7 +119,22 @@ const = 4194304
 [[io]]
 call = "System.FlashFree"
 const = 1048576
+
+# One-shot virtual RS232 input. Chunks become available when evaluator time
+# reaches time_s. Equal-time chunks retain declaration order.
+[[serial.rx]]
+time_s = 0.125
+port = 0
+bytes = [0x1b, 0x30, 0x35, 0x0d]
 ```
+
+Whole-project mode shares one virtual adapter between `On Startup` and periodic
+functions. Function and cone modes skip startup, so their selected call chain
+must initialize the port before virtual receive or transmit calls. A serial RX
+declaration schedules bytes but does not initialize a port. Counterfactual
+replay has neither scenario RX declarations nor a startup pass. See
+[`virtual-serial.md`](virtual-serial.md) for state ownership and mixed-route
+failure rules.
 
 Identifiers may contain spaces (e.g. `Cooling Fan.Output`); channel names are
 used verbatim and never split on whitespace, only on `.` for path segments.
@@ -138,17 +155,24 @@ Table captures also follow the stricter vector and corpus checks in
 ## Output
 
 - **JSON** (`--out trace.json`, or no `--out`):
-  `{ "time": [...], "channels": { path: [...] }, "external": [...], "hardware": [...] }`.
+  `{ "time": [...], "channels": { path: [...] }, "external": [...], "hardware": [...], "serial": [...] }`.
   Each `hardware` record names the resolved receiver, source spelling, method,
   script, byte offset, and selected route (`scenario-exact`,
-  `scenario-wildcard`, `adapter`, `system-model`, or `generic-stub`). The
+  `scenario-wildcard`, `adapter`, `virtual-serial`, `virtual-serial-rx`,
+  `system-model`, or `generic-stub`). Each ordered `serial` record contains the
+  RX/TX direction, evaluator time and phase, base tick, port, stable handle,
+  bytes, script, and call offset. The
   `external` list names channels whose values were externally driven rather than
   computed, including scenario inputs, held initial state, Tier-3 stubs,
   parameter defaults, opt-in table fallbacks, and opt-in defaults for unseeded
   channels. JSON has no non-finite numeric values, so NaN and positive or
   negative infinity are written as `null`.
 - **CSV** (`--out trace.csv`): a `time` header column followed by one column per
-  channel in sorted-name order, one row per tick.
+  channel in sorted-name order, one row per tick. Serial byte events are JSON
+  metadata and are deliberately absent from CSV.
+
+The virtual serial model is fresh for each run. Its complete method and error
+contract is documented in [`virtual-serial.md`](virtual-serial.md).
 
 Both are deterministic: the same scenario always produces byte-identical output.
 

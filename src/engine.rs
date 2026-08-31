@@ -263,9 +263,10 @@ impl Engine {
     }
 
     /// Report which builtins/constructs every loaded script uses and whether the
-    /// engine supports, assumes, requires adapter data for, stubs, or cannot
-    /// handle each, along with the whole-project execution schedule. Pure static
-    /// analysis; no scenario is needed, so this is safe before [`Engine::run`].
+    /// engine supports, assumes, routes through a typed adapter, stubs, or cannot
+    /// handle each, along with the whole-project execution schedule. Adapter
+    /// routes may be user-supplied or evaluator-owned. Pure static analysis; no
+    /// scenario is needed, so this is safe before [`Engine::run`].
     pub fn coverage(&self) -> CoverageReport {
         CoverageReport::analyse_loaded(&self.loaded)
     }

@@ -176,6 +176,10 @@ pub enum HardwareValueSource {
     ScenarioWildcard,
     /// An external [`HardwareAdapter`] supplied the value.
     Adapter,
+    /// The evaluator's deterministic virtual RS232 adapter handled the call.
+    VirtualSerial,
+    /// A virtual serial result depended on scenario-controlled receive data.
+    VirtualSerialRx,
     /// The evaluator's deterministic `System` model supplied the value.
     SystemModel,
     /// A documented type-correct offline stub supplied the value.
@@ -189,6 +193,8 @@ impl HardwareValueSource {
             HardwareValueSource::ScenarioExact => "scenario-exact",
             HardwareValueSource::ScenarioWildcard => "scenario-wildcard",
             HardwareValueSource::Adapter => "adapter",
+            HardwareValueSource::VirtualSerial => "virtual-serial",
+            HardwareValueSource::VirtualSerialRx => "virtual-serial-rx",
             HardwareValueSource::SystemModel => "system-model",
             HardwareValueSource::GenericStub => "generic-stub",
         }
@@ -196,7 +202,10 @@ impl HardwareValueSource {
 
     /// Whether this result came from outside evaluator computation.
     pub fn is_external(self) -> bool {
-        !matches!(self, HardwareValueSource::SystemModel)
+        !matches!(
+            self,
+            HardwareValueSource::SystemModel | HardwareValueSource::VirtualSerial
+        )
     }
 }
 

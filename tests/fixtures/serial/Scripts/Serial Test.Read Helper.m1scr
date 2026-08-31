@@ -1,0 +1,10 @@
+// Synthetic virtual-serial fixture. No proprietary or captured data.
+local h = Serial.GetHandle(true);
+if (Serial.Receive(h, 0))
+{
+ Out = Serial.GetUnsignedInteger(h, 0, 1);
+}
+else
+{
+ Out = -1;
+}

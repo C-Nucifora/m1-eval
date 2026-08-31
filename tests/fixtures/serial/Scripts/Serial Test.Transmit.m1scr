@@ -1,0 +1,6 @@
+// Synthetic virtual-serial fixture. No proprietary or captured data.
+local h = Serial.GetHandle(true);
+local next = Serial.SetUnsignedInteger(h, 0, 2, 0x3035);
+next = Serial.SetFloat(h, next, 1.5);
+Tx Offset = Serial.SetString(h, next, 2, "OK");
+Serial.Transmit(h, 0, Tx Offset);
