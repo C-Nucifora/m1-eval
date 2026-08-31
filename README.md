@@ -36,14 +36,15 @@ do not compare computed channel values with captured M1 results.
 | `MPSE.*`, `TC.*`, and `Switch.*` | **Unsupported internally / Adapter-backed** | The pinned help captures define seven signatures but omit the formulas and Switch-bank state contract. Calls validate their captured M1 families and ranges, then require a handling `HardwareAdapter`. There is no scenario or generic-zero fallback. See [the method-by-method contract](docs/mpse-tc-switch.md). |
 | Filters, integrals, derivatives, debounce, delay, change detection, timers, and `static local` state | **Assumed** | Update laws and startup behavior are explicit implementation assumptions with hand-derived tests, not M1 value comparisons. Timer countdowns use absolute evaluator time: `Remaining` is a read-only observation, while `Start`, `Stop`, and `Reset` are the only state transitions. |
 | Virtual `Serial.*` RS232 byte buffers | **Assumed** | A fresh adapter per run provides stable nonzero handles, timed scenario RX, independent handle cursors, endian-aware numeric access, TX capture, and real port status. LIN stays unsupported. The exact evaluator contracts and evidence boundaries are in [`docs/virtual-serial.md`](docs/virtual-serial.md). |
-| `CanComms.*`, `System.*`, `Logging.*`, DBC objects, and other hardware-backed calls | **Assumed / Stubbed** | Each call crosses a typed adapter boundary with its resolved receiver, source call site, arguments, and evaluator time. Exact-site scenario values take precedence over wildcard values and an attached adapter. `System.ElapsedTime` reports the interval since that call site last ran. Its first tick-zero call returns zero, while a site first reached later uses its function step. Tick calls use the deterministic base timeline. `System.FlashSize` and `System.FlashFree` require scenario or adapter data; they never become a dangerous zero. Remaining unhandled calls use documented typed stubs or fail loud. |
+| Virtual `CanComms.*` and `.m1dbc` objects | **Assumed** | A fresh classic-CAN adapter per run provides stable nonzero handles, timed scenario frames, independent raw receive cursors, strict M1 raw bit addressing, DBC signal decoding, and TX capture. The loader preserves exact DBC source identity and builds layout and bus bindings from one owned source/script/project snapshot. See [`docs/virtual-can.md`](docs/virtual-can.md). |
+| `System.*`, `Logging.*`, and other hardware-backed calls | **Assumed / Stubbed** | Each call crosses a typed adapter boundary with its resolved receiver, source call site, arguments, and evaluator time. Exact-site scenario values take precedence over wildcard values and an attached adapter. `System.ElapsedTime` reports the interval since that call site last ran. Its first tick-zero call returns zero, while a site first reached later uses its function step. Tick calls use the deterministic base timeline. `System.FlashSize` and `System.FlashFree` require scenario or adapter data; they never become a dangerous zero. Remaining unhandled calls use documented typed stubs or fail loud. |
 | Scenario parsing, tick grids, trace output, and `--coverage` | **Assumed** | These are deterministic m1-eval contracts tested with synthetic data. A `Supported` coverage entry means implemented, not M1-verified. |
 | Typed conformance fixture parser and runner | **Assumed** | Synthetic fixtures cover typed values, project hashes, initial-state reset, tolerances, and mismatch reporting. No genuine M1 Sim capture is committed yet, so this runner does not make another area Verified by itself. |
 | Single-function and upstream dependency-cone runners | **Assumed** | Selection, ordering, and zero-order hold are tested on synthetic projects. |
 | Whole-project multi-rate scheduling | **Assumed** | Trigger rates come from `Project.m1prj`; same-rate dependency order, fastest-first rate groups, startup order, and cross-rate stale reads are the evaluator's model. |
 | CSV log replay, overrides, downstream-cone recomputation, and diffs | **Assumed** | Synthetic tests cover import, resampling, source precedence, recomputation, and the no-op invariant. They do not establish M1 execution fidelity. |
 | Binary `.ld` import | **Assumed** | Synthetic decode tests run in CI. An optional real-log test checks structure and numeric plausibility only, not values against an independent oracle. |
-| Real-time/HIL execution, ECU budgets or preemption, watchdog behavior, live CAN/serial I/O, `.m1dbc` decoding, unlisted constructs or builtins, and LSP integration | **Unsupported** | These are outside the current evaluator. Unknown executable behavior fails loud rather than being inferred. |
+| Real-time/HIL execution, ECU budgets or preemption, watchdog behavior, live CAN/serial I/O, unlisted constructs or builtins, and LSP integration | **Unsupported** | These are outside the current evaluator. Unknown executable behavior fails loud rather than being inferred. |
 
 ## What it does (Phase 1)
 
@@ -66,9 +67,9 @@ dependency-cone runners.
 - **Tier-3 IO.** Hardware calls use a typed `HardwareAdapter` boundary. The
   adapter receives `ResolvedReceiver`, `CallSite`, arguments, and `EvalTime`.
   Routing is exact-site scenario value, wildcard scenario value, adapter,
-  virtual serial, deterministic `System` model, generic typed stub, then fail
-  loud. Trace provenance records which route supplied each call site. Virtual
-  serial transfers also have ordered byte events in JSON traces.
+  virtual CAN, virtual serial, deterministic `System` model, generic typed stub,
+  then fail loud. Trace provenance records which route supplied each call site.
+  Virtual CAN frames and serial transfers have ordered events in JSON traces.
 - **Two runners** — *single-function* (run one chosen function each tick over a
   time series) and *dependency-cone* (run a target channel plus its upstream
   cone, topologically ordered).
@@ -160,8 +161,10 @@ The multi-rate model:
   fastest-first within a base tick.
 - **Hardware calls keep base-grid time.** The adapter sees both the current
   function step and the base tick, elapsed seconds, and base period. CAN and
-  sensor reads can fall back to documented stubs. Required flash metadata does
-  not. Unknown calls still abort unless the adapter handles them.
+  sensor calls reach the typed adapter boundary. Implemented CAN calls then use
+  the run-owned model; known but unimplemented CanComms methods fail loud.
+  Required flash metadata does not fall back. Unknown calls still abort unless
+  the adapter handles them.
 
 ### Determinism & fail-loud
 
@@ -186,7 +189,7 @@ constructs each script uses and whether the engine dispatches them through a
 **direct implementation**, an explicit offline **model**, a typed
 **adapter-backed** route, a hardware **stub**, or no implementation. An adapter
 route may use a user `HardwareAdapter` or an evaluator-owned adapter such as
-virtual serial. Required external metadata, including `System.FlashSize` and
+virtual CAN or virtual serial. Required external metadata, including `System.FlashSize` and
 `System.FlashFree`, is only one subset of this bucket. The rendered labels are
 `Supported`, `Assumed`, `Adapter-backed`, `Stubbed`, and `Unsupported`. These are
 execution-route labels, separate from the evidence maturity contract above.
@@ -214,16 +217,17 @@ exact call.
 
 ## Quickstart
 
-`m1-eval` runs offline. It does not connect to an ECU, sample sensors, emulate a
-CAN bus, perform live serial IO, or reproduce firmware timing. It does provide a
-deterministic virtual RS232 byte-buffer model for scenario tests. A
+`m1-eval` runs offline. It does not connect to an ECU, sample sensors, perform
+live CAN or serial IO, or reproduce firmware timing. It provides deterministic
+virtual classic-CAN and RS232 buffer models for scenario tests. A
 `Project.m1prj` is always required because it supplies symbols, types, and trigger
 rates. Pass the matching `.m1cfg` when a run needs real parameter values or table
 cells. Without it, an unseeded parameter uses a type-correct externally-driven
 default. Table
 `.Lookup()` and `.Get()` fail in strict modes. In whole-project mode,
 `allow_default_inputs` also permits an externally-driven `0.0` table fallback.
-The evaluator does not load `.m1dbc` files.
+The loader discovers nested `.m1dbc` files and retains their exact source paths,
+message layouts, signal layouts, and script-derived bus bindings.
 
 Seed an ordinary hardware channel with scenario `[[inputs]]`. Seed a
 hardware-backed call with `[[io]]`, using its `Object.Method` name. Add `script`
@@ -240,6 +244,14 @@ for the schema, supported methods, routing order, run-mode boundaries, source
 migration, and explicit assumptions. Only whole-project mode runs `On Startup`;
 function and cone selections must initialize serial in their own call chain.
 Counterfactual replay has no serial scenario or startup pass.
+
+Inject classic-CAN frames with `[[can.rx]]`. Each entry carries evaluator time,
+bus, standard or extended ID, and zero to eight wire bytes. DBC message receivers
+and raw `CanComms` handles consume those frames; JSON traces retain ordered RX/TX
+frame events. See [`docs/virtual-can.md`](docs/virtual-can.md) for the supported
+methods, raw and DBC bit conventions, lifecycle, route ownership, and release
+dependency. Counterfactual replay starts with empty CAN scenario input and fresh
+CAN state.
 
 Whole-project mode is strict about ordinary missing channels unless
 `allow_default_inputs = true` or `--allow-default-inputs` is set. The CLI then

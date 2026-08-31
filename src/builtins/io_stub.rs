@@ -7,15 +7,14 @@
 //! 1. An exact-call-site scenario override.
 //! 2. A wildcard scenario override for the call name.
 //! 3. An external [`HardwareAdapter`](crate::hardware::HardwareAdapter).
-//! 4. The deterministic virtual RS232 adapter.
-//! 5. The deterministic `System` clock/tick model.
-//! 6. A generic typed stub. Every other method that the intrinsic registry
-//!    lists for the object is a hardware-backed read/write with no meaningful
-//!    offline value, but a determinate *type*. Rather than abort a whole-project
-//!    run on the first CAN read, we return the type-correct zero/false/empty
-//!    default for the overload's declared return type (see `typed_io_default`).
-//!    This is the externally-driven default a scenario/log replay would override.
-//! 7. Fail loud. A method the registry does not list on the object is
+//! 4. The deterministic virtual CAN adapter.
+//! 5. The deterministic virtual RS232 adapter.
+//! 6. The deterministic `System` clock/tick model.
+//! 7. A generic typed stub for explicitly retained non-CAN hardware methods.
+//!    Implemented CanComms calls are owned by virtual CAN, while known
+//!    unimplemented CanComms calls fail loud after the higher-priority scenario
+//!    and adapter routes decline.
+//! 8. Fail loud. A method the registry does not list on the object is
 //!    genuinely unknown — we never invent a value for it, so it returns
 //!    [`EvalError::UnsupportedBuiltin`].
 //!
@@ -89,6 +88,34 @@ pub(crate) fn call_with_runtime(
     {
         let value = coerce_hardware_value(value, returns, &call, ctx)?;
         return complete(ctx, &call, value, HardwareValueSource::Adapter);
+    }
+
+    if library_object == "CanComms"
+        && let Some(reply) = runtime.can.as_mut().call_routed(&call)?
+    {
+        let value = coerce_hardware_value(reply.value, returns, &call, ctx)?;
+        if let Some(event) = reply.event
+            && let Some(trace) = ctx.trace.as_deref_mut()
+        {
+            trace.record_can(event);
+        }
+        let source = if reply.external {
+            HardwareValueSource::VirtualCanRx
+        } else {
+            HardwareValueSource::VirtualCan
+        };
+        return complete(ctx, &call, value, source);
+    }
+
+    if library_object == "CanComms"
+        && !intrinsics::get()
+            .library_overloads(library_object, method)
+            .is_empty()
+    {
+        return Err(EvalError::UnsupportedBuiltin {
+            object: source_object.to_string(),
+            method: method.to_string(),
+        });
     }
 
     if library_object == "Serial"
@@ -209,8 +236,12 @@ fn coerce_hardware_value(
         Some("FloatingPoint") => coerce_for_scalar_kind(&key, value, M1ScalarKind::FloatingPoint),
         Some("FixedPoint7dps") => coerce_for_scalar_kind(&key, value, M1ScalarKind::FixedPoint7dps),
         Some("Boolean") => coerce_for_declared_type(&key, value, ValueType::Boolean, ctx.project),
+        Some("Bit") => coerce_for_declared_type(&key, value, ValueType::Boolean, ctx.project),
         Some("String") => coerce_for_declared_type(&key, value, ValueType::String, ctx.project),
-        // Void and remaining catalogue-only types have no scalar family to restore.
+        // A hardware adapter handles the whole side-effect call, but its
+        // placeholder reply must not leak into a source-level Void expression.
+        Some("Void") => Ok(Value::Bool(true)),
+        // Remaining catalogue-only types have no scalar family to restore.
         _ => Ok(value),
     }
 }
@@ -265,13 +296,13 @@ fn complete(
 
 /// Evaluate one project-object IO call `<object>.<method>(...)`.
 ///
-/// These are the project-object analogue of the Tier-3 library stubs above: a
+/// These are the project-object analogue of the Tier-3 library routes above: a
 /// DBC CAN message/signal object (`Balls3EV25.DashVals.Tx/TxOpen/SetBit/…`,
 /// `IZZE DBC.*.GetScaled/Receive`), a `GroupCompound` CAN service-bits push
 /// (`Service Bits.Update`), a package `Output.SetState`, or a buzzer's `.Buzze`.
-/// None of these can be evaluated from project data alone: they read from or
-/// write to a CAN bus or output pin. Each call uses the shared hardware routing
-/// order:
+/// Loaded DBC objects can be evaluated by the run-owned CAN model; other
+/// hardware objects retain their documented fallback. Each call uses the shared
+/// hardware routing order:
 ///
 /// 1. **Exact-site scenario override.** A value for this script and byte offset
 ///    wins over every other route.
@@ -279,19 +310,22 @@ fn complete(
 ///    `"<object>.<method>"` drives every matching call site.
 /// 3. **Adapter.** An attached [`HardwareAdapter`](crate::HardwareAdapter) sees
 ///    the resolved receiver, call site, arguments, and evaluator time.
-/// 4. **Documented stub.** A reader has a determinate offline default
+/// 4. **Virtual CAN.** A loaded DBC identity uses its exact source layout,
+///    direction, bus binding, handles, and scenario frames.
+/// 5. **Documented stub.** An unloaded legacy reader has a determinate offline
+///    default
 ///    (`Receive` → `false`, no message arrived; `GetScaled` → `0.0`;
 ///    `GetUnsignedInteger` → `0`; `TxOpen` → an opaque handle `0`); a void writer
 ///    (`Tx`/`TxInitialise`/`Init`/`SetBit`/`SetUnsignedInteger`/`Update`/
 ///    `SetState`/`Buzze`) returns the unit value (a no-op offline). The stub `0`
 ///    for reads is deliberate (not fail-loud) so a whole-project run does not
 ///    abort on every CAN read.
-/// 5. **Fail loud.** Any other method on the object has no determinate offline
+/// 6. **Fail loud.** Any other method on the object has no determinate offline
 ///    value → [`EvalError::UnsupportedBuiltin`]. We never invent a bus value.
 ///
-/// Every produced value flags `"<object>.<method>"` externally driven in the
-/// trace, so a consumer knows the value came from outside evaluator computation.
-/// Structured provenance retains the resolved receiver and selected route.
+/// Scenario, adapter, generic fallback, and virtual-CAN RX results are marked
+/// external. Deterministic CAN setup and transmit state is not. Structured
+/// provenance retains the resolved receiver and selected route.
 pub fn project_object_call(
     object: &str,
     method: &str,
@@ -337,6 +371,21 @@ pub(crate) fn project_object_call_with_runtime(
         return complete(ctx, &call, value, HardwareValueSource::Adapter);
     }
 
+    if let Some(reply) = runtime.can.as_mut().call_routed(&call)? {
+        let value = coerce_hardware_value(reply.value, returns, &call, ctx)?;
+        if let Some(event) = reply.event
+            && let Some(trace) = ctx.trace.as_deref_mut()
+        {
+            trace.record_can(event);
+        }
+        let source = if reply.external {
+            HardwareValueSource::VirtualCanRx
+        } else {
+            HardwareValueSource::VirtualCan
+        };
+        return complete(ctx, &call, value, source);
+    }
+
     if let Some(value) = project_stub(method) {
         return complete(ctx, &call, value, HardwareValueSource::GenericStub);
     }
@@ -353,6 +402,9 @@ fn project_return_type(method: &str) -> Option<&'static str> {
         "GetInteger" => Some("Integer"),
         "GetScaled" | "GetFloat" => Some("FloatingPoint"),
         "Receive" | "GetBit" => Some("Boolean"),
+        "Tx" | "TxInitialise" | "Init" | "SetBit" | "SetUnsignedInteger" | "SetInteger"
+        | "SetScaled" | "SetFloat" | "SetFromBaseUnit" | "Set" | "Update" | "SetState"
+        | "Buzze" => Some("Void"),
         _ => None,
     }
 }
@@ -599,6 +651,7 @@ mod tests {
                 time,
                 hardware,
                 serial: crate::expr::SerialRuntime::fresh(),
+                can: crate::expr::CanRuntime::fresh(),
             };
             crate::builtins::dispatch_with_runtime(
                 object,
@@ -774,44 +827,76 @@ mod tests {
     }
 
     #[test]
-    fn can_read_returns_typed_external_stub() {
+    fn scenario_and_adapter_void_replies_never_leak_placeholder_scalars() {
         let mut h = Harness::new();
-        // No scenario value, no specific stub: a real CAN read now returns the
-        // type-correct externally-driven default (never a guessed reading).
-        // `CanComms.GetFloat` declares a `FloatingPoint` return, so the stub is 0.0.
+        h.env
+            .set_io_override("CanComms.TxInitialise", Value::m1_integer(123));
         assert_eq!(
             h.io(
+                "CanComms",
+                "TxInitialise",
+                &[Value::m1_unsigned(99), Value::m1_integer(1)],
+            )
+            .unwrap(),
+            Value::Bool(true)
+        );
+
+        let mut adapter = RecordingAdapter {
+            reply: AdapterReply::Value(Value::m1_float(456.0)),
+            calls: Vec::new(),
+        };
+        for (method, arguments) in [
+            (
+                "SetScaled",
+                vec![Value::m1_unsigned(1), Value::m1_float(2.0)],
+            ),
+            ("Tx", vec![Value::m1_unsigned(1)]),
+        ] {
+            assert_eq!(
+                h.io_at(
+                    "DBC.Demo.Frame.Signal",
+                    method,
+                    &arguments,
+                    CallSite::new("Demo.Update.m1scr", 88),
+                    crate::hardware::EvalTime::at_start(0.02),
+                    Some(&mut adapter),
+                )
+                .unwrap(),
+                Value::Bool(true)
+            );
+        }
+    }
+
+    #[test]
+    fn can_read_without_a_run_owned_handle_fails_loud() {
+        let mut h = Harness::new();
+        let error = h
+            .io(
                 "CanComms",
                 "GetFloat",
-                &[Value::m1_unsigned(0), Value::m1_integer(0)]
+                &[Value::m1_unsigned(0), Value::m1_integer(0)],
             )
-            .unwrap(),
-            Value::m1_float(0.0)
-        );
-        // The stub is flagged externally driven.
-        assert!(h.trace.is_external("CanComms.GetFloat"));
+            .expect_err("zero is never a virtual CAN handle");
+        assert!(error.to_string().contains("invalid handle 0"), "{error}");
+        assert!(!h.trace.is_external("CanComms.GetFloat"));
     }
 
     #[test]
-    fn fixed_point_io_stub_preserves_its_declared_family() {
+    fn fixed_point_can_read_requires_a_run_owned_handle() {
         let mut h = Harness::new();
-        assert_eq!(
-            h.io(
+        let error = h
+            .io(
                 "CanComms",
                 "GetFixed7DP",
-                &[Value::m1_unsigned(0), Value::m1_integer(0)]
+                &[Value::m1_unsigned(0), Value::m1_integer(0)],
             )
-            .unwrap(),
-            Value::M1(M1Scalar::FixedPoint7dps(FixedPoint7dps::ZERO))
-        );
+            .expect_err("zero is never a virtual CAN handle");
+        assert!(error.to_string().contains("invalid handle 0"), "{error}");
     }
 
     #[test]
-    fn can_open_handle_returns_unsigned_zero_external_stub() {
+    fn can_open_returns_a_nonzero_virtual_handle() {
         let mut h = Harness::new();
-        // `CanComms.RxOpenStandard` declares a `Handle` return — an opaque
-        // receive handle with no live offline resource. M1 scripts store handles
-        // in unsigned locals, so the typed stub is the opaque zero handle.
         assert_eq!(
             h.io(
                 "CanComms",
@@ -820,34 +905,31 @@ mod tests {
                     Value::m1_unsigned(0),
                     Value::m1_unsigned(0),
                     Value::m1_unsigned(0),
-                    Value::m1_unsigned(0)
+                    Value::Bool(false)
                 ],
             )
             .unwrap(),
-            Value::m1_unsigned(0)
+            Value::m1_unsigned(1)
         );
-        assert!(h.trace.is_external("CanComms.RxOpenStandard"));
+        assert!(!h.trace.is_external("CanComms.RxOpenStandard"));
     }
 
     #[test]
-    fn can_void_writer_returns_unit_external_stub() {
+    fn can_writer_without_a_run_owned_handle_fails_loud() {
         let mut h = Harness::new();
-        // `CanComms.SetFloat` declares a `Void` return — a bus write that is a
-        // no-op offline — so the typed stub is the benign unit value.
-        assert_eq!(
-            h.io(
+        let error = h
+            .io(
                 "CanComms",
                 "SetFloat",
                 &[
                     Value::m1_unsigned(0),
                     Value::m1_integer(0),
-                    Value::m1_float(1.0)
+                    Value::m1_float(1.0),
                 ],
             )
-            .unwrap(),
-            Value::Bool(true)
-        );
-        assert!(h.trace.is_external("CanComms.SetFloat"));
+            .expect_err("zero is never a virtual CAN handle");
+        assert!(error.to_string().contains("invalid handle 0"), "{error}");
+        assert!(!h.trace.is_external("CanComms.SetFloat"));
     }
 
     #[test]

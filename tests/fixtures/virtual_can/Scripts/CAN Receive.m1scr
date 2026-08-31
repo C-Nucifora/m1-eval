@@ -1,0 +1,6 @@
+// Synthetic virtual-CAN fixture. No proprietary content.
+DBC.Vehicle Network.Init(0);
+if (DBC.Vehicle Network.Status Frame.Receive())
+{
+    Rx Value = DBC.Vehicle Network.Status Frame.Count.GetScaled();
+}

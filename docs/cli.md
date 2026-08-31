@@ -48,7 +48,7 @@ error, exit `2`). `--override` and `--diff` require `--log`.
 The `Supported`, `Assumed`, `Adapter-backed`, and `Stubbed` buckets distinguish a
 direct implementation, an explicit offline model, a typed adapter route, and a
 typed offline fallback. An adapter route may use a user `HardwareAdapter` or an
-evaluator-owned adapter such as virtual serial. Required external hardware
+evaluator-owned adapter such as virtual CAN or virtual serial. Required external hardware
 metadata is only a subset of `Adapter-backed`. These are execution-route labels,
 not evidence maturity. `Supported` and `Assumed` remain **Assumed** maturity
 until compared with captured M1 output. See the
@@ -126,6 +126,14 @@ const = 1048576
 time_s = 0.125
 port = 0
 bytes = [0x1b, 0x30, 0x35, 0x0d]
+
+# One classic-CAN frame in wire-byte order. `extended` defaults to false.
+[[can.rx]]
+time_s = 0.125
+bus = 0
+id = 0x123
+extended = false
+bytes = [0x12, 0x34]
 ```
 
 Whole-project mode shares one virtual adapter between `On Startup` and periodic
@@ -135,6 +143,12 @@ declaration schedules bytes but does not initialize a port. Counterfactual
 replay has neither scenario RX declarations nor a startup pass. See
 [`virtual-serial.md`](virtual-serial.md) for state ownership and mixed-route
 failure rules.
+
+The virtual CAN model follows the same run ownership boundary. Function and cone
+modes must initialize a raw bus or DBC module in their selected call chain.
+Counterfactual replay has fresh CAN state, no startup pass, and no scenario CAN
+frames. See [`virtual-can.md`](virtual-can.md) for exact methods, bit addressing,
+DBC layouts, and route ownership.
 
 Identifiers may contain spaces (e.g. `Cooling Fan.Output`); channel names are
 used verbatim and never split on whitespace, only on `.` for path segments.
@@ -155,24 +169,29 @@ Table captures also follow the stricter vector and corpus checks in
 ## Output
 
 - **JSON** (`--out trace.json`, or no `--out`):
-  `{ "time": [...], "channels": { path: [...] }, "external": [...], "hardware": [...], "serial": [...] }`.
+  `{ "time": [...], "channels": { path: [...] }, "external": [...], "hardware": [...], "serial": [...], "can": [...] }`.
   Each `hardware` record names the resolved receiver, source spelling, method,
   script, byte offset, and selected route (`scenario-exact`,
-  `scenario-wildcard`, `adapter`, `virtual-serial`, `virtual-serial-rx`,
+  `scenario-wildcard`, `adapter`, `virtual-can`, `virtual-can-rx`, `virtual-serial`, `virtual-serial-rx`,
   `system-model`, or `generic-stub`). Each ordered `serial` record contains the
   RX/TX direction, evaluator time and phase, base tick, port, stable handle,
-  bytes, script, and call offset. The
+  bytes, script, and call offset. Each ordered `can` record contains RX/TX
+  direction, evaluator time and phase, base tick, bus, ID and format, wire
+  bytes, optional handle, optional exact DBC message identity, script, and call
+  offset. The
   `external` list names channels whose values were externally driven rather than
   computed, including scenario inputs, held initial state, Tier-3 stubs,
   parameter defaults, opt-in table fallbacks, and opt-in defaults for unseeded
   channels. JSON has no non-finite numeric values, so NaN and positive or
   negative infinity are written as `null`.
 - **CSV** (`--out trace.csv`): a `time` header column followed by one column per
-  channel in sorted-name order, one row per tick. Serial byte events are JSON
-  metadata and are deliberately absent from CSV.
+  channel in sorted-name order, one row per tick. Serial byte and CAN frame
+  events are JSON metadata and are deliberately absent from CSV.
 
 The virtual serial model is fresh for each run. Its complete method and error
 contract is documented in [`virtual-serial.md`](virtual-serial.md).
+The virtual CAN model is also fresh per run; see
+[`virtual-can.md`](virtual-can.md).
 
 Both are deterministic: the same scenario always produces byte-identical output.
 

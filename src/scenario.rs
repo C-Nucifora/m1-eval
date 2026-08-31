@@ -208,6 +208,9 @@ pub struct Scenario {
     /// Deterministic virtual-serial inputs. Each declaration becomes visible to
     /// `Serial.Receive` when evaluator time reaches its timestamp.
     pub serial: SerialScenario,
+    /// Deterministic virtual-CAN inputs. Each frame becomes visible to matching
+    /// receive handles when evaluator time reaches its timestamp.
+    pub can: CanScenario,
     /// Whole-project mode only: substitute type-correct startup defaults for
     /// unseeded channel reads (each substitution is reported on the trace)
     /// instead of failing loud. **Off by default** — strict fail-loud is the
@@ -231,6 +234,29 @@ pub struct SerialRx {
     /// Non-negative M1 serial port number.
     pub port: i32,
     /// Bytes appended to the port's receive stream at [`SerialRx::time_s`].
+    pub bytes: Vec<u8>,
+}
+
+/// Scenario-owned frames for the deterministic virtual CAN adapter.
+#[derive(Debug, Clone, Default, PartialEq)]
+pub struct CanScenario {
+    /// Received frames, ordered by timestamp and then declaration order.
+    pub rx: Vec<CanRx>,
+}
+
+/// One classic CAN frame made available at evaluator time.
+#[derive(Debug, Clone, PartialEq)]
+pub struct CanRx {
+    /// Seconds from the beginning of the run. Startup and periodic tick zero
+    /// both observe declarations at `0.0`.
+    pub time_s: f64,
+    /// M1 CAN bus number, restricted by the catalogue to 0 through 2.
+    pub bus: i32,
+    /// Numeric 11-bit or 29-bit identifier.
+    pub id: u32,
+    /// `false` for a standard frame, `true` for an extended frame.
+    pub extended: bool,
+    /// Classic CAN payload in wire order, from zero through eight bytes.
     pub bytes: Vec<u8>,
 }
 
@@ -528,6 +554,8 @@ struct RawScenario {
     io: Vec<RawIo>,
     #[serde(default)]
     serial: RawSerial,
+    #[serde(default)]
+    can: RawCan,
     /// Opt-in unseeded-channel defaulting for whole-project mode (strict
     /// fail-loud when absent/false).
     #[serde(default)]
@@ -554,6 +582,25 @@ struct RawSerial {
 struct RawSerialRx {
     time_s: f64,
     port: i64,
+    bytes: Vec<i64>,
+}
+
+/// Wire shape for `[can]` and `[[can.rx]]` entries.
+#[derive(Debug, Default, Deserialize)]
+#[serde(deny_unknown_fields)]
+struct RawCan {
+    #[serde(default)]
+    rx: Vec<RawCanRx>,
+}
+
+#[derive(Debug, Deserialize)]
+#[serde(deny_unknown_fields)]
+struct RawCanRx {
+    time_s: f64,
+    bus: i64,
+    id: u64,
+    #[serde(default)]
+    extended: bool,
     bytes: Vec<i64>,
 }
 
@@ -761,6 +808,7 @@ impl RawScenario {
             .map(RawIo::into_io)
             .collect::<Result<Vec<_>, _>>()?;
         let serial = self.serial.into_serial()?;
+        let can = self.can.into_can()?;
         let mut io_selectors = BTreeSet::new();
         for entry in &io {
             if !io_selectors.insert((entry.call.clone(), entry.site.clone())) {
@@ -788,7 +836,113 @@ impl RawScenario {
             overrides,
             io,
             serial,
+            can,
             allow_default_inputs: self.allow_default_inputs,
+        })
+    }
+}
+
+impl RawCan {
+    fn into_can(self) -> Result<CanScenario, EvalError> {
+        let mut rx = self
+            .rx
+            .into_iter()
+            .enumerate()
+            .map(|(declaration, entry)| {
+                if !entry.time_s.is_finite() || entry.time_s < 0.0 {
+                    return Err(EvalError::UnsupportedConstruct {
+                        kind: format!(
+                            "CAN rx declaration {} has invalid time_s {} (expected a finite, non-negative time)",
+                            declaration + 1,
+                            entry.time_s
+                        ),
+                        at: 0,
+                    });
+                }
+                let bus = i32::try_from(entry.bus).map_err(|_| {
+                    EvalError::UnsupportedConstruct {
+                        kind: format!(
+                            "CAN rx declaration {} has bus {} outside the M1 Integer range",
+                            declaration + 1,
+                            entry.bus
+                        ),
+                        at: 0,
+                    }
+                })?;
+                if !(0..=2).contains(&bus) {
+                    return Err(EvalError::UnsupportedConstruct {
+                        kind: format!(
+                            "CAN rx declaration {} has bus {bus}, outside the catalogue range 0..=2",
+                            declaration + 1
+                        ),
+                        at: 0,
+                    });
+                }
+                let id = u32::try_from(entry.id).map_err(|_| {
+                    EvalError::UnsupportedConstruct {
+                        kind: format!(
+                            "CAN rx declaration {} has identifier {}, outside the 32-bit source representation",
+                            declaration + 1,
+                            entry.id
+                        ),
+                        at: 0,
+                    }
+                })?;
+                let maximum = if entry.extended { 0x1FFF_FFFF } else { 0x7FF };
+                if id > maximum {
+                    let format = if entry.extended { "extended" } else { "standard" };
+                    return Err(EvalError::UnsupportedConstruct {
+                        kind: format!(
+                            "CAN rx declaration {} has {format} identifier 0x{id:X}, outside 0x0..=0x{maximum:X}",
+                            declaration + 1
+                        ),
+                        at: 0,
+                    });
+                }
+                let bytes = entry
+                    .bytes
+                    .into_iter()
+                    .enumerate()
+                    .map(|(index, byte)| {
+                        u8::try_from(byte).map_err(|_| EvalError::UnsupportedConstruct {
+                            kind: format!(
+                                "CAN rx declaration {} byte {} is {byte}, outside 0..=255",
+                                declaration + 1,
+                                index
+                            ),
+                            at: 0,
+                        })
+                    })
+                    .collect::<Result<Vec<_>, _>>()?;
+                if bytes.len() > 8 {
+                    return Err(EvalError::UnsupportedConstruct {
+                        kind: format!(
+                            "CAN rx declaration {} has {} bytes, exceeding the 8-byte classic CAN payload",
+                            declaration + 1,
+                            bytes.len()
+                        ),
+                        at: 0,
+                    });
+                }
+                Ok((
+                    declaration,
+                    CanRx {
+                        time_s: entry.time_s,
+                        bus,
+                        id,
+                        extended: entry.extended,
+                        bytes,
+                    },
+                ))
+            })
+            .collect::<Result<Vec<_>, EvalError>>()?;
+        rx.sort_by(|(left_index, left), (right_index, right)| {
+            left.time_s
+                .total_cmp(&right.time_s)
+                .then_with(|| left_index.cmp(right_index))
+        });
+        Ok(CanScenario {
+            rx: rx.into_iter().map(|(_, entry)| entry).collect(),
         })
     }
 }
@@ -1435,6 +1589,97 @@ const = 2
         assert_eq!(sc.io.len(), 1);
         assert_eq!(sc.io[0].call, "CanComms.GetFloat");
         assert_eq!(sc.io[0].sample(0.0), Value::m1_float(12.5));
+    }
+
+    #[test]
+    fn can_frames_parse_in_toml_and_json_and_keep_stable_time_order() {
+        let toml = r#"
+mode = "whole-project"
+duration_s = 0.5
+
+[[can.rx]]
+time_s = 0.25
+bus = 2
+id = 536870911
+extended = true
+bytes = [255, 0]
+
+[[can.rx]]
+time_s = 0.0
+bus = 0
+id = 291
+bytes = []
+
+[[can.rx]]
+time_s = 0.25
+bus = 1
+id = 1
+bytes = [1]
+"#;
+        let scenario = Scenario::from_toml_str(toml).expect("valid virtual-CAN scenario");
+        assert_eq!(scenario.can.rx.len(), 3);
+        assert_eq!(scenario.can.rx[0].time_s, 0.0);
+        assert_eq!(scenario.can.rx[0].id, 0x123);
+        assert_eq!(scenario.can.rx[1].bus, 2);
+        assert!(scenario.can.rx[1].extended);
+        assert_eq!(scenario.can.rx[2].bus, 1, "equal times keep source order");
+
+        let json = r#"{
+            "mode": "whole-project",
+            "duration_s": 0.5,
+            "can": {"rx": [{
+                "time_s": 0.1,
+                "bus": 1,
+                "id": 2047,
+                "bytes": [18, 52]
+            }]}
+        }"#;
+        let scenario = Scenario::from_json_str(json).expect("valid JSON virtual-CAN scenario");
+        assert_eq!(scenario.can.rx[0].bytes, [0x12, 0x34]);
+        assert!(!scenario.can.rx[0].extended);
+    }
+
+    #[test]
+    fn can_frames_reject_invalid_bus_identifier_payload_and_time() {
+        for (entry, expected) in [
+            (
+                "time_s = -0.1\nbus = 0\nid = 1\nbytes = []",
+                "invalid time_s",
+            ),
+            (
+                "time_s = nan\nbus = 0\nid = 1\nbytes = []",
+                "invalid time_s",
+            ),
+            (
+                "time_s = inf\nbus = 0\nid = 1\nbytes = []",
+                "invalid time_s",
+            ),
+            (
+                "time_s = 0.0\nbus = 3\nid = 1\nbytes = []",
+                "catalogue range 0..=2",
+            ),
+            (
+                "time_s = 0.0\nbus = 0\nid = 2048\nbytes = []",
+                "standard identifier",
+            ),
+            (
+                "time_s = 0.0\nbus = 0\nid = 536870912\nextended = true\nbytes = []",
+                "extended identifier",
+            ),
+            (
+                "time_s = 0.0\nbus = 0\nid = 1\nbytes = [256]",
+                "outside 0..=255",
+            ),
+            (
+                "time_s = 0.0\nbus = 0\nid = 1\nbytes = [0,0,0,0,0,0,0,0,0]",
+                "8-byte classic CAN payload",
+            ),
+        ] {
+            let document =
+                format!("mode = \"whole-project\"\nduration_s = 0.1\n\n[[can.rx]]\n{entry}\n");
+            let error = Scenario::from_toml_str(&document).unwrap_err();
+            assert!(error.to_string().contains(expected), "{error}");
+        }
     }
 
     #[test]

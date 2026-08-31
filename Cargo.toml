@@ -28,7 +28,10 @@ sha2 = "0.10"
 toml = "1.1"
 roxmltree = "0.21"
 m1-core = { git = "https://github.com/C-Nucifora/m1-core.git", tag = "v0.15.0" }
-m1-typecheck = { git = "https://github.com/C-Nucifora/m1-typecheck.git", tag = "v0.50.0" }
+m1-typecheck = { git = "https://github.com/C-Nucifora/m1-typecheck.git", tag = "v0.51.0" }
+# DEVELOPMENT ONLY: replace this contributor revision with the upstream m1-can
+# release containing runtime_model_loaded before publishing this crate.
+m1-can = { git = "https://github.com/C-Nucifora/m1-can.git", rev = "fbb60e94aa0540198d743082fdc3f3ef229f879e" }
 # MIT, GPL-3.0-compatible, pure-std clean-room `.ld`/`.ldx` file-format
 # reader+writer. Optional: only compiled in under the `ld` feature. We use its
 # reader to import `.ld` telemetry and its writer to generate the tiny synthetic

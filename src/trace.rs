@@ -29,7 +29,8 @@
 //! established JSON and CSV formats are untyped compatibility outputs, so they
 //! preserve numeric values but do not encode signedness metadata. Serialisation
 //! is deterministic, with a `time` column followed by channels in sorted-name
-//! order.
+//! order. Ordered serial transfers and CAN frames are JSON metadata; they do not
+//! become channel columns.
 
 use crate::env::CallSite;
 use crate::hardware::{EvalPhase, EvalTime, HardwareProvenance, ResolvedReceiver};
@@ -66,6 +67,9 @@ pub struct Trace {
     /// Ordered byte transfers through the deterministic virtual serial adapter.
     /// Unlike de-duplicated hardware provenance, repeated transfers are retained.
     pub serial: Vec<SerialEvent>,
+    /// Ordered frames received or transmitted through the deterministic virtual
+    /// CAN adapter. Repeated transfers are retained for TX inspection.
+    pub can: Vec<CanEvent>,
     /// Final channel value and provenance for each tick that recorded one.
     /// Kept separately from the compatibility columns, whose public shape
     /// cannot represent a missing value before a channel first appears.
@@ -110,6 +114,47 @@ pub struct SerialEvent {
     /// Bytes transferred in wire order.
     pub bytes: Vec<u8>,
     /// Exact `Serial.Receive` or `Serial.Transmit` call occurrence.
+    pub site: CallSite,
+}
+
+/// Direction of one observable virtual CAN transfer.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum CanTransferDirection {
+    /// A scenario-controlled frame was consumed by a receive object.
+    Rx,
+    /// A script emitted a frame from a transmit buffer.
+    Tx,
+}
+
+impl CanTransferDirection {
+    fn as_str(self) -> &'static str {
+        match self {
+            CanTransferDirection::Rx => "rx",
+            CanTransferDirection::Tx => "tx",
+        }
+    }
+}
+
+/// One ordered virtual CAN frame event.
+#[derive(Debug, Clone, PartialEq)]
+pub struct CanEvent {
+    /// Receive or transmit.
+    pub direction: CanTransferDirection,
+    /// Evaluator time at which the script consumed or emitted the frame.
+    pub time: EvalTime,
+    /// M1 CAN bus number.
+    pub bus: i32,
+    /// Numeric CAN identifier.
+    pub frame_id: u32,
+    /// Standard 11-bit or extended 29-bit format.
+    pub format: m1_can::CanFrameFormat,
+    /// Payload bytes in wire order.
+    pub bytes: Vec<u8>,
+    /// Stable raw or DBC transmit/receive handle when the operation has one.
+    pub handle: Option<u32>,
+    /// Exact DBC message identity for DBC-backed operations.
+    pub message: Option<String>,
+    /// Exact hardware-call occurrence.
     pub site: CallSite,
 }
 
@@ -272,9 +317,14 @@ impl Trace {
         self.serial.push(event);
     }
 
+    /// Append one virtual CAN frame in execution order.
+    pub fn record_can(&mut self, event: CanEvent) {
+        self.can.push(event);
+    }
+
     /// Serialise the channel columns + time axis to JSON. The shape is
     /// `{ "time": [...], "channels": { path: [...] }, "external": [...],
-    /// "hardware": [...], "serial": [...] }`,
+    /// "hardware": [...], "serial": [...], "can": [...] }`,
     /// values rendered by `value_json`. This historical untyped shape cannot
     /// expose M1 scalar-family metadata. JSON has no non-finite number syntax, so
     /// NaN and positive or negative infinity are written as `null`. Deterministic
@@ -301,6 +351,8 @@ impl Trace {
         out.push_str(&join(self.hardware.iter().map(hardware_json)));
         out.push_str("],\"serial\":[");
         out.push_str(&join(self.serial.iter().map(serial_json)));
+        out.push_str("],\"can\":[");
+        out.push_str(&join(self.can.iter().map(can_json)));
         out.push_str("]}");
         out
     }
@@ -347,6 +399,41 @@ fn serial_json(event: &SerialEvent) -> String {
         event.port,
         event.handle,
         bytes,
+        json_string(event.site.script()),
+        event.site.offset(),
+    )
+}
+
+/// Render one ordered virtual CAN frame.
+fn can_json(event: &CanEvent) -> String {
+    let phase = match event.time.phase {
+        EvalPhase::Startup => "startup",
+        EvalPhase::Periodic => "periodic",
+    };
+    let format = match event.format {
+        m1_can::CanFrameFormat::Standard => "standard",
+        m1_can::CanFrameFormat::Extended => "extended",
+    };
+    let bytes = join(event.bytes.iter().map(u8::to_string));
+    let handle = event
+        .handle
+        .map_or_else(|| "null".to_string(), |value| value.to_string());
+    let message = event
+        .message
+        .as_deref()
+        .map_or_else(|| "null".to_string(), json_string);
+    format!(
+        "{{\"direction\":{},\"time_s\":{},\"phase\":{},\"base_tick\":{},\"bus\":{},\"id\":{},\"format\":{},\"bytes\":[{}],\"handle\":{},\"message\":{},\"script\":{},\"offset\":{}}}",
+        json_string(event.direction.as_str()),
+        f64_json(event.time.elapsed_s),
+        json_string(phase),
+        event.time.base_tick,
+        event.bus,
+        event.frame_id,
+        json_string(format),
+        bytes,
+        handle,
+        message,
         json_string(event.site.script()),
         event.site.offset(),
     )
@@ -537,7 +624,7 @@ mod tests {
         // BTreeMap ordering: A before B regardless of insertion order.
         assert_eq!(
             json,
-            "{\"time\":[0],\"channels\":{\"A\":[true],\"B\":[2]},\"external\":[\"A\"],\"hardware\":[],\"serial\":[]}"
+            "{\"time\":[0],\"channels\":{\"A\":[true],\"B\":[2]},\"external\":[\"A\"],\"hardware\":[],\"serial\":[],\"can\":[]}"
         );
     }
 
@@ -557,7 +644,7 @@ mod tests {
 
         assert_eq!(
             tr.to_json(),
-            "{\"time\":[0],\"channels\":{\"Fixed\":[0.1000001],\"Float\":[0.1],\"Int\":[-2147483648],\"Uint\":[4294967295]},\"external\":[],\"hardware\":[],\"serial\":[]}"
+            "{\"time\":[0],\"channels\":{\"Fixed\":[0.1000001],\"Float\":[0.1],\"Int\":[-2147483648],\"Uint\":[4294967295]},\"external\":[],\"hardware\":[],\"serial\":[],\"can\":[]}"
         );
     }
 
@@ -576,7 +663,7 @@ mod tests {
         let json = tr.to_json();
         assert_eq!(
             json,
-            "{\"time\":[null,null,null],\"channels\":{\"M1\":[null,null,null]},\"external\":[],\"hardware\":[],\"serial\":[]}"
+            "{\"time\":[null,null,null],\"channels\":{\"M1\":[null,null,null]},\"external\":[],\"hardware\":[],\"serial\":[],\"can\":[]}"
         );
         let parsed: serde_json::Value =
             serde_json::from_str(&json).expect("trace output must be valid JSON");
@@ -629,5 +716,44 @@ mod tests {
             }])
         );
         assert_eq!(trace.to_csv(), "time,Out\n0.25,1\n");
+    }
+
+    #[test]
+    fn can_events_are_ordered_json_metadata_and_not_csv_columns() {
+        let mut trace = Trace::new();
+        trace.push_tick(0.5);
+        trace.record_channel("Out", Value::m1_integer(1));
+        trace.record_can(CanEvent {
+            direction: CanTransferDirection::Rx,
+            time: EvalTime::periodic(50, 0.5, 0.01, 0.02),
+            bus: 1,
+            frame_id: 0x18ff_1234,
+            format: m1_can::CanFrameFormat::Extended,
+            bytes: vec![0xde, 0xad],
+            handle: Some(9),
+            message: Some("Vehicle Network.Status Frame".to_string()),
+            site: CallSite::new("Demo.Read.m1scr", 77),
+        });
+
+        let json: serde_json::Value =
+            serde_json::from_str(&trace.to_json()).expect("CAN trace is valid JSON");
+        assert_eq!(
+            json["can"],
+            serde_json::json!([{
+                "direction": "rx",
+                "time_s": 0.5,
+                "phase": "periodic",
+                "base_tick": 50,
+                "bus": 1,
+                "id": 0x18ff_1234,
+                "format": "extended",
+                "bytes": [222, 173],
+                "handle": 9,
+                "message": "Vehicle Network.Status Frame",
+                "script": "Demo.Read.m1scr",
+                "offset": 77
+            }])
+        );
+        assert_eq!(trace.to_csv(), "time,Out\n0.5,1\n");
     }
 }

@@ -348,6 +348,7 @@ mod tests {
                 time,
                 hardware,
                 serial: crate::expr::SerialRuntime::fresh(),
+                can: crate::expr::CanRuntime::fresh(),
             };
             call_with_runtime(callee, args, &mut ctx, &mut runtime)
         }
@@ -385,6 +386,10 @@ mod tests {
     #[test]
     fn raw_signature_metadata_directs_fixed_point_boundaries() {
         let mut h = Harness::new();
+        h.env.set_io_override(
+            "CanComms.GetFixed7DP",
+            Value::M1(M1Scalar::FixedPoint7dps(crate::value::FixedPoint7dps::ZERO)),
+        );
         let fixed = Value::M1(M1Scalar::FixedPoint7dps(
             crate::value::FixedPoint7dps::from_raw(12_345_678),
         ));

@@ -91,6 +91,7 @@ pub(crate) fn dispatch_with_runtime(
     let capability = {
         let scope = CapabilityScope {
             project: Some(ctx.project),
+            can: Some(runtime.can.as_ref().model()),
             group: ctx.group,
             fn_symbol: ctx.fn_symbol,
             locals: Some(&ctx.env.locals),
@@ -237,6 +238,7 @@ pub(crate) fn dispatch_bare_with_runtime(
     let capability = {
         let scope = CapabilityScope {
             project: Some(ctx.project),
+            can: None,
             group: ctx.group,
             fn_symbol: ctx.fn_symbol,
             locals: Some(&ctx.env.locals),
@@ -746,9 +748,10 @@ pub enum BuiltinSupport {
     /// A hardware call with a documented generic offline fallback.
     Stubbed,
     /// Runs through a typed external-adapter route. The route may use a user
-    /// adapter or an evaluator-owned adapter such as virtual serial. It also
-    /// carries capture-only library calls whose executable contract is absent.
-    /// Only some calls in this category require external metadata.
+    /// adapter or an evaluator-owned adapter such as virtual CAN or virtual
+    /// serial. It also carries capture-only library calls whose executable
+    /// contract is absent. Only some calls in this category require external
+    /// metadata.
     AdapterBacked,
     /// Not implemented — fails loud at runtime.
     Unsupported,
@@ -788,6 +791,7 @@ pub(crate) struct CallCapability {
 /// qualified library call such as `Calculate.Max`.
 pub(crate) struct CapabilityScope<'a> {
     pub(crate) project: Option<&'a Project>,
+    pub(crate) can: Option<&'a m1_can::CanRuntimeModel>,
     pub(crate) group: Option<&'a str>,
     pub(crate) fn_symbol: Option<&'a str>,
     pub(crate) locals: Option<&'a HashMap<String, Value>>,
@@ -1007,8 +1011,8 @@ pub(crate) fn classify_member_call(
 
     match classify(object, scope.group, scope.fn_symbol, project, locals) {
         Target::Builtin { object: builtin } => classify_library(&builtin, method),
-        Target::Symbol(canon) => classify_project_method(&canon, method, project),
-        Target::Unresolved => classify_unresolved_project_method(object, method),
+        Target::Symbol(canon) => classify_project_method(&canon, method, project, scope.can),
+        Target::Unresolved => classify_unresolved_project_method(object, method, scope.can),
         Target::Local(_) => unsupported_capability(),
     }
 }
@@ -1029,7 +1033,7 @@ fn classify_without_project(object: &str, method: &str) -> CallCapability {
     if object == "Library" || object.starts_with("Library.") {
         return unsupported_capability();
     }
-    classify_unresolved_project_method(object, method)
+    classify_unresolved_project_method(object, method, None)
 }
 
 /// Normalize a source receiver that directly names a library object. The
@@ -1076,6 +1080,18 @@ fn classify_library(object: &str, method: &str) -> CallCapability {
         let known = !intrinsics::get()
             .library_overloads(object, method)
             .is_empty();
+        if object == "CanComms" && known && crate::virtual_can::is_library_method(method) {
+            return capability(
+                BuiltinSupport::AdapterBacked,
+                CallRoute::IoLibrary(object.to_string()),
+            );
+        }
+        if object == "CanComms" && known {
+            return capability(
+                BuiltinSupport::Unsupported,
+                CallRoute::IoLibrary(object.to_string()),
+            );
+        }
         if object == "Serial" && known && crate::virtual_serial::is_adapter_backed(method) {
             return capability(
                 BuiltinSupport::AdapterBacked,
@@ -1119,7 +1135,12 @@ fn classify_library(object: &str, method: &str) -> CallCapability {
     unsupported_capability()
 }
 
-fn classify_project_method(canon: &str, method: &str, project: &Project) -> CallCapability {
+fn classify_project_method(
+    canon: &str,
+    method: &str,
+    project: &Project,
+    can: Option<&m1_can::CanRuntimeModel>,
+) -> CallCapability {
     let Some(symbol) = project.symbols().get(canon) else {
         return unsupported_capability();
     };
@@ -1183,6 +1204,21 @@ fn classify_project_method(canon: &str, method: &str, project: &Project) -> Call
     {
         return capability(BuiltinSupport::Modeled, CallRoute::Timer);
     }
+    if let Some(model) = can
+        && let Some(project_receiver) = crate::virtual_can::model_project_receiver(model, canon)
+    {
+        let support = if crate::virtual_can::model_handles_project_call(model, canon, method) {
+            BuiltinSupport::AdapterBacked
+        } else {
+            BuiltinSupport::Unsupported
+        };
+        return capability(
+            support,
+            CallRoute::ProjectIo(ResolvedReceiver::Project {
+                path: project_receiver.to_string(),
+            }),
+        );
+    }
     if matches!(
         symbol.kind,
         SymbolKind::Object | SymbolKind::Group | SymbolKind::Reference | SymbolKind::Other
@@ -1209,14 +1245,33 @@ fn classify_project_method(canon: &str, method: &str, project: &Project) -> Call
     unsupported_capability()
 }
 
-fn classify_unresolved_project_method(object: &str, method: &str) -> CallCapability {
-    let route = CallRoute::ProjectIo(ResolvedReceiver::Unresolved {
+fn classify_unresolved_project_method(
+    object: &str,
+    method: &str,
+    can: Option<&m1_can::CanRuntimeModel>,
+) -> CallCapability {
+    let unresolved_route = CallRoute::ProjectIo(ResolvedReceiver::Unresolved {
         spelling: object.to_string(),
     });
+    if let Some(model) = can
+        && let Some(project_receiver) = crate::virtual_can::model_project_receiver(model, object)
+    {
+        let support = if crate::virtual_can::model_handles_project_call(model, object, method) {
+            BuiltinSupport::AdapterBacked
+        } else {
+            BuiltinSupport::Unsupported
+        };
+        return capability(
+            support,
+            CallRoute::ProjectIo(ResolvedReceiver::Project {
+                path: project_receiver.to_string(),
+            }),
+        );
+    }
     if io_stub::PROJECT_OBJECT_STUB_METHODS.contains(&method) {
-        capability(BuiltinSupport::Stubbed, route)
+        capability(BuiltinSupport::Stubbed, unresolved_route)
     } else {
-        capability(BuiltinSupport::Unsupported, route)
+        capability(BuiltinSupport::Unsupported, unresolved_route)
     }
 }
 
@@ -1260,6 +1315,7 @@ fn script_backed_user_function(callee: &str, scope: &CapabilityScope<'_>) -> Opt
 pub fn classify_builtin(object: &str, method: &str) -> BuiltinSupport {
     let scope = CapabilityScope {
         project: None,
+        can: None,
         group: None,
         fn_symbol: None,
         locals: None,
@@ -1297,6 +1353,7 @@ mod tests {
     ) -> BuiltinSupport {
         let scope = CapabilityScope {
             project: Some(&loaded.project),
+            can: Some(&loaded.can),
             group,
             fn_symbol,
             locals: None,
@@ -1369,6 +1426,7 @@ mod tests {
                 time: crate::hardware::EvalTime::periodic(4, 0.04, 0.01, 0.02),
                 hardware: Some(adapter),
                 serial: crate::expr::SerialRuntime::fresh(),
+                can: crate::expr::CanRuntime::fresh(),
             };
             dispatch_with_runtime(object, method, args, site, &mut ctx, &mut runtime)
         }
@@ -1430,6 +1488,8 @@ mod tests {
     #[test]
     fn library_qualified_calls_dispatch_through_canonical_objects() {
         let mut h = Harness::new();
+        h.env
+            .set_io_override("CanComms.GetFloat", Value::m1_float(0.0));
 
         assert_eq!(
             h.call(
@@ -2272,6 +2332,7 @@ mod tests {
                 time: crate::hardware::EvalTime::at_start(0.01),
                 hardware,
                 serial: crate::expr::SerialRuntime::fresh(),
+                can: crate::expr::CanRuntime::fresh(),
             };
             dispatch_with_runtime(object, method, args, site, &mut ctx, &mut runtime)
         }
@@ -3330,6 +3391,10 @@ mod tests {
                 let method = overload.name.as_str();
                 let support = if object == "System" && MODELED_SYSTEM_METHODS.contains(&method) {
                     BuiltinSupport::Modeled
+                } else if object == "CanComms" && crate::virtual_can::is_library_method(method) {
+                    BuiltinSupport::AdapterBacked
+                } else if object == "CanComms" {
+                    BuiltinSupport::Unsupported
                 } else if object == "Serial" && crate::virtual_serial::is_adapter_backed(method) {
                     BuiltinSupport::AdapterBacked
                 } else if object == "Serial"
@@ -3387,8 +3452,13 @@ mod tests {
                     "Boolean" => Value::Bool(true),
                     "Integer" => Value::m1_integer(1),
                     "UnsignedInteger" => Value::m1_unsigned(1),
+                    "Handle" => Value::m1_unsigned(1),
+                    "FixedPoint7dps" => Value::M1(M1Scalar::FixedPoint7dps(
+                        crate::value::FixedPoint7dps::from_raw(1),
+                    )),
+                    "FloatingPoint" | "Integer|FloatingPoint" => Value::m1_float(1.0),
                     "String" => Value::Str("x".to_string()),
-                    _ => Value::m1_float(1.0),
+                    other => panic!("catalogue parity test has no value for {other}"),
                 })
                 .collect();
             let mut harness = Harness::new();
@@ -3433,24 +3503,28 @@ mod tests {
 
     #[test]
     fn io_library_methods_keep_modeled_metadata_and_stub_categories_distinct() {
-        // Every method on a hardware library object (CanComms/Serial/System/
-        // Logging) handled by the generic typed fallback must classify as
-        // Stubbed, so coverage stays consistent with runtime dispatch.
-        let cases = [
-            ("CanComms", "RxOpenStandard"),     // Handle -> unsigned-zero stub
-            ("CanComms", "GetFloat"),           // FloatingPoint -> 0.0
-            ("CanComms", "GetUnsignedInteger"), // Integer -> 0
-            ("CanComms", "RxMessage"),          // Boolean -> false
-            ("CanComms", "SetFloat"),           // Void -> unit
-            ("Logging", "Running"),
-        ];
-        for (object, method) in cases {
+        for method in [
+            "RxOpenStandard",
+            "GetFloat",
+            "GetUnsignedInteger",
+            "RxMessage",
+            "SetFloat",
+        ] {
             assert_eq!(
-                classify_builtin(object, method),
-                BuiltinSupport::Stubbed,
-                "{object}.{method} should be a stub"
+                classify_builtin("CanComms", method),
+                BuiltinSupport::AdapterBacked,
+                "CanComms.{method} should use virtual CAN"
             );
         }
+        assert_eq!(
+            classify_builtin("CanComms", "BusStatus"),
+            BuiltinSupport::Unsupported,
+            "known but unmodeled CAN calls must fail loud"
+        );
+        assert_eq!(
+            classify_builtin("Logging", "Running"),
+            BuiltinSupport::Stubbed
+        );
         assert_eq!(
             classify_builtin("Serial", "GetFloat"),
             BuiltinSupport::AdapterBacked,

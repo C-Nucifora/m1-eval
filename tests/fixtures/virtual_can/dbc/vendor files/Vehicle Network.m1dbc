@@ -1,0 +1,21 @@
+<?xml version="1.0"?>
+<!-- Synthetic virtual-CAN fixture. No proprietary content. -->
+<DBC>
+ <ComponentStream>
+  <List>
+   <Component Classname="BuiltIn.CAN.DBC" Name="Vehicle Network"/>
+   <Component Classname="BuiltIn.CAN.Message" Name="Vehicle Network.Status Frame">
+    <Props CANId="123" IdType="Standard" DLC="1" Transmit="RX"/>
+   </Component>
+   <Component Classname="BuiltIn.CAN.Signal" Name="Vehicle Network.Status Frame.Count">
+    <Props Type="u8" StartBit="0" Length="8" Endian="Little" Multiplier="2" Offset="1"/>
+   </Component>
+   <Component Classname="BuiltIn.CAN.Message" Name="Vehicle Network.Command Frame">
+    <Props CANId="321" IdType="Standard" DLC="1" Transmit="TX"/>
+   </Component>
+   <Component Classname="BuiltIn.CAN.Signal" Name="Vehicle Network.Command Frame.Command">
+    <Props Type="u8" StartBit="0" Length="8" Endian="Little" Multiplier="2" Offset="1"/>
+   </Component>
+  </List>
+ </ComponentStream>
+</DBC>
