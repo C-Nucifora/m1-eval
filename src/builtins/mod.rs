@@ -29,10 +29,12 @@ pub mod userfn;
 
 use crate::env::CallSite;
 use crate::error::EvalError;
-use crate::expr::{EvalCtx, EvalRuntime};
-use crate::hardware::ResolvedReceiver;
+use crate::expr::{EvalCtx, EvalRuntime, coerce_for_scalar_kind};
+use crate::hardware::{
+    AdapterReply, HardwareCall, HardwareProvenance, HardwareValueSource, ResolvedReceiver,
+};
 use crate::ident::{Target, classify};
-use crate::value::{M1Scalar, Value};
+use crate::value::{M1Scalar, M1ScalarKind, Value};
 use m1_typecheck::Project;
 use m1_typecheck::intrinsics;
 use m1_typecheck::parsed::ParsedScript;
@@ -201,6 +203,12 @@ pub(crate) fn dispatch_with_runtime(
         CallRoute::ProjectIo(receiver) => io_stub::project_object_call_with_runtime(
             receiver, object, method, args, site, ctx, runtime,
         ),
+        CallRoute::CataloguedAdapter(entry) => {
+            validate_arity(entry.object, object, method, args.len())?;
+            validate_catalogued_arguments(entry, object, args)?;
+            let arguments = normalize_catalogued_arguments(entry, object, args)?;
+            dispatch_catalogued_adapter(entry, object, method, arguments, site, ctx, runtime)
+        }
         CallRoute::Unsupported => Err(unsupported(object, method)),
     }
 }
@@ -460,6 +468,226 @@ fn validate_arity(
     }
 }
 
+/// Validate the captured argument families for a known but unsupported
+/// library method. This does not claim execution semantics. It only makes
+/// direct-dispatch diagnostics agree with the pinned signature catalogue.
+fn validate_catalogued_arguments(
+    entry: &CataloguedAdapterMethod,
+    source_object: &str,
+    args: &[Value],
+) -> Result<(), EvalError> {
+    let overload = intrinsics::get()
+        .library_overloads(entry.object, entry.method)
+        .into_iter()
+        .find(|overload| overload.params.len() == args.len())
+        .expect("arity was validated against the same intrinsic catalogue");
+
+    for (index, (param, value)) in overload.params.iter().zip(args).enumerate() {
+        if !catalogued_argument_matches(value, &param.ty) {
+            return Err(EvalError::TypeError {
+                detail: format!(
+                    "{source_object}.{} argument {} ({}) expects {}, got {}",
+                    entry.method,
+                    index + 1,
+                    param.name,
+                    param.ty,
+                    runtime_value_family(value)
+                ),
+            });
+        }
+    }
+
+    match (entry.object, entry.method) {
+        ("MPSE", "PressureRatioFactor") => {
+            let ratio = args[0].m1_scalar()?.as_f32();
+            if !ratio.is_finite() || !(0.0..=1.0).contains(&ratio) {
+                return Err(EvalError::BadCall {
+                    detail: format!(
+                        "{source_object}.PressureRatioFactor pressure ratio must be finite and in 0..=1, got {ratio:?}"
+                    ),
+                });
+            }
+        }
+        ("Switch", "Get" | "Set") => {
+            let index = match args[0].m1_scalar()? {
+                M1Scalar::Integer(value) => i64::from(value),
+                M1Scalar::UnsignedInteger(value) => i64::from(value),
+                _ => unreachable!("catalogue validation accepts only integral switch indices"),
+            };
+            if !(0..=63).contains(&index) {
+                return Err(EvalError::BadCall {
+                    detail: format!(
+                        "{source_object}.{} switch index must be in 0..=63, got {index}",
+                        entry.method
+                    ),
+                });
+            }
+        }
+        _ => {}
+    }
+    Ok(())
+}
+
+/// Match the widening families accepted by the pinned M1 intrinsic catalogue.
+/// No host-width numeric form participates in this check.
+fn catalogued_argument_matches(value: &Value, expected: &str) -> bool {
+    match expected {
+        "Integer" | "UnsignedInteger" => matches!(
+            value,
+            Value::M1(M1Scalar::Integer(_) | M1Scalar::UnsignedInteger(_))
+        ),
+        "FloatingPoint" => matches!(
+            value,
+            Value::M1(
+                M1Scalar::FloatingPoint(_) | M1Scalar::Integer(_) | M1Scalar::UnsignedInteger(_)
+            )
+        ),
+        "FixedPoint7dps" => matches!(value, Value::M1(M1Scalar::FixedPoint7dps(_))),
+        "Boolean" => matches!(value, Value::Bool(_)),
+        "String" => matches!(value, Value::Str(_)),
+        // The three pinned catalogues do not currently use another family.
+        // Reject one if a future capture adds it so the parity test forces an
+        // explicit representation decision.
+        _ => false,
+    }
+}
+
+/// Convert every accepted argument to the exact family declared by the pinned
+/// signature before an external adapter sees it. Integer conversions preserve
+/// M1's 32-bit patterns; floating-point conversions narrow to binary32.
+fn normalize_catalogued_arguments(
+    entry: &CataloguedAdapterMethod,
+    source_object: &str,
+    args: &[Value],
+) -> Result<Vec<Value>, EvalError> {
+    let overload = intrinsics::get()
+        .library_overloads(entry.object, entry.method)
+        .into_iter()
+        .find(|overload| overload.params.len() == args.len())
+        .expect("arity was validated against the same intrinsic catalogue");
+
+    overload
+        .params
+        .iter()
+        .zip(args)
+        .enumerate()
+        .map(|(index, (param, value))| {
+            let target = format!(
+                "{source_object}.{} argument {} ({})",
+                entry.method,
+                index + 1,
+                param.name
+            );
+            let kind = match param.ty.as_str() {
+                "Integer" => M1ScalarKind::Integer,
+                "UnsignedInteger" => M1ScalarKind::UnsignedInteger,
+                "FloatingPoint" => M1ScalarKind::FloatingPoint,
+                "FixedPoint7dps" => M1ScalarKind::FixedPoint7dps,
+                other => {
+                    return Err(EvalError::TypeError {
+                        detail: format!(
+                            "{target} uses unsupported captured argument family {other}"
+                        ),
+                    });
+                }
+            };
+            coerce_for_scalar_kind(&target, value.clone(), kind)
+        })
+        .collect()
+}
+
+/// Offer one capture-only call to an external adapter after validation and
+/// family normalization. Scenario overrides and generic typed defaults are not
+/// consulted. In particular, `Switch.Set` must reach the adapter that owns the
+/// side effect or fail loud.
+fn dispatch_catalogued_adapter(
+    entry: &CataloguedAdapterMethod,
+    source_object: &str,
+    method: &str,
+    arguments: Vec<Value>,
+    site: CallSite,
+    ctx: &mut EvalCtx,
+    runtime: &mut EvalRuntime<'_>,
+) -> Result<Value, EvalError> {
+    let call = HardwareCall {
+        receiver: ResolvedReceiver::Library {
+            object: entry.object.to_string(),
+        },
+        source_receiver: source_object.to_string(),
+        method: method.to_string(),
+        site,
+        arguments,
+        time: runtime.time,
+    };
+
+    let reply = match runtime.hardware.as_deref_mut() {
+        Some(adapter) => adapter.call(&call)?,
+        None => AdapterReply::Unhandled,
+    };
+    let AdapterReply::Value(value) = reply else {
+        return Err(catalogued_behavior_error(entry, source_object));
+    };
+    let value = normalize_catalogued_result(entry, source_object, value)?;
+
+    if let Some(trace) = ctx.trace.as_deref_mut() {
+        trace.mark_external(call.source_name());
+        trace.record_hardware(HardwareProvenance::new(&call, HardwareValueSource::Adapter));
+    }
+    Ok(value)
+}
+
+fn normalize_catalogued_result(
+    entry: &CataloguedAdapterMethod,
+    source_object: &str,
+    value: Value,
+) -> Result<Value, EvalError> {
+    let returns = intrinsics::get().library_overloads(entry.object, entry.method)[0]
+        .returns
+        .as_str();
+    let target = format!("{source_object}.{} result", entry.method);
+    if returns != "Void" && !catalogued_argument_matches(&value, returns) {
+        return Err(EvalError::TypeError {
+            detail: format!(
+                "{target} expects {returns}, got {}",
+                runtime_value_family(&value)
+            ),
+        });
+    }
+    match returns {
+        "Integer" => coerce_for_scalar_kind(&target, value, M1ScalarKind::Integer),
+        "UnsignedInteger" => coerce_for_scalar_kind(&target, value, M1ScalarKind::UnsignedInteger),
+        "FloatingPoint" => coerce_for_scalar_kind(&target, value, M1ScalarKind::FloatingPoint),
+        "FixedPoint7dps" => coerce_for_scalar_kind(&target, value, M1ScalarKind::FixedPoint7dps),
+        // The evaluator represents a successfully completed Void side effect
+        // with its established unit value. Never leak an adapter payload into
+        // script execution.
+        "Void" => Ok(Value::Bool(true)),
+        other => Err(EvalError::TypeError {
+            detail: format!("{target} uses unsupported captured return family {other}"),
+        }),
+    }
+}
+
+fn catalogued_behavior_error(entry: &CataloguedAdapterMethod, source_object: &str) -> EvalError {
+    EvalError::UnsupportedBuiltinBehavior {
+        object: source_object.to_string(),
+        method: entry.method.to_string(),
+        reason: entry.reason.to_string(),
+    }
+}
+
+fn runtime_value_family(value: &Value) -> &'static str {
+    match value {
+        Value::M1(M1Scalar::FloatingPoint(_)) => "M1 FloatingPoint",
+        Value::M1(M1Scalar::Integer(_)) => "M1 Integer",
+        Value::M1(M1Scalar::UnsignedInteger(_)) => "M1 UnsignedInteger",
+        Value::M1(M1Scalar::FixedPoint7dps(_)) => "M1 FixedPoint7dps",
+        Value::Bool(_) => "Boolean",
+        Value::Enum { .. } => "Enumeration",
+        Value::Str(_) => "String",
+    }
+}
+
 /// Validate a resolved project-object method against the object-method catalog.
 /// Receiver eligibility has already been decided by the capability model; this
 /// check only enforces the declared argument count.
@@ -517,9 +745,10 @@ pub enum BuiltinSupport {
     Modeled,
     /// A hardware call with a documented generic offline fallback.
     Stubbed,
-    /// Runs through a typed hardware-adapter route. The route may use a user
-    /// adapter or an evaluator-owned adapter such as virtual serial. Only some
-    /// calls in this category require external metadata.
+    /// Runs through a typed external-adapter route. The route may use a user
+    /// adapter or an evaluator-owned adapter such as virtual serial. It also
+    /// carries capture-only library calls whose executable contract is absent.
+    /// Only some calls in this category require external metadata.
     AdapterBacked,
     /// Not implemented — fails loud at runtime.
     Unsupported,
@@ -543,6 +772,7 @@ enum CallRoute {
     ChannelSet,
     Timer,
     ProjectIo(ResolvedReceiver),
+    CataloguedAdapter(&'static CataloguedAdapterMethod),
     Unsupported,
 }
 
@@ -570,6 +800,67 @@ fn capability(support: BuiltinSupport, route: CallRoute) -> CallCapability {
 
 fn unsupported_capability() -> CallCapability {
     capability(BuiltinSupport::Unsupported, CallRoute::Unsupported)
+}
+
+/// One signature captured from the M1 Build help pane whose execution contract
+/// is not captured. An external adapter may supply the missing behavior. With
+/// no handling adapter, runtime fails instead of returning a generic zero,
+/// performing a no-op, or using a guessed formula.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+struct CataloguedAdapterMethod {
+    object: &'static str,
+    method: &'static str,
+    reason: &'static str,
+}
+
+/// Method-for-method classification of the pinned `MPSE`, `TC`, and `Switch`
+/// catalogues. The reasons record what evidence must exist before a method can
+/// move from its required adapter route to a direct or modeled implementation.
+const CATALOGUED_ADAPTER_METHODS: &[CataloguedAdapterMethod] = &[
+    CataloguedAdapterMethod {
+        object: "MPSE",
+        method: "PressureRatioFactor",
+        reason: "the pinned help defines the signature and input range but not the pressure-ratio equation, constants, choked-flow boundary, or M1 rounding; no conformance vector is committed",
+    },
+    CataloguedAdapterMethod {
+        object: "MPSE",
+        method: "Solve",
+        reason: "the pinned help omits the integration equation, step ordering, unit convention, and Kalman update; no conformance vector is committed",
+    },
+    CataloguedAdapterMethod {
+        object: "MPSE",
+        method: "ThrottleMassFlow",
+        reason: "the pinned help omits units, gas constants, the throttle-area-factor definition, reverse-flow behavior, and the choked-flow boundary; no conformance vector is committed",
+    },
+    CataloguedAdapterMethod {
+        object: "TC",
+        method: "CO",
+        reason: "the zero-argument help signature does not identify the package state, calibration, or physical inputs used for crossover mass flow",
+    },
+    CataloguedAdapterMethod {
+        object: "TC",
+        method: "TP",
+        reason: "the pinned help does not define the inverse throttle model, calibration inputs, valid domain, or M1 rounding",
+    },
+    CataloguedAdapterMethod {
+        object: "Switch",
+        method: "Get",
+        reason: "the pinned help does not define switch-bank initial values, scope, lifetime, ordering, or external side effects",
+    },
+    CataloguedAdapterMethod {
+        object: "Switch",
+        method: "Set",
+        reason: "the pinned help does not define switch-bank initial values, scope, lifetime, ordering, or external side effects",
+    },
+];
+
+fn catalogued_adapter_method(
+    object: &str,
+    method: &str,
+) -> Option<&'static CataloguedAdapterMethod> {
+    CATALOGUED_ADAPTER_METHODS
+        .iter()
+        .find(|entry| entry.object == object && entry.method == method)
 }
 
 /// Direct pure-library implementations. The method catalog lives here, not in
@@ -754,6 +1045,12 @@ fn canonical_library_object(object: &str) -> Option<&'static str> {
 
 fn classify_library(object: &str, method: &str) -> CallCapability {
     let pair = (object, method);
+    if let Some(entry) = catalogued_adapter_method(object, method) {
+        return capability(
+            BuiltinSupport::AdapterBacked,
+            CallRoute::CataloguedAdapter(entry),
+        );
+    }
     if SUPPORTED_PURE_METHODS.contains(&pair) {
         return capability(
             BuiltinSupport::Direct,
@@ -1055,6 +1352,46 @@ mod tests {
             let site = CallSite::new("Demo.Update.m1scr", 0);
             let mut ctx = self.ctx();
             dispatch(object, method, args, site, &mut ctx)
+        }
+
+        fn call_with_adapter(
+            &mut self,
+            object: &str,
+            method: &str,
+            args: &[Value],
+            adapter: &mut dyn crate::hardware::HardwareAdapter,
+            trace: Option<&mut crate::trace::Trace>,
+        ) -> Result<Value, EvalError> {
+            let site = CallSite::new("Demo.Update.m1scr", 17);
+            let mut ctx = self.ctx();
+            ctx.trace = trace;
+            let mut runtime = EvalRuntime {
+                time: crate::hardware::EvalTime::periodic(4, 0.04, 0.01, 0.02),
+                hardware: Some(adapter),
+                serial: crate::expr::SerialRuntime::fresh(),
+            };
+            dispatch_with_runtime(object, method, args, site, &mut ctx, &mut runtime)
+        }
+    }
+
+    struct CapturingAdapter {
+        reply: AdapterReply,
+        calls: Vec<HardwareCall>,
+    }
+
+    impl CapturingAdapter {
+        fn replying(value: Value) -> CapturingAdapter {
+            CapturingAdapter {
+                reply: AdapterReply::Value(value),
+                calls: Vec::new(),
+            }
+        }
+    }
+
+    impl crate::hardware::HardwareAdapter for CapturingAdapter {
+        fn call(&mut self, call: &HardwareCall) -> Result<AdapterReply, EvalError> {
+            self.calls.push(call.clone());
+            Ok(self.reply.clone())
         }
     }
 
@@ -2679,6 +3016,296 @@ mod tests {
     }
 
     #[test]
+    fn pinned_mpse_tc_and_switch_catalogues_are_classified_method_for_method() {
+        let mut captured = Vec::new();
+        for object in ["MPSE", "TC", "Switch"] {
+            let library = intrinsics::get()
+                .library_object(object)
+                .expect("pinned library exists");
+            captured.extend(
+                library
+                    .functions
+                    .iter()
+                    .map(|overload| (object, overload.name.as_str())),
+            );
+        }
+        captured.sort_unstable();
+        captured.dedup();
+
+        let mut classified = CATALOGUED_ADAPTER_METHODS
+            .iter()
+            .map(|entry| (entry.object, entry.method))
+            .collect::<Vec<_>>();
+        classified.sort_unstable();
+        classified.dedup();
+
+        assert_eq!(classified, captured, "classification drifted from capture");
+        for (object, method) in captured {
+            assert_eq!(
+                classify_builtin(object, method),
+                BuiltinSupport::AdapterBacked,
+                "{object}.{method} must require an adapter until its behavior is evidenced"
+            );
+        }
+    }
+
+    #[test]
+    fn catalogued_adapter_calls_name_the_missing_contract_when_unhandled() {
+        for entry in CATALOGUED_ADAPTER_METHODS {
+            let overload = intrinsics::get().library_overloads(entry.object, entry.method)[0];
+            let args = overload
+                .params
+                .iter()
+                .map(|param| match param.ty.as_str() {
+                    "Integer" => Value::m1_integer(1),
+                    "UnsignedInteger" => Value::m1_unsigned(1),
+                    "FloatingPoint" => Value::m1_float(1.0),
+                    other => panic!("unexpected pinned argument family {other}"),
+                })
+                .collect::<Vec<_>>();
+            let mut harness = Harness::new();
+            match harness.call(entry.object, entry.method, &args) {
+                Err(EvalError::UnsupportedBuiltinBehavior {
+                    object,
+                    method,
+                    reason,
+                }) => {
+                    assert_eq!(object, entry.object);
+                    assert_eq!(method, entry.method);
+                    assert_eq!(reason, entry.reason);
+                    assert!(!reason.is_empty());
+                }
+                other => panic!(
+                    "expected precise unsupported behavior for {}.{}, got {other:?}",
+                    entry.object, entry.method
+                ),
+            }
+        }
+    }
+
+    #[test]
+    fn catalogued_adapter_calls_validate_arity_type_and_documented_ranges() {
+        let mut harness = Harness::new();
+        match harness.call("MPSE", "Solve", &[]) {
+            Err(EvalError::BadCall { detail }) => {
+                assert!(detail.contains("MPSE.Solve expects 12 argument(s), got 0"));
+            }
+            other => panic!("expected precise MPSE.Solve arity error, got {other:?}"),
+        }
+
+        match harness.call("Switch", "Get", &[Value::m1_float(1.0)]) {
+            Err(EvalError::TypeError { detail }) => {
+                assert!(detail.contains("Switch.Get argument 1 (idx) expects Integer"));
+                assert!(detail.contains("got M1 FloatingPoint"));
+            }
+            other => panic!("expected precise Switch.Get type error, got {other:?}"),
+        }
+
+        for index in [-1, 64] {
+            match harness.call(
+                "Switch",
+                "Set",
+                &[Value::m1_integer(index), Value::m1_integer(7)],
+            ) {
+                Err(EvalError::BadCall { detail }) => {
+                    assert!(detail.contains("Switch.Set switch index must be in 0..=63"));
+                    assert!(detail.contains(&format!("got {index}")));
+                }
+                other => panic!("expected Switch.Set index error for {index}, got {other:?}"),
+            }
+        }
+
+        match harness.call("MPSE", "PressureRatioFactor", &[Value::m1_float(1.25)]) {
+            Err(EvalError::BadCall { detail }) => {
+                assert!(detail.contains("pressure ratio must be finite and in 0..=1"));
+            }
+            other => panic!("expected pressure-ratio range error, got {other:?}"),
+        }
+
+        let mut adapter = CapturingAdapter::replying(Value::m1_integer(0));
+        match harness.call_with_adapter(
+            "Switch",
+            "Get",
+            &[Value::m1_integer(64)],
+            &mut adapter,
+            None,
+        ) {
+            Err(EvalError::BadCall { detail }) => {
+                assert!(detail.contains("Switch.Get switch index must be in 0..=63"));
+            }
+            other => panic!("expected pre-adapter range error, got {other:?}"),
+        }
+        assert!(
+            adapter.calls.is_empty(),
+            "invalid calls must not reach adapter"
+        );
+
+        let fixed = Value::M1(M1Scalar::FixedPoint7dps(
+            crate::value::FixedPoint7dps::parse_decimal("0.5").unwrap(),
+        ));
+        match harness.call("TC", "TP", &[fixed, Value::m1_float(1.0)]) {
+            Err(EvalError::TypeError { detail }) => {
+                assert!(detail.contains("TC.TP argument 1 (map) expects FloatingPoint"));
+                assert!(detail.contains("got M1 FixedPoint7dps"));
+            }
+            other => panic!("expected evidence-bounded Fixed Point rejection, got {other:?}"),
+        }
+    }
+
+    #[test]
+    fn catalogued_adapter_receives_exact_captured_argument_families() {
+        let mut harness = Harness::new();
+        let mut adapter = CapturingAdapter::replying(Value::m1_integer(9));
+        let mut solve_args = vec![Value::m1_integer(-1)];
+        solve_args.extend((0..11).map(|_| Value::m1_integer(1)));
+
+        assert_eq!(
+            harness
+                .call_with_adapter("MPSE", "Solve", &solve_args, &mut adapter, None)
+                .unwrap(),
+            Value::m1_float(9.0)
+        );
+        let call = adapter.calls.last().unwrap();
+        assert_eq!(call.canonical_name(), "MPSE.Solve");
+        assert_eq!(call.source_name(), "MPSE.Solve");
+        assert_eq!(call.arguments[0], Value::m1_unsigned(u32::MAX));
+        assert!(
+            call.arguments[1..]
+                .iter()
+                .all(|value| matches!(value, Value::M1(M1Scalar::FloatingPoint(1.0))))
+        );
+        assert_eq!(call.site, CallSite::new("Demo.Update.m1scr", 17));
+        assert_eq!(call.time.base_tick, 4);
+        assert_eq!(call.time.elapsed_s, 0.04);
+    }
+
+    #[test]
+    fn switch_set_reaches_adapter_and_returns_only_the_void_unit() {
+        let mut harness = Harness::new();
+        // A scenario value must not bypass the adapter which owns this side
+        // effect.
+        harness
+            .env
+            .set_io_override("Switch.Set", Value::Bool(false));
+        let mut adapter = CapturingAdapter::replying(Value::m1_float(123.0));
+
+        assert_eq!(
+            harness
+                .call_with_adapter(
+                    "Switch",
+                    "Set",
+                    &[Value::m1_unsigned(3), Value::m1_unsigned(u32::MAX)],
+                    &mut adapter,
+                    None,
+                )
+                .unwrap(),
+            Value::Bool(true)
+        );
+        assert_eq!(adapter.calls.len(), 1);
+        assert_eq!(
+            adapter.calls[0].arguments,
+            vec![Value::m1_integer(3), Value::m1_integer(-1)]
+        );
+    }
+
+    #[test]
+    fn unhandled_catalogued_adapter_call_ignores_scenario_and_fails_loud() {
+        let mut harness = Harness::new();
+        harness
+            .env
+            .set_io_override("MPSE.PressureRatioFactor", Value::m1_float(0.75));
+        let mut adapter = CapturingAdapter {
+            reply: AdapterReply::Unhandled,
+            calls: Vec::new(),
+        };
+
+        match harness.call_with_adapter(
+            "MPSE",
+            "PressureRatioFactor",
+            &[Value::m1_float(0.5)],
+            &mut adapter,
+            None,
+        ) {
+            Err(EvalError::UnsupportedBuiltinBehavior {
+                object,
+                method,
+                reason,
+            }) => {
+                assert_eq!(object, "MPSE");
+                assert_eq!(method, "PressureRatioFactor");
+                assert!(reason.contains("pressure-ratio equation"));
+            }
+            other => panic!("expected unhandled adapter failure, got {other:?}"),
+        }
+        assert_eq!(adapter.calls.len(), 1);
+    }
+
+    #[test]
+    fn switch_get_normalizes_the_adapter_result_to_m1_integer() {
+        let mut harness = Harness::new();
+        let mut adapter = CapturingAdapter::replying(Value::m1_unsigned(u32::MAX));
+        let mut trace = crate::trace::Trace::new();
+        assert_eq!(
+            harness
+                .call_with_adapter(
+                    "Library.Switch",
+                    "Get",
+                    &[Value::m1_unsigned(4)],
+                    &mut adapter,
+                    Some(&mut trace),
+                )
+                .unwrap(),
+            Value::m1_integer(-1)
+        );
+        let call = adapter.calls.last().unwrap();
+        assert_eq!(call.canonical_name(), "Switch.Get");
+        assert_eq!(call.source_name(), "Library.Switch.Get");
+        assert_eq!(call.arguments, vec![Value::m1_integer(4)]);
+        assert!(trace.is_external("Library.Switch.Get"));
+        assert!(trace.hardware.iter().any(|record| {
+            record.canonical_call() == "Switch.Get"
+                && record.source_call == "Library.Switch.Get"
+                && record.site == CallSite::new("Demo.Update.m1scr", 17)
+                && record.source == HardwareValueSource::Adapter
+        }));
+    }
+
+    #[test]
+    fn catalogued_adapter_result_rejects_unestablished_fixed_to_float_conversion() {
+        let mut harness = Harness::new();
+        let fixed = Value::M1(M1Scalar::FixedPoint7dps(
+            crate::value::FixedPoint7dps::parse_decimal("0.5").unwrap(),
+        ));
+        let mut adapter = CapturingAdapter::replying(fixed);
+        match harness.call_with_adapter(
+            "TC",
+            "TP",
+            &[Value::m1_float(1.0), Value::m1_float(2.0)],
+            &mut adapter,
+            None,
+        ) {
+            Err(EvalError::TypeError { detail }) => {
+                assert!(detail.contains("TC.TP result expects FloatingPoint"));
+                assert!(detail.contains("got M1 FixedPoint7dps"));
+            }
+            other => panic!("expected Fixed Point result rejection, got {other:?}"),
+        }
+        assert_eq!(adapter.calls.len(), 1);
+    }
+
+    #[test]
+    fn library_anchor_keeps_source_spelling_in_missing_contract_error() {
+        let mut harness = Harness::new();
+        match harness.call("Library.Switch", "Get", &[Value::m1_integer(1)]) {
+            Err(EvalError::UnsupportedBuiltinBehavior { object, method, .. }) => {
+                assert_eq!(object, "Library.Switch");
+                assert_eq!(method, "Get");
+            }
+            other => panic!("expected anchored missing-contract error, got {other:?}"),
+        }
+    }
+
+    #[test]
     fn library_catalog_matches_coverage_and_runtime_dispatch() {
         let mut cases = SUPPORTED_PURE_METHODS
             .iter()
@@ -2688,6 +3315,11 @@ mod tests {
                     .iter()
                     .chain(MODELED_MATH_METHODS.iter())
                     .map(|&(object, method)| (object, method, BuiltinSupport::Modeled)),
+            )
+            .chain(
+                CATALOGUED_ADAPTER_METHODS
+                    .iter()
+                    .map(|entry| (entry.object, entry.method, BuiltinSupport::AdapterBacked)),
             )
             .collect::<Vec<_>>();
         for &object in STUB_OBJECTS {
@@ -2763,9 +3395,16 @@ mod tests {
             match harness.call(object, method, &args) {
                 Err(EvalError::BadCall { .. } | EvalError::MissingHardwareMetadata { .. })
                     if expected == BuiltinSupport::AdapterBacked => {}
+                Err(EvalError::UnsupportedBuiltinBehavior { .. })
+                    if expected == BuiltinSupport::AdapterBacked => {}
                 Err(EvalError::UnsupportedBuiltin { .. })
                     if expected == BuiltinSupport::Unsupported => {}
+                Err(EvalError::UnsupportedBuiltinBehavior { .. })
+                    if expected == BuiltinSupport::Unsupported => {}
                 Err(EvalError::UnsupportedBuiltin { .. }) => {
+                    panic!("coverage says {expected:?}, but dispatch rejects {name}")
+                }
+                Err(EvalError::UnsupportedBuiltinBehavior { .. }) => {
                     panic!("coverage says {expected:?}, but dispatch rejects {name}")
                 }
                 Err(error) => panic!("dispatch failed for classified {name}: {error}"),
