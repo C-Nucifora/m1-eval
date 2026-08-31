@@ -137,6 +137,22 @@ rejected instead of producing a vacuous conformance pass. Expected channels
 must be disjoint from fixture input channels. A run that consults an external
 stub or source not declared as fixture input or initial state is also rejected.
 
+Whole-project fixtures may also declare an exact schedule-execution sequence:
+
+```toml
+[[expected_schedule_executions]]
+function = "Root.Filter.Update"
+base_tick = 0
+plan_order = 0
+due_position = 0
+divisor = 1
+```
+
+This optional check compares the runner's recorded schedule trace strictly, in
+order. It is useful for synthetic scheduler regressions and future M1 Sim
+schedule captures, but a synthetic schedule fixture still does not count as M1
+compatibility evidence.
+
 ## Typed values and comparisons
 
 Every value names its M1 family:
@@ -207,8 +223,9 @@ The committed mini fixture checks calibrated arithmetic, typed floating-point
 input, tolerances, and bundle hashes. The typed-value fixture carries Boolean,
 signed, unsigned, binary32, fixed-point, enum, and string values through the
 full parser, evaluator, and comparator. The initial-state fixture starts two
-scheduled counters at non-zero values and runs the same fixture twice in one
-test. It catches state leakage and accidental per-tick reseeding.
+scheduled counters at non-zero values, asserts the synthetic whole-project
+schedule trace, and runs the same fixture twice in one test. It catches state
+leakage, accidental per-tick reseeding, and schedule-order regressions.
 
 The table fixture checks one-, two-, and three-dimensional X-fastest layout,
 exact breakpoints, interior interpolation, lower and upper boundaries, a

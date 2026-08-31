@@ -1,5 +1,6 @@
 ---
 source: tests/snapshot.rs
+assertion_line: 136
 expression: report.render()
 ---
 Supported:
@@ -13,8 +14,13 @@ Stubbed:
 Unsupported:
   (none)
 Schedule:
-  Root.MR.Fast Reader @ 100 Hz
-  Root.MR.Fast Writer @ 100 Hz
-  Root.MR.Slow Integrator @ 50 Hz
-  Root.MR.Slow Writer @ 50 Hz
+  ordering maturity: Assumed
+  ready-node tie: rate descending, then canonical function name
+  1. Root.MR.Slow Integrator @ 50 Hz
+  2. Root.MR.Slow Writer @ 50 Hz
+  3. Root.MR.Fast Writer @ 100 Hz
+  4. Root.MR.Fast Reader @ 100 Hz
   Root.MR.Init (startup, runs once)
+  dependencies:
+    Root.MR.Fast Writer -> Root.MR.Fast Reader via Root.MR.Fast Shared
+    Root.MR.Slow Writer -> Root.MR.Fast Writer via Root.MR.Slow Out

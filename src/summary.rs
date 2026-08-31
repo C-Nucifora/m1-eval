@@ -30,6 +30,7 @@ use m1_core::{Field, Kind, Node};
 use m1_typecheck::Project;
 use m1_typecheck::parsed::ParsedScript;
 use std::collections::{BTreeSet, HashMap};
+use std::ops::{Deref, DerefMut};
 
 /// The canonical read/write sets of one function's body.
 #[derive(Debug, Clone, Default, PartialEq)]
@@ -40,12 +41,58 @@ pub struct IoSets {
     pub reads: BTreeSet<String>,
 }
 
+/// The checked form used by schedule planning.
+///
+/// `IoSets` is a public, externally constructible two-field struct. Keep the
+/// scheduler-only call graph and static-analysis failures in this crate-private
+/// wrapper so downstream struct literals keep compiling.
+#[derive(Debug, Clone, Default, PartialEq)]
+pub(crate) struct CheckedIoSets {
+    pub(crate) sets: IoSets,
+    /// Canonical user functions or methods called by this function.
+    ///
+    /// The scheduler uses these edges only to fold helper-function I/O into a
+    /// periodic root. Builtin and project-object methods never appear here.
+    pub(crate) calls: BTreeSet<String>,
+    /// Static expansion failures that would make the sets incomplete. Schedule
+    /// planning rejects these instead of using an under-approximated graph.
+    analysis_errors: BTreeSet<String>,
+}
+
+impl CheckedIoSets {
+    pub(crate) fn analysis_errors(&self) -> impl Iterator<Item = &str> {
+        self.analysis_errors.iter().map(String::as_str)
+    }
+}
+
+impl Deref for CheckedIoSets {
+    type Target = IoSets;
+
+    fn deref(&self) -> &Self::Target {
+        &self.sets
+    }
+}
+
+impl DerefMut for CheckedIoSets {
+    fn deref_mut(&mut self) -> &mut Self::Target {
+        &mut self.sets
+    }
+}
+
 /// Collect the read/write sets of `script`'s body.
 ///
 /// `group` is the enclosing group's canonical path (for group-relative name
 /// resolution); the function symbol the script backs is looked up from the
 /// project by the script's file name, so `In.*` references canonicalise too.
 pub fn io_sets(script: &ParsedScript, project: &Project, group: Option<&str>) -> IoSets {
+    checked_io_sets(script, project, group).sets
+}
+
+pub(crate) fn checked_io_sets(
+    script: &ParsedScript,
+    project: &Project,
+    group: Option<&str>,
+) -> CheckedIoSets {
     let fn_symbol = project.function_symbol_for_script(&script.name);
     let mut walker = Walker {
         project,
@@ -54,7 +101,8 @@ pub fn io_sets(script: &ParsedScript, project: &Project, group: Option<&str>) ->
         // Local variable names in scope; a declared local shadows project lookup,
         // so we track them to exclude from the dependency sets.
         locals: HashMap::new(),
-        sets: IoSets::default(),
+        expand: Vec::new(),
+        sets: CheckedIoSets::default(),
     };
     walker.walk(&script.cst.root());
     walker.sets
@@ -66,7 +114,9 @@ struct Walker<'a> {
     group: Option<&'a str>,
     fn_symbol: Option<&'a str>,
     locals: HashMap<String, Value>,
-    sets: IoSets,
+    /// Active compile-time `expand` bindings, outermost first.
+    expand: Vec<(String, i32, i32)>,
+    sets: CheckedIoSets,
 }
 
 impl Walker<'_> {
@@ -74,12 +124,71 @@ impl Walker<'_> {
     /// recursing elsewhere.
     fn walk(&mut self, node: &Node) {
         match node.kind() {
+            Kind::ExpandStatement => self.walk_expand(node),
             Kind::LocalDeclaration => self.walk_local_decl(node),
             Kind::AssignmentStatement => self.walk_assignment(node),
             Kind::CallExpression => self.walk_call(node),
             _ => {
                 for child in node.named_children() {
                     self.walk(&child);
+                }
+            }
+        }
+    }
+
+    /// Walk an `expand` body with its literal integer range available for M1's
+    /// compile-time `$(VAR)` text substitution. Unsupported bounds leave the
+    /// template unresolved instead of inventing concrete paths.
+    fn walk_expand(&mut self, node: &Node) {
+        let binding = match expand_binding(node) {
+            Ok(binding) => Some(binding),
+            Err(reason) => {
+                self.sets.analysis_errors.insert(format!(
+                    "expand at byte {} cannot be resolved: {reason}",
+                    node.byte_range().start
+                ));
+                None
+            }
+        };
+        let binding = match binding {
+            Some(binding)
+                if self
+                    .expand
+                    .iter()
+                    .any(|(variable, _, _)| variable == &binding.0) =>
+            {
+                self.sets.analysis_errors.insert(format!(
+                    "expand at byte {} shadows loop variable `{}`",
+                    node.byte_range().start,
+                    binding.0
+                ));
+                None
+            }
+            other => other,
+        };
+        let saved_local = binding
+            .as_ref()
+            .and_then(|(variable, _, _)| self.locals.get(variable).cloned());
+        if let Some(binding) = binding.clone() {
+            self.locals
+                .insert(binding.0.clone(), Value::m1_integer(binding.1));
+            self.expand.push(binding);
+        }
+        if let Some(body) = node
+            .children()
+            .into_iter()
+            .find(|child| child.kind() == Kind::Block)
+        {
+            self.walk(&body);
+        }
+        if let Some((variable, _, _)) = &binding {
+            self.expand.pop();
+            match saved_local {
+                Some(value) => {
+                    self.locals.insert(variable.clone(), value);
+                }
+                None => {
+                    self.locals.remove(variable);
                 }
             }
         }
@@ -92,7 +201,48 @@ impl Walker<'_> {
         if let Some(args) = node.child_by_field(Field::Arguments) {
             self.walk_reads(&args);
         }
+        self.account_user_call(node);
         self.account_call_callee(node);
+    }
+
+    /// Record a resolved user-function call. Keeping this next to the channel
+    /// receiver accounting makes statement-position and expression-position
+    /// calls follow the same resolution rules as runtime dispatch.
+    fn account_user_call(&mut self, call_node: &Node) {
+        let Some(callee) = call_node.child_by_field(Field::Function) else {
+            return;
+        };
+        let raw = match callee.kind() {
+            Kind::Identifier => callee.text().to_string(),
+            Kind::MemberExpression => match crate::expr::flatten_member(&callee) {
+                Ok(path) => path,
+                Err(_) => return,
+            },
+            _ => return,
+        };
+        for variant in self.substituted(&raw) {
+            let rewritten = crate::expr::rewrite_this(&variant, self.group);
+            let path = rewritten.as_deref().unwrap_or(&variant);
+            let Target::Symbol(canonical) =
+                classify(path, self.group, self.fn_symbol, self.project, &self.locals)
+            else {
+                continue;
+            };
+            if self
+                .project
+                .symbols()
+                .get(&canonical)
+                .is_some_and(|symbol| {
+                    matches!(
+                        symbol.kind,
+                        m1_typecheck::symbols::SymbolKind::Function
+                            | m1_typecheck::symbols::SymbolKind::Method
+                    )
+                })
+            {
+                self.sets.calls.insert(canonical);
+            }
+        }
     }
 
     /// Account the *receiver* of a method call's callee. Mirrors `m1-typecheck`
@@ -115,50 +265,47 @@ impl Walker<'_> {
         ) else {
             return;
         };
-        let Some(path) = self.canonical_symbol(&receiver) else {
-            return;
-        };
-
-        if method.text() == "GetUnscheduled"
-            && crate::builtins::object::unscheduled_value_path(&path, self.project).is_some()
-        {
-            // Only channels and generated table values own this method. Its
-            // entire purpose is to suppress the receiver's scheduling edge.
-            return;
-        }
-        if method.text().starts_with("Set") {
-            if let Some(value_path) =
-                crate::builtins::object::writable_value_path(&path, self.project)
+        for path in self.canonical_symbols(&receiver) {
+            if method.text() == "GetUnscheduled"
+                && crate::builtins::object::unscheduled_value_path(&path, self.project).is_some()
             {
-                self.sets.writes.insert(value_path);
+                // Only channels and generated table values own this method. Its
+                // entire purpose is to suppress the receiver's scheduling edge.
+                continue;
             }
-            return;
-        }
-        if matches!(method.text(), "Lookup" | "Get")
-            && self
-                .project
-                .symbols()
-                .get(&path)
-                .is_some_and(|symbol| symbol.kind == m1_typecheck::symbols::SymbolKind::Table)
-        {
-            // Table lookup/indexing reads calibration axes and body cells, not
-            // the generated runtime `.Value` channel. Arguments remain reads
-            // because `walk_call` accounts for them before the receiver.
-            return;
-        }
+            if method.text().starts_with("Set") {
+                if let Some(value_path) =
+                    crate::builtins::object::writable_value_path(&path, self.project)
+                {
+                    self.sets.writes.insert(value_path);
+                }
+                continue;
+            }
+            if matches!(method.text(), "Lookup" | "Get")
+                && self
+                    .project
+                    .symbols()
+                    .get(&path)
+                    .is_some_and(|symbol| symbol.kind == m1_typecheck::symbols::SymbolKind::Table)
+            {
+                // Table lookup/indexing reads calibration axes and body cells,
+                // not the generated runtime `.Value` channel.
+                continue;
+            }
 
-        // Parameters are readable even though they are calibration-owned and
-        // therefore excluded from `writable_value_path`. Enum conversions use
-        // their parallel typed resolver so their receiver edges are retained.
-        let value_path = match method.text() {
-            "AsInteger" | "AsString" => {
-                crate::builtins::enum_conv::enum_value_path(&path, self.project)
-                    .or_else(|| crate::builtins::object::numeric_value_path(&path, self.project))
+            // Parameters are readable even though they are calibration-owned
+            // and therefore excluded from `writable_value_path`.
+            let value_path = match method.text() {
+                "AsInteger" | "AsString" => {
+                    crate::builtins::enum_conv::enum_value_path(&path, self.project).or_else(|| {
+                        crate::builtins::object::numeric_value_path(&path, self.project)
+                    })
+                }
+                _ => crate::builtins::object::numeric_value_path(&path, self.project),
+            };
+            if let Some(value_path) = value_path {
+                self.sets.reads.insert(value_path);
             }
-            _ => crate::builtins::object::numeric_value_path(&path, self.project),
-        };
-        if let Some(value_path) = value_path {
-            self.sets.reads.insert(value_path);
         }
     }
 
@@ -168,8 +315,9 @@ impl Walker<'_> {
         if let Some(name) = node.child_by_field(Field::Name) {
             // Register the local so later references to it are not mistaken for a
             // project channel read.
-            self.locals
-                .insert(name.text().to_string(), Value::Bool(false));
+            for name in self.substituted(name.text()) {
+                self.locals.insert(name, Value::Bool(false));
+            }
         }
         if let Some(init) = node.child_by_field(Field::Value) {
             self.walk_reads(&init);
@@ -188,7 +336,7 @@ impl Walker<'_> {
 
         if let Some(target) = &target {
             // Resolve the target path to a canonical symbol; locals are not deps.
-            if let Some(path) = self.canonical_symbol(target) {
+            for path in self.canonical_symbols(target) {
                 self.sets.writes.insert(path.clone());
                 if compound {
                     // A compound assignment reads the target before writing it.
@@ -207,7 +355,7 @@ impl Walker<'_> {
     fn walk_reads(&mut self, node: &Node) {
         match node.kind() {
             Kind::Identifier => {
-                if let Some(path) = self.canonical_symbol(node) {
+                for path in self.canonical_symbols(node) {
                     self.sets.reads.insert(path);
                 }
             }
@@ -215,7 +363,7 @@ impl Walker<'_> {
                 // A member chain like `A.B.C` is one reference. If its head is a
                 // builtin object (e.g. `Calculate.PI`) or it does not resolve to a
                 // project symbol, `canonical_symbol` returns None and we skip it.
-                if let Some(path) = self.canonical_symbol(node) {
+                for path in self.canonical_symbols(node) {
                     self.sets.reads.insert(path);
                 }
                 // Do not recurse into the member's segments — they are not
@@ -232,6 +380,7 @@ impl Walker<'_> {
                 if let Some(args) = node.child_by_field(Field::Arguments) {
                     self.walk_reads(&args);
                 }
+                self.account_user_call(node);
                 self.account_call_callee(node);
             }
             _ => {
@@ -245,22 +394,114 @@ impl Walker<'_> {
     /// Canonicalise an identifier/member node to a project-symbol path, or `None`
     /// when it is a local, a builtin object, or unresolved (none of which is a
     /// cross-function channel dependency).
-    fn canonical_symbol(&self, node: &Node) -> Option<String> {
+    fn canonical_symbols(&mut self, node: &Node) -> Vec<String> {
         let raw = match node.kind() {
             Kind::Identifier => node.text().to_string(),
-            Kind::MemberExpression => crate::expr::flatten_member(node).ok()?,
-            _ => return None,
+            Kind::MemberExpression => match crate::expr::flatten_member(node) {
+                Ok(path) => path,
+                Err(_) => return Vec::new(),
+            },
+            _ => return Vec::new(),
         };
-        // Expand a `This` anchor to the enclosing group before resolution, exactly
-        // as the evaluator does.
-        let rewritten = crate::expr::rewrite_this(&raw, self.group);
-        let path = rewritten.as_deref().unwrap_or(&raw);
-        match classify(path, self.group, self.fn_symbol, self.project, &self.locals) {
-            Target::Symbol(p) => Some(p),
-            // Locals, builtins, and unresolved anchors are not project deps.
-            Target::Local(_) | Target::Builtin { .. } | Target::Unresolved => None,
+        self.substituted(&raw)
+            .into_iter()
+            .filter_map(|variant| {
+                // Expand a `This` anchor before resolution, exactly as runtime.
+                let rewritten = crate::expr::rewrite_this(&variant, self.group);
+                let path = rewritten.as_deref().unwrap_or(&variant);
+                match classify(path, self.group, self.fn_symbol, self.project, &self.locals) {
+                    Target::Symbol(path) => Some(path),
+                    Target::Local(_) | Target::Builtin { .. } | Target::Unresolved => None,
+                }
+            })
+            .collect()
+    }
+
+    fn substituted(&mut self, text: &str) -> Vec<String> {
+        match substituted(text, &self.expand) {
+            Ok(variants) => variants,
+            Err(reason) => {
+                self.sets.analysis_errors.insert(reason);
+                Vec::new()
+            }
         }
     }
+}
+
+fn expand_binding(node: &Node) -> Result<(String, i32, i32), String> {
+    let variable = node
+        .child_by_field(Field::Variable)
+        .ok_or_else(|| "missing loop variable".to_string())?
+        .text()
+        .trim()
+        .to_string();
+    let start_text = node
+        .child_by_field(Field::Start)
+        .ok_or_else(|| "missing start bound".to_string())?
+        .text()
+        .trim()
+        .to_string();
+    let end_text = node
+        .child_by_field(Field::End)
+        .ok_or_else(|| "missing end bound".to_string())?
+        .text()
+        .trim()
+        .to_string();
+    let start: i32 = start_text
+        .parse()
+        .map_err(|_| format!("start bound `{start_text}` is not a literal integer"))?;
+    let end: i32 = end_text
+        .parse()
+        .map_err(|_| format!("end bound `{end_text}` is not a literal integer"))?;
+    if start.abs_diff(end) >= 256 {
+        return Err(format!(
+            "range {start} to {end} exceeds the 256-value analysis limit"
+        ));
+    }
+    if start > end {
+        return Err(format!(
+            "descending range {start} to {end} is not expanded by schedule analysis"
+        ));
+    }
+    Ok((variable, start, end))
+}
+
+fn substituted(text: &str, bindings: &[(String, i32, i32)]) -> Result<Vec<String>, String> {
+    if !text.contains("$(") {
+        return Ok(vec![text.to_string()]);
+    }
+    let mut variants = vec![text.to_string()];
+    // Process the innermost literal binding first. Shadowing is rejected by the
+    // walker before it reaches this substitution step.
+    for (variable, start, end) in bindings.iter().rev() {
+        let needle = format!("$({variable})");
+        if !variants.iter().any(|variant| variant.contains(&needle)) {
+            continue;
+        }
+        let mut next = Vec::new();
+        for variant in &variants {
+            let values: Box<dyn Iterator<Item = i32>> = if start <= end {
+                Box::new(*start..=*end)
+            } else {
+                Box::new((*end..=*start).rev())
+            };
+            for value in values {
+                next.push(variant.replace(&needle, &value.to_string()));
+            }
+        }
+        variants = next;
+        if variants.len() > 4096 {
+            return Err(format!(
+                "expand substitution for `{text}` exceeds 4096 variants"
+            ));
+        }
+    }
+    if variants.iter().any(|variant| variant.contains("$(")) {
+        return Err(format!(
+            "expand substitution for `{text}` has an unresolved template"
+        ));
+    }
+    Ok(variants)
 }
 
 #[cfg(test)]

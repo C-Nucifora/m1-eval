@@ -615,9 +615,9 @@ const = 2.5
         // Task 14: the whole-project multi-rate scheduler is reachable through the
         // unchanged `Engine::run` dispatch. The multirate fixture's fast (100 Hz)
         // channels update every tick; the slow (50 Hz) channels run on even ticks
-        // and hold between. We seed `Slow Out` so the cross-rate Fast Writer read
-        // on tick 0 succeeds, and observe `Slow Echo` (read by nothing) for the
-        // pure zero-order-hold.
+        // and hold between. The global schedule makes Slow Writer feed Fast Writer
+        // on common due ticks, while `Slow Echo` (read by nothing) probes the pure
+        // zero-order-hold path.
         let dir = Path::new(env!("CARGO_MANIFEST_DIR")).join("tests/fixtures/multirate");
         let engine =
             Engine::load(&dir.join("Project.m1prj"), None).expect("multirate loads through engine");
@@ -629,10 +629,6 @@ base_rate_hz = 100.0
 [[inputs]]
 channel = "Root.MR.Seed"
 const = 3.0
-
-[[inputs]]
-channel = "Root.MR.Slow Out"
-const = 6.0
 "#;
         let scenario = Scenario::from_toml_str(toml).unwrap();
         let trace = engine

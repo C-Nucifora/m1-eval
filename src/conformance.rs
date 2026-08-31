@@ -3,7 +3,8 @@
 //!
 //! A fixture binds its expected values to an exact project bundle through
 //! SHA-256 hashes. It records an explicit tick grid, one-time initial channel
-//! state, zero-order-held inputs, expected outputs, tolerances, and provenance.
+//! state, zero-order-held inputs, expected outputs, optional whole-project
+//! schedule executions, tolerances, and provenance.
 //! Running a fixture always loads a new project and starts a new evaluator run,
 //! so stateful operators cannot leak state between fixtures in a suite.
 
@@ -11,7 +12,7 @@ use crate::error::EvalError;
 use crate::loader::{Loaded, load};
 use crate::runner;
 use crate::scenario::{InitialValue, InputKind, InputSeries, RunMode, Scenario};
-use crate::trace::Trace;
+use crate::trace::{ScheduleExecution, Trace};
 use crate::value::{FixedPoint7dps, M1Scalar, Value};
 use m1_typecheck::Project;
 use m1_typecheck::symbols::SymbolKind;
@@ -47,6 +48,10 @@ pub struct ConformanceFixture {
     pub initial_state: Vec<FixtureChannelValue>,
     /// One record per tick, starting at `time_s = 0`.
     pub steps: Vec<FixtureStep>,
+    /// Optional exact whole-project schedule execution sequence. Empty fixtures
+    /// keep the historical channel-value-only comparison.
+    #[serde(default)]
+    pub expected_schedule_executions: Vec<ExpectedScheduleExecution>,
     /// Absolute path of the parsed document. This is not part of the wire data.
     #[serde(skip)]
     source_path: PathBuf,
@@ -178,6 +183,22 @@ pub struct ExpectedChannelValue {
     /// Required for floating-point and fixed-point values, forbidden otherwise.
     #[serde(default)]
     pub tolerance: Option<ValueTolerance>,
+}
+
+/// One expected whole-project schedule execution.
+#[derive(Debug, Clone, Deserialize)]
+#[serde(deny_unknown_fields)]
+pub struct ExpectedScheduleExecution {
+    /// Canonical function symbol.
+    pub function: String,
+    /// Base tick that ran this function.
+    pub base_tick: u64,
+    /// Function position in the global schedule plan.
+    pub plan_order: usize,
+    /// Position within this tick's exact due set after filtering the global plan.
+    pub due_position: usize,
+    /// Number of base ticks between executions for this function.
+    pub divisor: usize,
 }
 
 /// A value with its M1 runtime family written explicitly.
@@ -561,6 +582,62 @@ impl ConformanceFixture {
                 }
             }
         }
+        self.validate_expected_schedule_executions()?;
+        Ok(())
+    }
+
+    fn validate_expected_schedule_executions(&self) -> Result<(), ConformanceError> {
+        if self.expected_schedule_executions.is_empty() {
+            return Ok(());
+        }
+        if self.run.mode != FixtureRunMode::WholeProject {
+            return Err(
+                self.invalid("expected_schedule_executions requires run.mode = \"whole-project\"")
+            );
+        }
+        let mut last: Option<(u64, usize)> = None;
+        let mut due_positions_by_tick: BTreeMap<u64, Vec<usize>> = BTreeMap::new();
+        for (index, expected) in self.expected_schedule_executions.iter().enumerate() {
+            if expected.function.trim().is_empty() {
+                return Err(self.invalid(format!(
+                    "expected_schedule_executions[{index}] function must not be empty"
+                )));
+            }
+            if expected.base_tick as usize >= self.steps.len() {
+                return Err(self.invalid(format!(
+                    "expected_schedule_executions[{index}] base_tick {} is outside the {} fixture steps",
+                    expected.base_tick,
+                    self.steps.len()
+                )));
+            }
+            if expected.divisor == 0 {
+                return Err(self.invalid(format!(
+                    "expected_schedule_executions[{index}] divisor must be positive"
+                )));
+            }
+            if let Some((last_tick, last_position)) = last
+                && (expected.base_tick < last_tick
+                    || (expected.base_tick == last_tick && expected.due_position <= last_position))
+            {
+                return Err(self.invalid(format!(
+                    "expected_schedule_executions[{index}] must be sorted by base_tick then due_position"
+                )));
+            }
+            last = Some((expected.base_tick, expected.due_position));
+            due_positions_by_tick
+                .entry(expected.base_tick)
+                .or_default()
+                .push(expected.due_position);
+        }
+        for (tick, mut positions) in due_positions_by_tick {
+            positions.sort_unstable();
+            let expected: Vec<_> = (0..positions.len()).collect();
+            if positions != expected {
+                return Err(self.invalid(format!(
+                    "expected_schedule_executions for base_tick {tick} must use contiguous due_position values starting at 0"
+                )));
+            }
+        }
         Ok(())
     }
 
@@ -692,6 +769,7 @@ fn run_parsed_fixture(fixture: &ConformanceFixture) -> Result<ConformanceReport,
         fixture: fixture.name.clone(),
         source,
     })?;
+    compare_schedule_executions(fixture, &trace)?;
     compare_trace(fixture, &loaded.project, &trace)?;
 
     Ok(ConformanceReport {
@@ -735,6 +813,34 @@ fn validate_project_bindings(
                 &expected.value,
             )?;
         }
+    }
+    for expected in &fixture.expected_schedule_executions {
+        validate_project_function(
+            fixture,
+            project,
+            "expected schedule execution",
+            &expected.function,
+        )?;
+    }
+    Ok(())
+}
+
+fn validate_project_function(
+    fixture: &ConformanceFixture,
+    project: &Project,
+    role: &str,
+    function: &str,
+) -> Result<(), ConformanceError> {
+    let Some(symbol) = project.symbols().get(function) else {
+        return Err(fixture.invalid(format!(
+            "{role} function {function:?} is not a project symbol; use its canonical project path"
+        )));
+    };
+    if !matches!(symbol.kind, SymbolKind::Function | SymbolKind::Method) {
+        return Err(fixture.invalid(format!(
+            "{role} path {function:?} resolves to {:?}, not a project Function or Method",
+            symbol.kind
+        )));
     }
     Ok(())
 }
@@ -1151,6 +1257,67 @@ fn fixture_scenario(
     })
 }
 
+fn compare_schedule_executions(
+    fixture: &ConformanceFixture,
+    trace: &Trace,
+) -> Result<(), ConformanceError> {
+    if fixture.expected_schedule_executions.is_empty() {
+        return Ok(());
+    }
+    let expected = &fixture.expected_schedule_executions;
+    let actual = &trace.schedule_executions;
+    if actual.len() != expected.len() {
+        return Err(fixture.invalid(format!(
+            "runner produced {} schedule executions, fixture expected {}",
+            actual.len(),
+            expected.len()
+        )));
+    }
+    for (index, expected) in expected.iter().enumerate() {
+        let actual = &actual[index];
+        let mut differences = Vec::new();
+        if actual.function != expected.function {
+            differences.push(format!(
+                "function expected {:?}, got {:?}",
+                expected.function, actual.function
+            ));
+        }
+        if actual.time.base_tick != expected.base_tick {
+            differences.push(format!(
+                "base_tick expected {}, got {}",
+                expected.base_tick, actual.time.base_tick
+            ));
+        }
+        if actual.plan_order != expected.plan_order {
+            differences.push(format!(
+                "plan_order expected {}, got {}",
+                expected.plan_order, actual.plan_order
+            ));
+        }
+        if actual.due_position != expected.due_position {
+            differences.push(format!(
+                "due_position expected {}, got {}",
+                expected.due_position, actual.due_position
+            ));
+        }
+        if actual.divisor != expected.divisor {
+            differences.push(format!(
+                "divisor expected {}, got {}",
+                expected.divisor, actual.divisor
+            ));
+        }
+        if !differences.is_empty() {
+            return Err(fixture.invalid(format!(
+                "schedule execution {index} differs: {}; expected {}, got {}",
+                differences.join("; "),
+                expected_schedule_execution_text(expected),
+                actual_schedule_execution_text(actual)
+            )));
+        }
+    }
+    Ok(())
+}
+
 fn compare_trace(
     fixture: &ConformanceFixture,
     project: &Project,
@@ -1447,6 +1614,28 @@ fn expected_text(expected: &ExpectedChannelValue) -> String {
             relative.as_deref().unwrap_or("unset")
         ),
     }
+}
+
+fn expected_schedule_execution_text(expected: &ExpectedScheduleExecution) -> String {
+    format!(
+        "{} at base_tick={} plan_order={} due_position={} divisor={}",
+        expected.function,
+        expected.base_tick,
+        expected.plan_order,
+        expected.due_position,
+        expected.divisor
+    )
+}
+
+fn actual_schedule_execution_text(actual: &ScheduleExecution) -> String {
+    format!(
+        "{} at base_tick={} plan_order={} due_position={} divisor={}",
+        actual.function,
+        actual.time.base_tick,
+        actual.plan_order,
+        actual.due_position,
+        actual.divisor
+    )
 }
 
 fn runtime_value_text(value: &Value) -> String {

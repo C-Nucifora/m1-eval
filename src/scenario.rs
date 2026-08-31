@@ -76,9 +76,9 @@ pub enum RunMode {
     /// canonical channel path the user wants computed.
     Cone(String),
     /// Run *every* periodically-scheduled function whose effective project
-    /// trigger resolves to a rate. Each runs at its own rate in
-    /// dependency-then-rate order. The offline schedule model has no single
-    /// target: the runner schedules the whole project.
+    /// trigger resolves to a rate. The runner filters the global dependency plan
+    /// to the functions due on each base tick. The offline schedule model has no
+    /// single target: the runner schedules the whole project.
     WholeProject,
 }
 
