@@ -687,13 +687,11 @@ fn delay_stable(args: &[Value], site: CallSite, ctx: &mut EvalCtx) -> Result<Val
 
 // ---- Debounce family --------------------------------------------------------
 //
-// A debounce suppresses spurious flips: the output only adopts a new condition
-// value once that value has been held *stably* for `>= filter` seconds; any
-// reversal before the filter time restarts the timer. `Stable`, `Fast` and
-// `Verify` share this accept-after-stable model in Phase 1 (their finer MoTeC
-// distinctions are a fidelity follow-up). `Filter` instead low-pass filters the
-// 0/1 condition (time constant `response`) and applies a Schmitt trigger:
-// output rises at `>= 0.8`, falls at `<= 0.2`.
+// `Debounce.Stable` suppresses spurious flips: the output only adopts a new
+// condition value once that value has been held *stably* for `>= filter`
+// seconds. `Filter` instead low-pass filters the 0/1 condition and applies a
+// Schmitt trigger. `Fast` and `Verify` deliberately do not route here because
+// the pinned catalogue does not define what distinguishes their state machines.
 
 /// Dispatch the `Debounce.*` family.
 fn debounce(
@@ -703,7 +701,7 @@ fn debounce(
     ctx: &mut EvalCtx,
 ) -> Result<Option<Value>, EvalError> {
     match method {
-        "Stable" | "Fast" | "Verify" => debounce_stable(args, site, ctx).map(Some),
+        "Stable" => debounce_stable(args, site, ctx).map(Some),
         "Filter" => debounce_filter(args, site, ctx).map(Some),
         _ => Ok(None),
     }

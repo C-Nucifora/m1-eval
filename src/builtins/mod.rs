@@ -209,6 +209,11 @@ pub(crate) fn dispatch_with_runtime(
             let arguments = normalize_catalogued_arguments(entry, object, args)?;
             dispatch_catalogued_adapter(entry, object, method, arguments, site, ctx, runtime)
         }
+        CallRoute::CataloguedUnsupported(entry) => {
+            validate_arity(entry.object, object, method, args.len())?;
+            validate_catalogued_argument_families(entry.object, entry.method, object, args)?;
+            Err(catalogued_unsupported_error(entry, object))
+        }
         CallRoute::Unsupported => Err(unsupported(object, method)),
     }
 }
@@ -476,26 +481,7 @@ fn validate_catalogued_arguments(
     source_object: &str,
     args: &[Value],
 ) -> Result<(), EvalError> {
-    let overload = intrinsics::get()
-        .library_overloads(entry.object, entry.method)
-        .into_iter()
-        .find(|overload| overload.params.len() == args.len())
-        .expect("arity was validated against the same intrinsic catalogue");
-
-    for (index, (param, value)) in overload.params.iter().zip(args).enumerate() {
-        if !catalogued_argument_matches(value, &param.ty) {
-            return Err(EvalError::TypeError {
-                detail: format!(
-                    "{source_object}.{} argument {} ({}) expects {}, got {}",
-                    entry.method,
-                    index + 1,
-                    param.name,
-                    param.ty,
-                    runtime_value_family(value)
-                ),
-            });
-        }
-    }
+    validate_catalogued_argument_families(entry.object, entry.method, source_object, args)?;
 
     match (entry.object, entry.method) {
         ("MPSE", "PressureRatioFactor") => {
@@ -524,6 +510,38 @@ fn validate_catalogued_arguments(
             }
         }
         _ => {}
+    }
+    Ok(())
+}
+
+/// Validate only the argument families recorded by the pinned intrinsic
+/// catalogue. This boundary is useful even when the catalogue omits enough
+/// behavior that execution must stop.
+fn validate_catalogued_argument_families(
+    library_object: &str,
+    method: &str,
+    source_object: &str,
+    args: &[Value],
+) -> Result<(), EvalError> {
+    let overload = intrinsics::get()
+        .library_overloads(library_object, method)
+        .into_iter()
+        .find(|overload| overload.params.len() == args.len())
+        .expect("arity was validated against the same intrinsic catalogue");
+
+    for (index, (param, value)) in overload.params.iter().zip(args).enumerate() {
+        if !catalogued_argument_matches(value, &param.ty) {
+            return Err(EvalError::TypeError {
+                detail: format!(
+                    "{source_object}.{} argument {} ({}) expects {}, got {}",
+                    method,
+                    index + 1,
+                    param.name,
+                    param.ty,
+                    runtime_value_family(value)
+                ),
+            });
+        }
     }
     Ok(())
 }
@@ -676,6 +694,17 @@ fn catalogued_behavior_error(entry: &CataloguedAdapterMethod, source_object: &st
     }
 }
 
+fn catalogued_unsupported_error(
+    entry: &CataloguedUnsupportedMethod,
+    source_object: &str,
+) -> EvalError {
+    EvalError::UnsupportedBuiltinBehavior {
+        object: source_object.to_string(),
+        method: entry.method.to_string(),
+        reason: entry.reason.to_string(),
+    }
+}
+
 fn runtime_value_family(value: &Value) -> &'static str {
     match value {
         Value::M1(M1Scalar::FloatingPoint(_)) => "M1 FloatingPoint",
@@ -773,6 +802,7 @@ enum CallRoute {
     Timer,
     ProjectIo(ResolvedReceiver),
     CataloguedAdapter(&'static CataloguedAdapterMethod),
+    CataloguedUnsupported(&'static CataloguedUnsupportedMethod),
     Unsupported,
 }
 
@@ -863,6 +893,76 @@ fn catalogued_adapter_method(
         .find(|entry| entry.object == object && entry.method == method)
 }
 
+/// A captured signature whose execution contract is too incomplete even for
+/// an offline assumption. Runtime validates the known call shape, then reports
+/// the exact missing evidence instead of selecting a guessed state machine.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+struct CataloguedUnsupportedMethod {
+    object: &'static str,
+    method: &'static str,
+    reason: &'static str,
+}
+
+const SIGNAL_DELAY_EVIDENCE_GAP: &str = "the pinned help gives only the buffer limit and signature; it does not define startup output, delay rounding or clamping, zero-delay ordering, or behavior when delay changes, and no M1 transition capture is committed";
+const DEBOUNCE_MODE_EVIDENCE_GAP: &str = "the pinned help does not distinguish this mode's transition and initialization behavior from Debounce.Stable, and no M1 transition capture is committed";
+
+const CATALOGUED_UNSUPPORTED_METHODS: &[CataloguedUnsupportedMethod] = &[
+    CataloguedUnsupportedMethod {
+        object: "Debounce",
+        method: "Fast",
+        reason: DEBOUNCE_MODE_EVIDENCE_GAP,
+    },
+    CataloguedUnsupportedMethod {
+        object: "Debounce",
+        method: "Verify",
+        reason: DEBOUNCE_MODE_EVIDENCE_GAP,
+    },
+    CataloguedUnsupportedMethod {
+        object: "Delay",
+        method: "Signal15",
+        reason: SIGNAL_DELAY_EVIDENCE_GAP,
+    },
+    CataloguedUnsupportedMethod {
+        object: "Delay",
+        method: "Signal31",
+        reason: SIGNAL_DELAY_EVIDENCE_GAP,
+    },
+    CataloguedUnsupportedMethod {
+        object: "Delay",
+        method: "Signal63",
+        reason: SIGNAL_DELAY_EVIDENCE_GAP,
+    },
+    CataloguedUnsupportedMethod {
+        object: "Delay",
+        method: "Signal127",
+        reason: SIGNAL_DELAY_EVIDENCE_GAP,
+    },
+    CataloguedUnsupportedMethod {
+        object: "Delay",
+        method: "Signal255",
+        reason: SIGNAL_DELAY_EVIDENCE_GAP,
+    },
+    CataloguedUnsupportedMethod {
+        object: "Delay",
+        method: "Signal511",
+        reason: SIGNAL_DELAY_EVIDENCE_GAP,
+    },
+    CataloguedUnsupportedMethod {
+        object: "Delay",
+        method: "Signal1023",
+        reason: SIGNAL_DELAY_EVIDENCE_GAP,
+    },
+];
+
+fn catalogued_unsupported_method(
+    object: &str,
+    method: &str,
+) -> Option<&'static CataloguedUnsupportedMethod> {
+    CATALOGUED_UNSUPPORTED_METHODS
+        .iter()
+        .find(|entry| entry.object == object && entry.method == method)
+}
+
 /// Direct pure-library implementations. The method catalog lives here, not in
 /// coverage, and dispatch refuses any library call that this model does not
 /// route.
@@ -921,8 +1021,6 @@ const MODELED_STATEFUL_METHODS: &[(&str, &str)] = &[
     ("Delay", "Falling"),
     ("Delay", "Stable"),
     ("Debounce", "Stable"),
-    ("Debounce", "Fast"),
-    ("Debounce", "Verify"),
     ("Debounce", "Filter"),
     ("Change", "By"),
     ("Change", "Up"),
@@ -1045,6 +1143,12 @@ fn canonical_library_object(object: &str) -> Option<&'static str> {
 
 fn classify_library(object: &str, method: &str) -> CallCapability {
     let pair = (object, method);
+    if let Some(entry) = catalogued_unsupported_method(object, method) {
+        return capability(
+            BuiltinSupport::Unsupported,
+            CallRoute::CataloguedUnsupported(entry),
+        );
+    }
     if let Some(entry) = catalogued_adapter_method(object, method) {
         return capability(
             BuiltinSupport::AdapterBacked,
@@ -1664,20 +1768,84 @@ mod tests {
     }
 
     #[test]
-    fn unimplemented_stateful_method_fails_loud() {
+    fn evidence_gated_stateful_methods_fail_with_the_missing_contract() {
+        for entry in CATALOGUED_UNSUPPORTED_METHODS {
+            let overload = intrinsics::get().library_overloads(entry.object, entry.method)[0];
+            let args = overload
+                .params
+                .iter()
+                .map(|param| match param.ty.as_str() {
+                    "Boolean" => Value::Bool(true),
+                    "Integer" => Value::m1_integer(1),
+                    "FloatingPoint" => Value::m1_float(1.0),
+                    other => panic!("unexpected evidence-gated argument family {other}"),
+                })
+                .collect::<Vec<_>>();
+            let mut h = Harness::new();
+            match h.call(entry.object, entry.method, &args) {
+                Err(EvalError::UnsupportedBuiltinBehavior {
+                    object,
+                    method,
+                    reason,
+                }) => {
+                    assert_eq!(object, entry.object);
+                    assert_eq!(method, entry.method);
+                    assert_eq!(reason, entry.reason);
+                }
+                other => panic!(
+                    "expected precise missing behavior for {}.{}, got {other:?}",
+                    entry.object, entry.method
+                ),
+            }
+        }
+    }
+
+    #[test]
+    fn evidence_gated_stateful_calls_validate_the_captured_shape_first() {
         let mut h = Harness::new();
-        // Delay.Signal15 is a buffered sample delay we do not implement; the
-        // object is recognised but the method falls through to fail loud.
+        match h.call(
+            "Debounce",
+            "Fast",
+            &[Value::m1_integer(1), Value::m1_float(0.1)],
+        ) {
+            Err(EvalError::TypeError { detail }) => {
+                assert!(detail.contains("Debounce.Fast argument 1 (cond) expects Boolean"));
+            }
+            other => panic!("expected Fast family error, got {other:?}"),
+        }
+
         match h.call(
             "Delay",
             "Signal15",
-            &[Value::m1_float(1.0), Value::m1_integer(3)],
+            &[Value::m1_float(1.0), Value::m1_float(3.0)],
         ) {
-            Err(EvalError::UnsupportedBuiltin { object, method }) => {
-                assert_eq!(object, "Delay");
-                assert_eq!(method, "Signal15");
+            Err(EvalError::TypeError { detail }) => {
+                assert!(detail.contains("Delay.Signal15 argument 2 (delay) expects Integer"));
             }
-            other => panic!("expected UnsupportedBuiltin, got {other:?}"),
+            other => panic!("expected Signal15 family error, got {other:?}"),
+        }
+
+        match h.call("Delay", "Signal31", &[Value::m1_float(1.0)]) {
+            Err(EvalError::BadCall { detail }) => {
+                assert!(detail.contains("Delay.Signal31 expects 2 argument(s), got 1"));
+            }
+            other => panic!("expected Signal31 arity error, got {other:?}"),
+        }
+    }
+
+    #[test]
+    fn evidence_gated_stateful_error_preserves_library_anchor() {
+        let mut h = Harness::new();
+        match h.call(
+            "Library.Debounce",
+            "Verify",
+            &[Value::Bool(true), Value::m1_float(0.1)],
+        ) {
+            Err(EvalError::UnsupportedBuiltinBehavior { object, method, .. }) => {
+                assert_eq!(object, "Library.Debounce");
+                assert_eq!(method, "Verify");
+            }
+            other => panic!("expected anchored missing behavior, got {other:?}"),
         }
     }
 
@@ -3050,6 +3218,47 @@ mod tests {
     }
 
     #[test]
+    fn evidence_gated_stateful_catalogue_has_runtime_and_coverage_parity() {
+        let debounce = intrinsics::get()
+            .library_object("Debounce")
+            .expect("pinned Debounce library exists");
+        let delay = intrinsics::get()
+            .library_object("Delay")
+            .expect("pinned Delay library exists");
+        let mut captured = debounce
+            .functions
+            .iter()
+            .filter(|overload| matches!(overload.name.as_str(), "Fast" | "Verify"))
+            .map(|overload| ("Debounce", overload.name.as_str()))
+            .chain(
+                delay
+                    .functions
+                    .iter()
+                    .filter(|overload| overload.name.starts_with("Signal"))
+                    .map(|overload| ("Delay", overload.name.as_str())),
+            )
+            .collect::<Vec<_>>();
+        captured.sort_unstable();
+        captured.dedup();
+
+        let mut classified = CATALOGUED_UNSUPPORTED_METHODS
+            .iter()
+            .map(|entry| (entry.object, entry.method))
+            .collect::<Vec<_>>();
+        classified.sort_unstable();
+        classified.dedup();
+
+        assert_eq!(classified, captured, "classification drifted from capture");
+        for (object, method) in captured {
+            assert_eq!(
+                classify_builtin(object, method),
+                BuiltinSupport::Unsupported,
+                "{object}.{method} must stay unsupported until its behavior is evidenced"
+            );
+        }
+    }
+
+    #[test]
     fn catalogued_adapter_calls_name_the_missing_contract_when_unhandled() {
         for entry in CATALOGUED_ADAPTER_METHODS {
             let overload = intrinsics::get().library_overloads(entry.object, entry.method)[0];
@@ -3320,6 +3529,11 @@ mod tests {
                 CATALOGUED_ADAPTER_METHODS
                     .iter()
                     .map(|entry| (entry.object, entry.method, BuiltinSupport::AdapterBacked)),
+            )
+            .chain(
+                CATALOGUED_UNSUPPORTED_METHODS
+                    .iter()
+                    .map(|entry| (entry.object, entry.method, BuiltinSupport::Unsupported)),
             )
             .collect::<Vec<_>>();
         for &object in STUB_OBJECTS {
