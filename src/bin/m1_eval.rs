@@ -95,8 +95,8 @@ struct Args {
     #[arg(long)]
     target: Option<String>,
 
-    /// Override the scenario's mode: run the whole-project multi-rate scheduler
-    /// (every periodically-scheduled function at its own rate). Mutually
+    /// Override the scenario's mode: run the whole-project multi-rate scheduler.
+    /// Each periodic function runs on the base ticks where it is due. Mutually
     /// exclusive with --function and --target.
     #[arg(long)]
     whole_project: bool,

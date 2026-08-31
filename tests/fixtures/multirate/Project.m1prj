@@ -10,8 +10,8 @@
 <!--                                                                       -->
 <!--   50 Hz group:                                                        -->
 <!--     Root.MR.Slow Writer   writes  Root.MR.Slow Out (= Seed * 2)       -->
-<!--       (Fast Writer reads Slow Out across rates: stale-tolerant, no    -->
-<!--        cross-rate edge is added)                                      -->
+<!--       (Fast Writer reads Slow Out across rates. The global scheduler  -->
+<!--        orders common due ticks and fast ticks read the held value.)    -->
 <!--     Root.MR.Slow Integrator integrates Seed into Slow Total at 50 Hz; -->
 <!--       its stateful Integral.Normal must accumulate with dt = 0.02     -->
 <!--       (its own period), NOT the 0.01 base dt                          -->

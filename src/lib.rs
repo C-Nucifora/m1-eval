@@ -18,6 +18,12 @@ pub use loader::{Loaded, load};
 pub mod triggers;
 pub use triggers::{TriggerMap, TriggerStatus};
 
+pub mod schedule;
+pub use schedule::{
+    ReadyTiePolicy, ScheduleDependency, ScheduleMaturity, SchedulePlan, SchedulePlanEntry,
+    build_schedule_plan,
+};
+
 pub mod env;
 pub use env::{CallSite, Env, OpState, StateStore};
 
@@ -31,7 +37,10 @@ pub mod ident;
 pub use ident::{Target, classify};
 
 pub mod trace;
-pub use trace::{SerialDirection, SerialEvent, Trace};
+pub use trace::{
+    ScheduleExecution, ScheduleInputProvenance, ScheduleInputSource, SerialDirection, SerialEvent,
+    Trace,
+};
 
 mod virtual_serial;
 
@@ -74,7 +83,8 @@ pub use engine::Engine;
 pub mod conformance;
 pub use conformance::{
     CONFORMANCE_SCHEMA_VERSION, ConformanceError, ConformanceFixture, ConformanceMismatch,
-    ConformanceOptions, ConformanceReport, ExpectedChannelValue, FixtureChannelValue,
-    FixtureProvenance, FixtureRun, FixtureRunMode, FixtureStep, ProjectBundle, ProjectFileHash,
-    ProvenanceKind, ValueTolerance, WireValue, run_conformance_fixture, run_conformance_suite,
+    ConformanceOptions, ConformanceReport, ExpectedChannelValue, ExpectedScheduleExecution,
+    FixtureChannelValue, FixtureProvenance, FixtureRun, FixtureRunMode, FixtureStep, ProjectBundle,
+    ProjectFileHash, ProvenanceKind, ValueTolerance, WireValue, run_conformance_fixture,
+    run_conformance_suite,
 };

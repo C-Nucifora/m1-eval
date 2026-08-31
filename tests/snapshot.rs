@@ -104,10 +104,6 @@ base_rate_hz = 100.0
 [[inputs]]
 channel = "Root.MR.Seed"
 const = 2.0
-
-[[inputs]]
-channel = "Root.MR.Slow Out"
-const = 4.0
 "#;
     let scenario = Scenario::from_toml_str(toml).expect("scenario parses");
     let trace = engine.run(&scenario).expect("whole-project run succeeds");
@@ -128,10 +124,9 @@ fn coverage_render_snapshot() {
     insta::assert_snapshot!("coverage_render", report.render());
 }
 
-/// The multirate fixture's coverage report renders a `Schedule:` section listing
-/// every scheduled function fastest-first with its rate, and identifies the
-/// On-Startup function as running once — pinned so a regression in the schedule
-/// report shows.
+/// The multirate fixture's coverage report renders dependency-plan order,
+/// schedule edges, and the On-Startup function's once-only role, pinned so a
+/// regression in the schedule report shows.
 #[test]
 fn coverage_schedule_render_snapshot() {
     let dir = Path::new(env!("CARGO_MANIFEST_DIR")).join("tests/fixtures/multirate");

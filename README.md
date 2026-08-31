@@ -40,7 +40,7 @@ do not compare computed channel values with captured M1 results.
 | Scenario parsing, tick grids, trace output, and `--coverage` | **Assumed** | These are deterministic m1-eval contracts tested with synthetic data. A `Supported` coverage entry means implemented, not M1-verified. |
 | Typed conformance fixture parser and runner | **Assumed** | Synthetic fixtures cover typed values, project hashes, initial-state reset, tolerances, and mismatch reporting. No genuine M1 Sim capture is committed yet, so this runner does not make another area Verified by itself. |
 | Single-function and upstream dependency-cone runners | **Assumed** | Selection, ordering, and zero-order hold are tested on synthetic projects. |
-| Whole-project multi-rate scheduling | **Assumed** | Trigger rates come from `Project.m1prj`; same-rate dependency order, fastest-first rate groups, startup order, and cross-rate stale reads are the evaluator's model. |
+| Whole-project multi-rate scheduling | **Assumed** | Trigger rates come from `Project.m1prj`; periodic ordering uses the evaluator's global writer-before-reader plan across rates, with a documented rate-descending/name tie-break only for otherwise independent ready functions. Startup order is separate. Genuine M1 schedule captures are still required before this moves beyond Assumed. |
 | CSV log replay, overrides, downstream-cone recomputation, and diffs | **Assumed** | Synthetic tests cover import, resampling, source precedence, recomputation, and the no-op invariant. They do not establish M1 execution fidelity. |
 | Binary `.ld` import | **Assumed** | Synthetic decode tests run in CI. An optional real-log test checks structure and numeric plausibility only, not values against an independent oracle. |
 | Real-time/HIL execution, ECU budgets or preemption, watchdog behavior, live CAN/serial I/O, `.m1dbc` decoding, unlisted constructs or builtins, and LSP integration | **Unsupported** | These are outside the current evaluator. Unknown executable behavior fails loud rather than being inferred. |
@@ -114,11 +114,11 @@ The implemented behavior is still **Assumed** under the maturity contract above:
 ## What it adds (Phase 2 — the whole-project multi-rate scheduler)
 
 **Phase 2** adds the whole-project multi-rate scheduler: instead of running one
-function or one dependency cone, the `whole-project` mode runs *every*
-periodically-scheduled function each tick at its own rate, over a fixed duration,
-producing one deterministic `Trace`. It models the ECU's *schedule*, not the
-ECU itself — execution budgets, stalls, preemption, and watchdog effects are
-out of scope. Select it with `mode = "whole-project"` in
+function or one dependency cone, the `whole-project` mode runs every periodic
+function on the base ticks where it is due, over a fixed duration, producing one
+deterministic `Trace`. It models the ECU's *schedule*, not the ECU itself.
+Execution budgets, stalls, preemption, and watchdog effects are out of scope.
+Select it with `mode = "whole-project"` in
 the scenario or the `--whole-project` CLI flag (which overrides the scenario's
 mode and is mutually exclusive with `--function` / `--target`).
 
@@ -154,12 +154,17 @@ The multi-rate model:
   tick keeps its last value (the shared value store carries it forward), so a
   slow channel holds steady between its updates while fast channels move every
   tick.
-- **Same-rate dependency ordering, cross-rate stale-tolerance.** Within one
-  rate group, a writer runs before any reader of its output (topological order).
-  Across rates, no ordering edge is added: a faster reader of a slower writer
-  sees the slower function's *previous* value (stale between writer ticks).
-  This ordering is an explicit evaluator assumption. Rate groups run
-  fastest-first within a base tick.
+- **Global dependency ordering.** The planner builds one writer-before-reader
+  graph from the scripts' actual reads and writes, including reachable
+  script-backed callees, then filters that global order to the functions due at
+  each base tick. Dependencies are kept across rates. A slower writer due on the
+  same timestamp therefore runs before a faster reader of that channel; when the
+  writer is not due, the reader sees the held value from the previous writer
+  execution. Multiple periodic writers, incomplete `expand` templates, missing
+  script bodies, and dependency cycles fail loudly instead of falling back to an
+  unverified order. Independent ready functions tie by rate descending, then by
+  canonical function name. That tie-break is still an explicit evaluator
+  assumption until captured M1 schedule evidence replaces it.
 - **Hardware calls keep base-grid time.** The adapter sees both the current
   function step and the base tick, elapsed seconds, and base period. CAN and
   sensor reads can fall back to documented stubs. Required flash metadata does
@@ -197,9 +202,12 @@ captured M1 output verifies them.
 
 The report also prints a **`Schedule:`** section: every script-backed function
 with its execution rate (`@ 500 Hz`, `@ 50 Hz`, …), `startup, runs once`, or
-an explicit `helper`, `unscheduled`, or `unresolved trigger` status. The last
-status includes the failed path or attribute, so a project author can repair the
-selection instead of treating every excluded function as the same case.
+an explicit `helper`, `unscheduled`, or `unresolved trigger` status. When the
+owned periodic plan is available, the section shows the plan order and dependency
+edges. When planning fails, `schedule_error` is reported separately and the
+trigger roles remain visible. The unresolved status includes the failed path or
+attribute, so a project author can repair the selection instead of treating every
+excluded function as the same case.
 
 Core value-object calls are receiver-aware. Enum values provide `AsInteger()`
 and `AsString()`. Numeric channels, parameters, tables, and value compounds

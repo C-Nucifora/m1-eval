@@ -23,8 +23,8 @@ fn multirate_dir() -> PathBuf {
 }
 
 /// A whole-project scenario TOML for the multirate fixture: it pins the base
-/// tick at 100 Hz and seeds the external `Seed`/`Slow Out` inputs the schedule
-/// reads on the first tick. `mode = "whole-project"` needs no `target`.
+/// tick at 100 Hz and seeds the external `Seed` input. The schedule itself must
+/// make `Slow Writer` feed the faster reader on common due ticks.
 const WHOLE_PROJECT_SCENARIO: &str = r#"
 mode = "whole-project"
 duration_s = 0.04
@@ -33,10 +33,6 @@ base_rate_hz = 100.0
 [[inputs]]
 channel = "Root.MR.Seed"
 const = 3.0
-
-[[inputs]]
-channel = "Root.MR.Slow Out"
-const = 6.0
 "#;
 
 /// A scenario TOML that runs the mini `Demo.Update` function for three ticks with

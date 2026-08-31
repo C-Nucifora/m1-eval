@@ -33,6 +33,8 @@
 
 use crate::env::CallSite;
 use crate::hardware::{EvalPhase, EvalTime, HardwareProvenance, ResolvedReceiver};
+use crate::schedule::{ReadyTiePolicy, ScheduleMaturity, SchedulePlan};
+use crate::triggers::TriggerStatus;
 use crate::value::{M1Scalar, Value};
 use std::collections::{BTreeMap, BTreeSet};
 
@@ -66,6 +68,11 @@ pub struct Trace {
     /// Ordered byte transfers through the deterministic virtual serial adapter.
     /// Unlike de-duplicated hardware provenance, repeated transfers are retained.
     pub serial: Vec<SerialEvent>,
+    /// The whole-project plan used for this run. Function and cone runs have no
+    /// global schedule plan.
+    pub schedule_plan: Option<SchedulePlan>,
+    /// One record for each periodic function execution, in execution order.
+    pub schedule_executions: Vec<ScheduleExecution>,
     /// Final channel value and provenance for each tick that recorded one.
     /// Kept separately from the compatibility columns, whose public shape
     /// cannot represent a missing value before a channel first appears.
@@ -111,6 +118,60 @@ pub struct SerialEvent {
     pub bytes: Vec<u8>,
     /// Exact `Serial.Receive` or `Serial.Transmit` call occurrence.
     pub site: CallSite,
+}
+
+/// Where a dependency channel's value came from when a function began.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+#[non_exhaustive]
+pub enum ScheduleInputSource {
+    /// The writer or an external seed supplied the value on this base tick.
+    CurrentTick,
+    /// The value came from an earlier tick or the startup pass.
+    Held,
+    /// No trace or environment value existed before the function ran.
+    Unavailable,
+}
+
+impl ScheduleInputSource {
+    fn as_str(self) -> &'static str {
+        match self {
+            ScheduleInputSource::CurrentTick => "current_tick",
+            ScheduleInputSource::Held => "held",
+            ScheduleInputSource::Unavailable => "unavailable",
+        }
+    }
+}
+
+/// Provenance of one scheduled dependency input at function entry.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct ScheduleInputProvenance {
+    /// Periodic function that owns this channel in the schedule plan.
+    pub writer: String,
+    /// Canonical channel path.
+    pub channel: String,
+    /// Whether the writer belongs to this tick's exact due set.
+    pub writer_due: bool,
+    /// Whether the value was written on this tick or held from an earlier one.
+    pub source: ScheduleInputSource,
+    /// Whether existing channel provenance identifies the value as external.
+    pub external: bool,
+}
+
+/// Why and where one periodic function ran.
+#[derive(Debug, Clone, PartialEq)]
+pub struct ScheduleExecution {
+    /// Canonical function symbol.
+    pub function: String,
+    /// Position in the static global plan.
+    pub plan_order: usize,
+    /// Position in this tick's filtered due set.
+    pub due_position: usize,
+    /// Exact integer number of base ticks between executions.
+    pub divisor: usize,
+    /// Shared deterministic timing context used by hardware calls in this body.
+    pub time: EvalTime,
+    /// Dependency values visible immediately before execution.
+    pub inputs: Vec<ScheduleInputProvenance>,
 }
 
 /// One reported default substitution: what value was substituted and which
@@ -272,6 +333,16 @@ impl Trace {
         self.serial.push(event);
     }
 
+    /// Attach the global whole-project plan used by the runner.
+    pub(crate) fn set_schedule_plan(&mut self, plan: SchedulePlan) {
+        self.schedule_plan = Some(plan);
+    }
+
+    /// Append one periodic schedule execution record.
+    pub(crate) fn record_schedule_execution(&mut self, execution: ScheduleExecution) {
+        self.schedule_executions.push(execution);
+    }
+
     /// Serialise the channel columns + time axis to JSON. The shape is
     /// `{ "time": [...], "channels": { path: [...] }, "external": [...],
     /// "hardware": [...], "serial": [...] }`,
@@ -301,7 +372,17 @@ impl Trace {
         out.push_str(&join(self.hardware.iter().map(hardware_json)));
         out.push_str("],\"serial\":[");
         out.push_str(&join(self.serial.iter().map(serial_json)));
-        out.push_str("]}");
+        out.push(']');
+        if let Some(plan) = &self.schedule_plan {
+            out.push_str(",\"schedule_plan\":");
+            out.push_str(&schedule_plan_json(plan));
+            out.push_str(",\"schedule_executions\":[");
+            out.push_str(&join(
+                self.schedule_executions.iter().map(schedule_execution_json),
+            ));
+            out.push(']');
+        }
+        out.push('}');
         out
     }
 
@@ -349,6 +430,91 @@ fn serial_json(event: &SerialEvent) -> String {
         bytes,
         json_string(event.site.script()),
         event.site.offset(),
+    )
+}
+
+fn schedule_plan_json(plan: &SchedulePlan) -> String {
+    let maturity = match plan.maturity {
+        ScheduleMaturity::Assumed => "assumed",
+    };
+    let tie_policy = match plan.ready_tie_policy {
+        ReadyTiePolicy::RateDescendingThenFunction => "rate_descending_then_function",
+    };
+    let entries = join(plan.entries.iter().map(|entry| {
+        let trigger = match &entry.trigger {
+            TriggerStatus::Periodic(rate_hz) => format!(
+                "{{\"kind\":\"periodic\",\"rate_hz\":{}}}",
+                f64_json(*rate_hz)
+            ),
+            TriggerStatus::Startup => "{\"kind\":\"startup\"}".to_string(),
+            TriggerStatus::Helper => "{\"kind\":\"helper\"}".to_string(),
+            TriggerStatus::Unscheduled => "{\"kind\":\"unscheduled\"}".to_string(),
+            TriggerStatus::Unresolved { trigger, reason } => format!(
+                "{{\"kind\":\"unresolved\",\"trigger\":{},\"reason\":{}}}",
+                json_string(trigger),
+                json_string(reason)
+            ),
+        };
+        let order = entry
+            .order
+            .map_or_else(|| "null".to_string(), |order| order.to_string());
+        format!(
+            "{{\"function\":{},\"trigger\":{},\"order\":{}}}",
+            json_string(&entry.function),
+            trigger,
+            order
+        )
+    }));
+    let dependencies = join(plan.dependencies.iter().map(|dependency| {
+        let channels = join(
+            dependency
+                .channels
+                .iter()
+                .map(|channel| json_string(channel)),
+        );
+        format!(
+            "{{\"writer\":{},\"reader\":{},\"channels\":[{}]}}",
+            json_string(&dependency.writer),
+            json_string(&dependency.reader),
+            channels
+        )
+    }));
+    format!(
+        "{{\"maturity\":{},\"ready_tie_policy\":{},\"entries\":[{}],\"dependencies\":[{}]}}",
+        json_string(maturity),
+        json_string(tie_policy),
+        entries,
+        dependencies
+    )
+}
+
+fn schedule_execution_json(execution: &ScheduleExecution) -> String {
+    let phase = match execution.time.phase {
+        EvalPhase::Startup => "startup",
+        EvalPhase::Periodic => "periodic",
+    };
+    let inputs = join(execution.inputs.iter().map(|input| {
+        format!(
+            "{{\"writer\":{},\"channel\":{},\"writer_due\":{},\"source\":{},\"external\":{}}}",
+            json_string(&input.writer),
+            json_string(&input.channel),
+            input.writer_due,
+            json_string(input.source.as_str()),
+            input.external
+        )
+    }));
+    format!(
+        "{{\"function\":{},\"plan_order\":{},\"due_position\":{},\"divisor\":{},\"phase\":{},\"base_tick\":{},\"elapsed_s\":{},\"base_period_s\":{},\"step_s\":{},\"inputs\":[{}]}}",
+        json_string(&execution.function),
+        execution.plan_order,
+        execution.due_position,
+        execution.divisor,
+        json_string(phase),
+        execution.time.base_tick,
+        f64_json(execution.time.elapsed_s),
+        f64_json(execution.time.base_period_s),
+        f64_json(execution.time.step_s),
+        inputs
     )
 }
 

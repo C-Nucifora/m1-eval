@@ -55,6 +55,25 @@ fn edited_types_fixture(edit: impl FnOnce(String) -> String) -> (tempfile::TempD
     (temp, path)
 }
 
+fn edited_initial_state_fixture(
+    edit: impl FnOnce(String) -> String,
+) -> (tempfile::TempDir, PathBuf) {
+    let template = fixture("synthetic-initial-state.toml");
+    let body = std::fs::read_to_string(template).expect("read template fixture");
+    let root = project_fixture("ratemix")
+        .canonicalize()
+        .expect("canonical ratemix fixture");
+    let body = body.replace(
+        "root = \"../ratemix\"",
+        &format!("root = {:?}", root.to_string_lossy()),
+    );
+    let body = edit(body);
+    let temp = tempfile::tempdir().expect("temp fixture directory");
+    let path = temp.path().join("fixture.toml");
+    std::fs::write(&path, body).expect("write edited fixture");
+    (temp, path)
+}
+
 fn copy_mini_bundle(temp: &tempfile::TempDir) -> PathBuf {
     let source_root = project_fixture("mini");
     let root = temp.path().join("project");
@@ -334,6 +353,21 @@ fn suite_reloads_state_for_every_fixture() {
             .expect("both runs start from the fixture's initial state");
     assert_eq!(reports.len(), 2);
     assert_eq!(reports[0].assertions_checked, reports[1].assertions_checked);
+}
+
+#[test]
+fn schedule_execution_expectations_are_strict() {
+    let (_temp, path) =
+        edited_initial_state_fixture(|body| body.replacen("plan_order = 1", "plan_order = 0", 1));
+    let error = run_conformance_fixture(&path).expect_err("wrong schedule order must fail");
+    let ConformanceError::InvalidFixture { detail, .. } = error else {
+        panic!("expected invalid fixture, got {error}");
+    };
+    assert!(
+        detail.contains("schedule execution 1 differs")
+            && detail.contains("plan_order expected 0, got 1"),
+        "unexpected detail: {detail}"
+    );
 }
 
 #[test]

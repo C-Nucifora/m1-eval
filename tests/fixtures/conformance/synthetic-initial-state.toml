@@ -29,6 +29,41 @@ notes = "Expected values test one-time state seeding and do not establish M1 com
 [run]
 mode = "whole-project"
 
+[[expected_schedule_executions]]
+function = "Root.RX.Fast Counter"
+base_tick = 0
+plan_order = 0
+due_position = 0
+divisor = 2
+
+[[expected_schedule_executions]]
+function = "Root.RX.Mid Counter"
+base_tick = 0
+plan_order = 1
+due_position = 1
+divisor = 5
+
+[[expected_schedule_executions]]
+function = "Root.RX.Fast Counter"
+base_tick = 2
+plan_order = 0
+due_position = 0
+divisor = 2
+
+[[expected_schedule_executions]]
+function = "Root.RX.Fast Counter"
+base_tick = 4
+plan_order = 0
+due_position = 0
+divisor = 2
+
+[[expected_schedule_executions]]
+function = "Root.RX.Mid Counter"
+base_tick = 5
+plan_order = 1
+due_position = 0
+divisor = 5
+
 [[initial_state]]
 channel = "Root.RX.Fast Count"
 value = { type = "floating-point", value = "10" }

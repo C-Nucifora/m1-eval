@@ -20,6 +20,7 @@
 
 use crate::builtins::{BuiltinSupport, CapabilityScope, classify_bare_call, classify_member_call};
 use crate::loader::Loaded;
+use crate::schedule::{ReadyTiePolicy, ScheduleMaturity, SchedulePlan, build_schedule_plan};
 use crate::triggers::{TriggerMap, TriggerStatus};
 use m1_core::{Field, Kind, Node};
 use m1_typecheck::Project;
@@ -77,10 +78,16 @@ pub struct CoverageReport {
     /// per script-backed function. `Some(hz)` is the function's periodic rate (it
     /// runs that many times per second in whole-project mode); `None` flags a
     /// function with no resolved periodic trigger. Companion fields distinguish
-    /// startup, helper, unscheduled, and unresolved cases. Sorted `(rate
-    /// descending, function symbol)` for a deterministic report; empty when the
-    /// analysis had no [`Project`] to resolve rates from.
+    /// startup, helper, unscheduled, and unresolved cases. Loaded-project
+    /// analysis uses the dependency plan order when planning succeeds; otherwise
+    /// this field retains the legacy trigger/rate view.
     pub schedule: Vec<(String, Option<f64>)>,
+    /// The same dependency plan consumed by whole-project runtime. This is
+    /// present for a loaded project when planning succeeds.
+    pub schedule_plan: Option<SchedulePlan>,
+    /// Planning failure for a loaded project. Coverage reports it instead of
+    /// substituting a fallback order.
+    pub schedule_error: Option<String>,
     /// Functions the whole-project runner executes exactly once before the
     /// periodic loop. These also appear in `schedule` with no periodic rate.
     pub startup: Vec<String>,
@@ -116,11 +123,25 @@ impl CoverageReport {
     /// Analyse a complete loaded project, including the loader's exact startup
     /// trigger set. This is the path used by [`crate::Engine::coverage`].
     pub fn analyse_loaded(loaded: &Loaded) -> CoverageReport {
-        Self::analyse_with_triggers(
+        let mut report = Self::analyse_with_triggers(
             &loaded.scripts,
             Some(&loaded.project),
             Some(&loaded.triggers),
-        )
+        );
+        match build_schedule_plan(loaded) {
+            Ok(plan) => {
+                report.schedule = plan
+                    .entries
+                    .iter()
+                    .map(|entry| (entry.function.clone(), entry.periodic_rate()))
+                    .collect();
+                report.schedule_plan = Some(plan);
+            }
+            Err(error) => {
+                report.schedule_error = Some(error.to_string());
+            }
+        }
+        report
     }
 
     fn analyse_with_triggers(
@@ -172,6 +193,8 @@ impl CoverageReport {
             stubbed: stubbed.into_iter().collect(),
             unsupported: unsupported.into_iter().collect(),
             schedule: build_schedule(scripts, project, triggers),
+            schedule_plan: None,
+            schedule_error: None,
             startup: roles.startup,
             helpers: roles.helpers,
             unscheduled: roles.unscheduled,
@@ -191,44 +214,105 @@ impl CoverageReport {
         render_section(&mut out, "Unsupported", &self.unsupported);
         render_schedule(
             &mut out,
-            &self.schedule,
-            &self.startup,
-            &self.helpers,
-            &self.unscheduled,
-            &self.unresolved,
+            ScheduleRender {
+                schedule: &self.schedule,
+                plan: self.schedule_plan.as_ref(),
+                schedule_error: self.schedule_error.as_deref(),
+                startup: &self.startup,
+                helpers: &self.helpers,
+                unscheduled: &self.unscheduled,
+                unresolved: &self.unresolved,
+            },
         );
         out
     }
 }
 
+struct ScheduleRender<'a> {
+    schedule: &'a [(String, Option<f64>)],
+    plan: Option<&'a SchedulePlan>,
+    schedule_error: Option<&'a str>,
+    startup: &'a [String],
+    helpers: &'a [String],
+    unscheduled: &'a [String],
+    unresolved: &'a [UnresolvedTrigger],
+}
+
 /// Append the `Schedule:` section: one line per function with its periodic rate,
 /// startup execution, or unscheduled status. An empty schedule still prints the
 /// label so the output shape is stable.
-fn render_schedule(
-    out: &mut String,
-    schedule: &[(String, Option<f64>)],
-    startup: &[String],
-    helpers: &[String],
-    unscheduled: &[String],
-    unresolved: &[UnresolvedTrigger],
-) {
+fn render_schedule(out: &mut String, render: ScheduleRender<'_>) {
     out.push_str("Schedule:\n");
-    if schedule.is_empty() {
+    if let Some(error) = render.schedule_error {
+        out.push_str(&format!("  error: {error}\n"));
+        out.push_str("  trigger entries below are unplanned:\n");
+    }
+    let mut entries = render.schedule.to_vec();
+    let mut seen: BTreeSet<String> = entries
+        .iter()
+        .map(|(function, _)| function.clone())
+        .collect();
+    let mut extra = Vec::new();
+    for function in render
+        .startup
+        .iter()
+        .chain(render.helpers)
+        .chain(render.unscheduled)
+    {
+        if seen.insert(function.clone()) {
+            extra.push((function.clone(), None));
+        }
+    }
+    for unresolved in render.unresolved {
+        if seen.insert(unresolved.function.clone()) {
+            extra.push((unresolved.function.clone(), None));
+        }
+    }
+    extra.sort_by(|left, right| left.0.cmp(&right.0));
+    entries.extend(extra);
+
+    if entries.is_empty() {
         out.push_str("  (none)\n");
         return;
     }
-    for (function, rate) in schedule {
+    if let Some(plan) = render.plan
+        && plan.entries.iter().any(|entry| entry.order.is_some())
+    {
+        let maturity = match plan.maturity {
+            ScheduleMaturity::Assumed => "Assumed",
+        };
+        let tie = match plan.ready_tie_policy {
+            ReadyTiePolicy::RateDescendingThenFunction => {
+                "rate descending, then canonical function name"
+            }
+        };
+        out.push_str(&format!("  ordering maturity: {maturity}\n"));
+        out.push_str(&format!("  ready-node tie: {tie}\n"));
+    }
+    for (function, rate) in &entries {
         match rate {
-            Some(hz) => out.push_str(&format!("  {function} @ {hz} Hz\n")),
+            Some(hz) => {
+                let prefix = render
+                    .plan
+                    .and_then(|plan| {
+                        plan.entries
+                            .iter()
+                            .find(|entry| entry.function == *function)
+                            .and_then(|entry| entry.order)
+                    })
+                    .map_or_else(String::new, |order| format!("{}. ", order + 1));
+                out.push_str(&format!("  {prefix}{function} @ {hz} Hz\n"));
+            }
             None => {
-                if startup.binary_search(function).is_ok() {
+                if render.startup.binary_search(function).is_ok() {
                     out.push_str(&format!("  {function} (startup, runs once)\n"));
-                } else if helpers.binary_search(function).is_ok() {
+                } else if render.helpers.binary_search(function).is_ok() {
                     out.push_str(&format!("  {function} (helper, not scheduled directly)\n"));
-                } else if let Ok(index) = unresolved
+                } else if let Ok(index) = render
+                    .unresolved
                     .binary_search_by(|entry| entry.function.as_str().cmp(function.as_str()))
                 {
-                    let entry = &unresolved[index];
+                    let entry = &render.unresolved[index];
                     if entry.trigger.is_empty() {
                         out.push_str(&format!(
                             "  {function} (unresolved trigger: {})\n",
@@ -240,7 +324,7 @@ fn render_schedule(
                             entry.trigger, entry.reason
                         ));
                     }
-                } else if unscheduled.binary_search(function).is_ok() {
+                } else if render.unscheduled.binary_search(function).is_ok() {
                     out.push_str(&format!(
                         "  {function} (unscheduled, no trigger selected)\n"
                     ));
@@ -250,15 +334,27 @@ fn render_schedule(
             }
         }
     }
+    if let Some(plan) = render.plan
+        && !plan.dependencies.is_empty()
+    {
+        out.push_str("  dependencies:\n");
+        for dependency in &plan.dependencies {
+            out.push_str(&format!(
+                "    {} -> {} via {}\n",
+                dependency.writer,
+                dependency.reader,
+                dependency.channels.join(", ")
+            ));
+        }
+    }
 }
 
-/// Derive the whole-project execution schedule: one `(function symbol, rate)`
-/// entry per script-backed function. Loaded-project analysis reads the same
-/// effective trigger map as `runner::enumerate_scheduled` and keeps every
-/// nonperiodic function as `None`, so companion status fields can explain why
-/// it is excluded. Project-only analysis falls back to `call_rate_hz` because it
-/// has no raw `SelectedTrigger` attributes. Sorted `(rate descending, function
-/// symbol)` for determinism; empty when no [`Project`] is available.
+/// Derive the legacy whole-project schedule visibility: one `(function symbol,
+/// rate)` entry per script-backed function. Loaded-project analysis keeps this
+/// view on schedule-plan errors so coverage can still show trigger roles.
+/// Project-only analysis falls back to `call_rate_hz` because it has no raw
+/// `SelectedTrigger` attributes. Sorted `(rate descending, function symbol)` for
+/// determinism; empty when no [`Project`] is available.
 fn build_schedule(
     scripts: &[ParsedScript],
     project: Option<&Project>,
@@ -283,8 +379,8 @@ fn build_schedule(
             Some((fn_symbol, rate_hz))
         })
         .collect();
-    // Fastest-first, ties broken by the function symbol path. A `None` rate sorts
-    // last (unscheduled functions after every periodic one).
+    // Rate-descending, ties broken by the function symbol path. A `None` rate
+    // sorts last (unscheduled functions after every periodic one).
     schedule.sort_by(|a, b| {
         rate_sort_key(b.1)
             .partial_cmp(&rate_sort_key(a.1))
@@ -983,5 +1079,82 @@ Output = i;
         let report = CoverageReport::analyse(&scripts_from("Output = Speed;\n"));
         assert!(report.schedule.is_empty());
         assert!(report.render().contains("Schedule:"));
+    }
+
+    #[test]
+    fn schedule_error_render_preserves_trigger_roles() {
+        let report = CoverageReport {
+            schedule_error: Some("whole-project schedule: synthetic plan failure".to_string()),
+            startup: vec!["Root.T.Init".to_string()],
+            helpers: vec!["Root.T.Helper".to_string()],
+            unscheduled: vec!["Root.T.Idle".to_string()],
+            unresolved: vec![UnresolvedTrigger {
+                function: "Root.T.Bad".to_string(),
+                trigger: "Root.Events.On 999Hz".to_string(),
+                reason: "missing component `Root.Events.On 999Hz`".to_string(),
+            }],
+            ..CoverageReport::default()
+        };
+        let text = report.render();
+
+        assert!(text.contains("synthetic plan failure"), "{text}");
+        assert!(text.contains("Root.T.Init (startup, runs once)"), "{text}");
+        assert!(
+            text.contains("Root.T.Helper (helper, not scheduled directly)"),
+            "{text}"
+        );
+        assert!(
+            text.contains("Root.T.Idle (unscheduled, no trigger selected)"),
+            "{text}"
+        );
+        assert!(text.contains("Root.T.Bad (unresolved trigger"), "{text}");
+    }
+
+    #[test]
+    fn loaded_coverage_keeps_trigger_schedule_when_planning_fails() {
+        let temp = tempfile::tempdir().expect("temp project");
+        let scripts = temp.path().join("Scripts");
+        std::fs::create_dir(&scripts).expect("create scripts directory");
+        std::fs::write(
+            temp.path().join("Project.m1prj"),
+            r#"<?xml version="1.0"?>
+<MoTeCM1BuildSession>
+ <Project Name="Coverage cycle" TargetHardware="ecu120">
+  <ComponentStream><List>
+   <Component Classname="BuiltIn.GroupCompound" Name="Root.T"/>
+   <Component Classname="BuiltIn.GroupCompound" Name="Root.Events"/>
+   <Component Classname="BuiltIn.EventKernel" Name="Root.Events.On 100Hz"/>
+   <Component Classname="BuiltIn.Channel" Name="Root.T.A"><Props Type="f32"/></Component>
+   <Component Classname="BuiltIn.Channel" Name="Root.T.B"><Props Type="f32"/></Component>
+   <Component Classname="BuiltIn.FuncUser" Filename="T.One.m1scr" Name="Root.T.One"><Props SelectedTrigger="Root.Events.On 100Hz"/></Component>
+   <Component Classname="BuiltIn.FuncUser" Filename="T.Two.m1scr" Name="Root.T.Two"><Props SelectedTrigger="Root.Events.On 100Hz"/></Component>
+  </List></ComponentStream>
+ </Project>
+</MoTeCM1BuildSession>
+"#,
+        )
+        .expect("write project");
+        std::fs::write(scripts.join("T.One.m1scr"), "A = B;\n").expect("write first script");
+        std::fs::write(scripts.join("T.Two.m1scr"), "B = A;\n").expect("write second script");
+
+        let loaded =
+            crate::loader::load(&temp.path().join("Project.m1prj"), None).expect("project loads");
+        let report = CoverageReport::analyse_loaded(&loaded);
+
+        assert!(report.schedule_plan.is_none());
+        assert!(
+            report
+                .schedule_error
+                .as_deref()
+                .is_some_and(|error| error.contains("periodic dependency cycle")),
+            "schedule error must describe the rejected plan: {report:?}"
+        );
+        assert_eq!(
+            report.schedule,
+            vec![
+                ("Root.T.One".to_string(), Some(100.0)),
+                ("Root.T.Two".to_string(), Some(100.0)),
+            ]
+        );
     }
 }

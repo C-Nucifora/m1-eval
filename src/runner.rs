@@ -49,9 +49,10 @@ use crate::ident::{Target, classify};
 use crate::loader::Loaded;
 use crate::log::Log;
 use crate::scenario::{InitialValue, InputSeries, IoSeries, RunMode, Scenario};
+use crate::schedule::{ScheduleDependency, SchedulePlan, build_schedule_plan};
 use crate::stmt::exec_script_with_runtime;
 use crate::summary::io_sets;
-use crate::trace::Trace;
+use crate::trace::{ScheduleExecution, ScheduleInputProvenance, ScheduleInputSource, Trace};
 #[cfg(test)]
 use crate::value::M1Scalar;
 use crate::value::Value;
@@ -108,7 +109,7 @@ fn run_inner(
                 sched: scheduled,
                 rate_hz: base,
             }];
-            tick_loop(loaded, scenario, &rated, base, hardware)
+            tick_loop(loaded, scenario, &rated, base, None, hardware)
         }
         RunMode::Cone(target) => {
             let base = require_base_rate(scenario)?;
@@ -120,16 +121,15 @@ fn run_inner(
                     rate_hz: base,
                 })
                 .collect();
-            tick_loop(loaded, scenario, &rated, base, hardware)
+            tick_loop(loaded, scenario, &rated, base, None, hardware)
         }
         RunMode::WholeProject => {
-            // Enumerate every periodically-scheduled function, ordered
-            // dependency-then-rate, then drive the rate-gated tick loop: each
-            // function runs only on the base ticks its rate divisor selects, with
-            // its own period as `dt`.
-            let ordered = build_whole_project_schedule(loaded);
+            // Plan every periodic function once, then drive the rate-gated tick
+            // loop: each function runs only on the base ticks selected by its
+            // rate divisor, with its own period as `dt`.
+            let (plan, ordered) = build_whole_project_schedule(loaded)?;
             let base = resolve_base_rate(scenario, &ordered)?;
-            tick_loop(loaded, scenario, &ordered, base, hardware)
+            tick_loop(loaded, scenario, &ordered, base, Some(&plan), hardware)
         }
     }
 }
@@ -278,23 +278,43 @@ struct ScheduledRated<'a> {
     rate_hz: f64,
 }
 
-/// Build the whole-project schedule: every periodically-scheduled function, in
-/// dependency-then-rate order.
-///
-/// 1. **Enumerate + rate** (Task 11): for each script, read the effective rate
-///    from [`Loaded::triggers`]. This includes direct, group-relative, and
-///    `$(…:SelectedTrigger)` attribute-reference forms. Keep only periodic
-///    functions.
-/// 2. **Dependency-then-rate order** (Task 12): within a single rate group,
-///    writer-before-reader topological order (from [`io_sets`], reusing
-///    [`topo_order`]); groups concatenated fastest-rate-first. There are no
-///    cross-rate edges — a faster reader of a slower writer sees the previous
-///    value (the same same-rate-only dependency rule `m1-typecheck`'s
-///    `schedule.rs` applies).
-fn build_whole_project_schedule(loaded: &Loaded) -> Vec<ScheduledRated<'_>> {
-    let mut rated = enumerate_scheduled(loaded);
-    order_by_dependency_then_rate(loaded, &mut rated);
-    rated
+/// Build the whole-project schedule: every periodically scheduled function, in
+/// the owned [`SchedulePlan`] order. Dependencies are global across rates. The
+/// ready-node tie policy remains documented as assumed until genuine M1 schedule
+/// captures replace it.
+fn build_whole_project_schedule(
+    loaded: &Loaded,
+) -> Result<(SchedulePlan, Vec<ScheduledRated<'_>>), EvalError> {
+    let plan = build_schedule_plan(loaded)?;
+    let scripts_by_function: BTreeMap<String, &ParsedScript> = loaded
+        .scripts
+        .iter()
+        .filter_map(|script| {
+            loaded
+                .project
+                .function_symbol_for_script(&script.name)
+                .map(|function| (function, script))
+        })
+        .collect();
+    let mut rated = Vec::new();
+    for entry in plan.periodic_entries() {
+        let script = scripts_by_function.get(&entry.function).ok_or_else(|| {
+            EvalError::UnsupportedConstruct {
+                kind: format!(
+                    "whole-project schedule: planned function `{}` has no backing script",
+                    entry.function
+                ),
+                at: 0,
+            }
+        })?;
+        rated.push(ScheduledRated {
+            sched: scheduled_for(loaded, script),
+            rate_hz: entry
+                .periodic_rate()
+                .expect("periodic plan entry has a periodic rate"),
+        });
+    }
+    Ok((plan, rated))
 }
 
 /// Enumerate every periodically-scheduled function with its rate (Task 11).
@@ -303,6 +323,7 @@ fn build_whole_project_schedule(loaded: &Loaded) -> Vec<ScheduledRated<'_>> {
 /// trigger; keep only periodic functions. The result is sorted by `(rate
 /// descending, fn_symbol)` as a deterministic baseline; the dependency layer
 /// refines order within each rate group.
+#[cfg(test)]
 fn enumerate_scheduled(loaded: &Loaded) -> Vec<ScheduledRated<'_>> {
     let mut rated: Vec<ScheduledRated> = loaded
         .scripts
@@ -327,23 +348,12 @@ fn enumerate_scheduled(loaded: &Loaded) -> Vec<ScheduledRated<'_>> {
     rated
 }
 
-/// Reorder an already rate-sorted schedule into dependency-then-rate order
-/// (Task 12).
+/// Reorder one ad-hoc rated list by writer-before-reader edges inside each
+/// equal-rate group.
 ///
-/// Within each rate group, a writer runs before any reader of its output: build
-/// writer→reader edges from [`io_sets`] (restricted to that rate group) and
-/// [`topo_order`] them. Groups are then concatenated fastest-rate-first — the
-/// conventional ECU order, fast loops before slow within a base tick.
-///
-/// Cross-rate dependencies deliberately add **no** edges: a faster function that
-/// reads a slower function's channel sees the value from the slower function's
-/// previous run (stale between writer ticks). This mirrors `m1-typecheck`'s
-/// `schedule.rs`, whose dependency edges are same-rate only; forcing a fast loop
-/// to wait on a slow one would misrepresent the real ECU schedule.
-///
-/// A dependency cycle within a rate group falls back to discovery order (the
-/// existing [`topo_order`] behaviour) — acceptable, since ordering is best-effort
-/// and values are never guessed.
+/// The whole-project periodic runner no longer uses this fallback; it consumes
+/// [`SchedulePlan`]. Startup ordering still uses it with a nominal single rate
+/// because startup functions are a separate once-only pass.
 fn order_by_dependency_then_rate(loaded: &Loaded, rated: &mut Vec<ScheduledRated<'_>>) {
     // Group indices by rate, preserving the fastest-first order of the first
     // appearance of each rate (the input is already rate-sorted descending).
@@ -355,9 +365,9 @@ fn order_by_dependency_then_rate(loaded: &Loaded, rated: &mut Vec<ScheduledRated
         }
     }
 
-    // Compute the final order of indices: for each rate group, topo-order its
-    // members writer-before-reader using only that group's writers (no cross-rate
-    // edges), then concatenate the groups fastest-first.
+    // Compute the final order of indices: for each equal-rate group, topo-order
+    // its members writer-before-reader using only that group's writers, then
+    // concatenate the groups fastest-first.
     let mut final_order: Vec<usize> = Vec::with_capacity(rated.len());
     for (_rate, idxs) in &groups {
         // Map each script name in this group to its index, its io sets, and the
@@ -384,8 +394,7 @@ fn order_by_dependency_then_rate(loaded: &Loaded, rated: &mut Vec<ScheduledRated
             nodes.insert(name.clone());
         }
 
-        // Writer→reader edges, restricted to this rate group (cross-rate reads
-        // intentionally add no edge — see the doc comment).
+        // Writer→reader edges, restricted to this equal-rate group.
         let mut edges: Vec<(String, String)> = Vec::new();
         for (name, io) in &sets {
             for r in &io.reads {
@@ -435,6 +444,7 @@ fn tick_loop(
     scenario: &Scenario,
     schedule: &[ScheduledRated],
     base_rate_hz: f64,
+    schedule_plan: Option<&SchedulePlan>,
     mut hardware: Option<&mut dyn HardwareAdapter>,
 ) -> Result<Trace, EvalError> {
     let ticks = tick_count(scenario.duration_s, base_rate_hz);
@@ -454,10 +464,22 @@ fn tick_loop(
             })
         })
         .collect::<Result<_, EvalError>>()?;
+    let mut dependencies_by_reader: BTreeMap<&str, Vec<&ScheduleDependency>> = BTreeMap::new();
+    if let Some(plan) = schedule_plan {
+        for dependency in &plan.dependencies {
+            dependencies_by_reader
+                .entry(&dependency.reader)
+                .or_default()
+                .push(dependency);
+        }
+    }
 
     let mut env = Env::new();
     let mut state = StateStore::new();
     let mut trace = Trace::new();
+    if let Some(plan) = schedule_plan {
+        trace.set_schedule_plan(plan.clone());
+    }
     // A virtual serial adapter is run-local state. Repeating the same scenario
     // starts with fresh ports, handles, cursors, and buffers.
     let mut serial = crate::virtual_serial::VirtualSerial::new(&scenario.serial)?;
@@ -587,15 +609,44 @@ fn tick_loop(
         // 2. Open the tick.
         trace.push_tick(t);
 
-        // 3. Run each scheduled function whose divisor selects this tick, in
-        //    dependency-then-rate order, sharing env/state. A function not run
-        //    holds its last-written channels in `env` (zero-order hold).
-        for (rated, plan) in schedule.iter().zip(plans.iter()) {
-            if i % plan.divisor != 0 {
-                continue;
-            }
+        // 3. Filter the static plan to the exact due set for this tick. Filtering
+        //    preserves every dependency order among functions that are due.
+        let due_indices: Vec<usize> = plans
+            .iter()
+            .enumerate()
+            .filter_map(|(index, plan)| (i % plan.divisor == 0).then_some(index))
+            .collect();
+        let due_functions: BTreeSet<String> = due_indices
+            .iter()
+            .filter_map(|&index| schedule[index].sched.fn_symbol.clone())
+            .collect();
+        for (due_position, &index) in due_indices.iter().enumerate() {
+            let rated = &schedule[index];
+            let plan = &plans[index];
             let sched = &rated.sched;
+            let function = sched
+                .fn_symbol
+                .as_deref()
+                .unwrap_or(sched.script.name.as_str());
+            let execution_inputs = schedule_plan.map_or_else(Vec::new, |_| {
+                schedule_input_provenance(
+                    dependencies_by_reader
+                        .get(function)
+                        .map(Vec::as_slice)
+                        .unwrap_or(&[]),
+                    ScheduleProvenanceCtx {
+                        due_functions: &due_functions,
+                        trace: &trace,
+                        env: &env,
+                        inputs: &inputs,
+                        overrides: &overrides,
+                        initial_state: &initial_state,
+                        startup_written: &startup_written,
+                    },
+                )
+            });
             let root = sched.script.cst.root();
+            let execution_time = EvalTime::periodic(i as u64, t, 1.0 / base_rate_hz, plan.dt);
             let mut ctx = EvalCtx {
                 project: &loaded.project,
                 calib: &loaded.calib,
@@ -612,7 +663,7 @@ fn tick_loop(
                 trace: Some(&mut trace),
             };
             let mut runtime = EvalRuntime {
-                time: EvalTime::periodic(i as u64, t, 1.0 / base_rate_hz, plan.dt),
+                time: execution_time,
                 hardware: match hardware.as_mut() {
                     Some(hardware) => Some(&mut **hardware),
                     None => None,
@@ -621,6 +672,16 @@ fn tick_loop(
             };
             exec_script_with_runtime(&root, &mut ctx, &mut runtime)
                 .map_err(|e| e.in_script(&sched.script.name, Some(t)))?;
+            if schedule_plan.is_some() {
+                trace.record_schedule_execution(ScheduleExecution {
+                    function: function.to_string(),
+                    plan_order: index,
+                    due_position,
+                    divisor: plan.divisor,
+                    time: execution_time,
+                    inputs: execution_inputs,
+                });
+            }
         }
 
         // 4. Preserve value provenance before filling scheduled zero-order holds.
@@ -683,6 +744,81 @@ struct RunPlan {
     /// `1 / rate_hz` — the time since this function's previous run, handed to its
     /// stateful operators so accumulation is rate-correct.
     dt: f64,
+}
+
+/// Capture the dependency values visible immediately before one scheduled
+/// execution. Actual current-tick channel records win. A continuously seeded
+/// scenario value is also current-tick and external. Otherwise the previous
+/// trace sample or startup environment value is a held value.
+fn schedule_input_provenance(
+    dependencies: &[&ScheduleDependency],
+    ctx: ScheduleProvenanceCtx<'_>,
+) -> Vec<ScheduleInputProvenance> {
+    let tick = ctx.trace.time.len().checked_sub(1);
+    let mut provenance = Vec::new();
+    for dependency in dependencies {
+        for channel in &dependency.channels {
+            let seeded_now = ctx
+                .inputs
+                .iter()
+                .chain(ctx.overrides.iter())
+                .any(|(path, _)| path == channel);
+            let (source, external) = if ctx.trace.has_channel_value_at_current_tick(channel) {
+                let tick = tick.expect("an open tick has a current channel value");
+                (
+                    ScheduleInputSource::CurrentTick,
+                    ctx.trace.channel_is_external_at_tick(channel, tick),
+                )
+            } else if seeded_now {
+                (ScheduleInputSource::CurrentTick, true)
+            } else if tick == Some(0) && ctx.initial_state.iter().any(|(path, _)| path == channel) {
+                (
+                    ScheduleInputSource::Held,
+                    !ctx.startup_written.contains(channel),
+                )
+            } else if tick == Some(0) && ctx.startup_written.contains(channel) {
+                (ScheduleInputSource::Held, false)
+            } else if let Some(previous_tick) = tick.and_then(|tick| tick.checked_sub(1)) {
+                if ctx
+                    .trace
+                    .channel_value_at_tick(channel, previous_tick)
+                    .is_some()
+                {
+                    (
+                        ScheduleInputSource::Held,
+                        ctx.trace
+                            .channel_is_external_at_tick(channel, previous_tick),
+                    )
+                } else if ctx.env.get(channel).is_some() {
+                    (ScheduleInputSource::Held, ctx.trace.is_external(channel))
+                } else {
+                    (ScheduleInputSource::Unavailable, false)
+                }
+            } else if ctx.env.get(channel).is_some() {
+                (ScheduleInputSource::Held, ctx.trace.is_external(channel))
+            } else {
+                (ScheduleInputSource::Unavailable, false)
+            };
+            provenance.push(ScheduleInputProvenance {
+                writer: dependency.writer.clone(),
+                channel: channel.clone(),
+                writer_due: ctx.due_functions.contains(&dependency.writer),
+                source,
+                external,
+            });
+        }
+    }
+    provenance
+}
+
+struct ScheduleProvenanceCtx<'a> {
+    due_functions: &'a BTreeSet<String>,
+    trace: &'a Trace,
+    env: &'a Env,
+    inputs: &'a [(String, &'a InputSeries)],
+    overrides: &'a [(String, &'a InputSeries)],
+    initial_state: &'a [(String, &'a InitialValue)],
+    startup_written: &'a BTreeSet<String>,
 }
 
 /// The On-Startup functions to run once before the periodic loop, in
@@ -1810,10 +1946,6 @@ value = { floating_point = 99.0 }
 [[inputs]]
 channel = "Root.MR.Seed"
 const = 3.0
-
-[[inputs]]
-channel = "Root.MR.Slow Out"
-const = 6.0
 "#;
         let scenario = Scenario::from_toml_str(toml).unwrap();
         let trace = run(&loaded, &scenario).expect("whole-project run succeeds");
@@ -2027,14 +2159,12 @@ duration_s = 0.01
     }
 
     #[test]
-    fn dependency_then_rate_orders_writer_before_reader_within_a_rate() {
-        // Within the 100 Hz group, Fast Writer (writes Fast Shared) must precede
-        // Fast Reader (reads Fast Shared) even though "Root.MR.Fast Reader" sorts
-        // before "Root.MR.Fast Writer" by name. Across rates, the 100 Hz group
-        // runs before the 50 Hz Slow Writer (fastest-first); no cross-rate edge
-        // forces Slow Writer ahead of its 100 Hz reader.
+    fn dependency_plan_orders_writers_before_readers_across_rates() {
+        // Slow Writer feeds Fast Writer, which feeds Fast Reader. The global
+        // dependency chain therefore overrides rate-first order. Slow Integrator
+        // is independent and wins the isolated ready-node name tie at 50 Hz.
         let loaded = multirate();
-        let ordered = build_whole_project_schedule(&loaded);
+        let (_, ordered) = build_whole_project_schedule(&loaded).expect("schedule plan builds");
         let order: Vec<String> = ordered
             .iter()
             .map(|r| r.sched.fn_symbol.clone().unwrap())
@@ -2042,14 +2172,12 @@ duration_s = 0.01
         assert_eq!(
             order,
             vec![
-                "Root.MR.Fast Writer".to_string(),
-                "Root.MR.Fast Reader".to_string(),
-                // 50 Hz group: no inter-dependency, so name order — "Integrator"
-                // sorts before "Writer".
                 "Root.MR.Slow Integrator".to_string(),
                 "Root.MR.Slow Writer".to_string(),
+                "Root.MR.Fast Writer".to_string(),
+                "Root.MR.Fast Reader".to_string(),
             ],
-            "writer-before-reader within rate, fastest group first: {order:?}"
+            "global dependencies override the isolated ready-node tie: {order:?}"
         );
     }
 
@@ -2057,11 +2185,9 @@ duration_s = 0.01
     fn whole_project_run_computes_every_scheduled_channel() {
         // End-to-end whole-project run over the multirate fixture. With Seed = 3
         // (constant input), Slow Writer computes Slow Out = 6. The 100 Hz Fast
-        // Writer reads Slow Out *across rates*: the fast group runs before the
-        // slow writer each tick, so it reads the previous value (stale-tolerant —
-        // no cross-rate edge). We seed Slow Out's steady-state (6) so the very
-        // first tick has a value to read; from then on Slow Writer holds it at 6.
-        // Therefore Fast Shared = 7 and Fast Out = 70 on every tick. Within the
+        // Writer reads Slow Out across rates. The global dependency plan runs
+        // Slow Writer first on common due ticks; odd fast ticks read the held
+        // value. Therefore Fast Shared = 7 and Fast Out = 70 on every tick. Within the
         // 100 Hz group the order runs Fast Writer before Fast Reader, so Fast Out
         // sees the freshly-written Fast Shared the same tick. (Per-divisor
         // rate-gating is P2-B; here every function runs every tick.)
@@ -2074,10 +2200,6 @@ base_rate_hz = 100.0
 [[inputs]]
 channel = "Root.MR.Seed"
 const = 3.0
-
-[[inputs]]
-channel = "Root.MR.Slow Out"
-const = 6.0
 "#;
         let scenario = Scenario::from_toml_str(toml).unwrap();
         let trace = run(&loaded, &scenario).expect("whole-project run succeeds");
@@ -2118,16 +2240,197 @@ base_rate_hz = 100.0
 [[inputs]]
 channel = "Root.MR.Seed"
 const = 3.0
-
-[[inputs]]
-channel = "Root.MR.Slow Out"
-const = 6.0
 "#;
         let scenario = Scenario::from_toml_str(toml).unwrap();
         let a = run(&loaded, &scenario).expect("run a");
         let b = run(&loaded, &scenario).expect("run b");
         assert_eq!(a.time, b.time);
         assert_eq!(a.channels, b.channels);
+    }
+
+    #[test]
+    fn schedule_trace_marks_cross_rate_dependency_current_then_held() {
+        let loaded = multirate();
+        let toml = r#"
+mode = "whole-project"
+duration_s = 0.03
+base_rate_hz = 100.0
+allow_default_inputs = true
+
+[[inputs]]
+channel = "Root.MR.Seed"
+const = 2.0
+"#;
+        let scenario = Scenario::from_toml_str(toml).unwrap();
+        let trace = run(&loaded, &scenario).expect("whole-project run succeeds");
+
+        let fast_writer_inputs: Vec<_> = trace
+            .schedule_executions
+            .iter()
+            .filter(|execution| execution.function == "Root.MR.Fast Writer")
+            .map(|execution| {
+                let slow_out = execution
+                    .inputs
+                    .iter()
+                    .find(|input| input.channel == "Root.MR.Slow Out")
+                    .expect("Fast Writer depends on Slow Out");
+                (
+                    execution.time.base_tick,
+                    slow_out.writer_due,
+                    slow_out.source,
+                    slow_out.external,
+                )
+            })
+            .collect();
+
+        assert_eq!(
+            fast_writer_inputs,
+            vec![
+                (0, true, ScheduleInputSource::CurrentTick, false),
+                (1, false, ScheduleInputSource::Held, false),
+                (2, true, ScheduleInputSource::CurrentTick, false),
+            ],
+            "dependency freshness follows actual writer executions"
+        );
+    }
+
+    #[test]
+    fn schedule_trace_marks_due_conditional_writer_skip_as_held() {
+        let temp = tempfile::tempdir().expect("temp project");
+        let scripts = temp.path().join("Scripts");
+        std::fs::create_dir(&scripts).expect("create scripts directory");
+        std::fs::write(
+            temp.path().join("Project.m1prj"),
+            r#"<?xml version="1.0"?>
+<MoTeCM1BuildSession>
+ <Project Name="Conditional Schedule" TargetHardware="ecu120">
+  <ComponentStream><List>
+   <Component Classname="BuiltIn.GroupCompound" Name="Root.T"/>
+   <Component Classname="BuiltIn.GroupCompound" Name="Root.Events"/>
+   <Component Classname="BuiltIn.EventKernel" Name="Root.Events.On 100Hz"/>
+   <Component Classname="BuiltIn.Channel" Name="Root.T.A"><Props Type="f32"/></Component>
+   <Component Classname="BuiltIn.Channel" Name="Root.T.B"><Props Type="f32"/></Component>
+   <Component Classname="BuiltIn.Channel" Name="Root.T.Enable"><Props Type="bool"/></Component>
+   <Component Classname="BuiltIn.Channel" Name="Root.T.Seed"><Props Type="f32"/></Component>
+   <Component Classname="BuiltIn.FuncUser" Filename="T.Writer.m1scr" Name="Root.T.Writer">
+    <Props SelectedTrigger="Root.Events.On 100Hz"/>
+   </Component>
+   <Component Classname="BuiltIn.FuncUser" Filename="T.Reader.m1scr" Name="Root.T.Reader">
+    <Props SelectedTrigger="Root.Events.On 100Hz"/>
+   </Component>
+  </List></ComponentStream>
+ </Project>
+</MoTeCM1BuildSession>
+"#,
+        )
+        .expect("write project");
+        std::fs::write(
+            scripts.join("T.Writer.m1scr"),
+            "if (Enable)\n{\n\tA = Seed;\n}\n",
+        )
+        .expect("write writer");
+        std::fs::write(scripts.join("T.Reader.m1scr"), "B = A;\n").expect("write reader");
+        let loaded = load(&temp.path().join("Project.m1prj"), None).expect("project loads");
+        let scenario = Scenario::from_toml_str(
+            r#"
+mode = "whole-project"
+duration_s = 0.01
+base_rate_hz = 100.0
+
+[[initial_state]]
+channel = "Root.T.A"
+value = { floating_point = 7.0 }
+
+[[inputs]]
+channel = "Root.T.Enable"
+const = false
+"#,
+        )
+        .expect("scenario parses");
+
+        let trace = run(&loaded, &scenario).expect("whole-project run succeeds");
+        let reader = trace
+            .schedule_executions
+            .iter()
+            .find(|execution| execution.function == "Root.T.Reader")
+            .expect("reader executed");
+        let input = reader
+            .inputs
+            .iter()
+            .find(|input| input.channel == "Root.T.A")
+            .expect("Reader depends on A");
+
+        assert!(input.writer_due, "Writer was due on tick zero");
+        assert_eq!(input.source, ScheduleInputSource::Held);
+        assert!(
+            input.external,
+            "initial state is external until a writer assigns"
+        );
+        assert_eq!(
+            trace.channel_value_at_tick("Root.T.B", 0),
+            Some(&Value::m1_float(7.0))
+        );
+    }
+
+    #[test]
+    fn failed_scheduled_execution_does_not_continue_to_later_due_functions() {
+        #[derive(Default)]
+        struct CallProbe {
+            calls: Vec<String>,
+        }
+
+        impl HardwareAdapter for CallProbe {
+            fn call(
+                &mut self,
+                call: &crate::hardware::HardwareCall,
+            ) -> Result<crate::hardware::AdapterReply, EvalError> {
+                self.calls.push(call.canonical_name());
+                Ok(crate::hardware::AdapterReply::Unhandled)
+            }
+        }
+
+        let temp = tempfile::tempdir().expect("temp project");
+        let scripts = temp.path().join("Scripts");
+        std::fs::create_dir(&scripts).expect("create scripts directory");
+        std::fs::write(
+            temp.path().join("Project.m1prj"),
+            r#"<?xml version="1.0"?>
+<MoTeCM1BuildSession>
+ <Project Name="Execution failure" TargetHardware="ecu120">
+  <ComponentStream><List>
+   <Component Classname="BuiltIn.GroupCompound" Name="Root.T"/>
+   <Component Classname="BuiltIn.GroupCompound" Name="Root.Events"/>
+   <Component Classname="BuiltIn.EventKernel" Name="Root.Events.On 100Hz"/>
+   <Component Classname="BuiltIn.Channel" Name="Root.T.A"><Props Type="f32"/></Component>
+   <Component Classname="BuiltIn.Channel" Name="Root.T.B"><Props Type="f32"/></Component>
+   <Component Classname="BuiltIn.FuncUser" Filename="T.A Failing.m1scr" Name="Root.T.A Failing"><Props SelectedTrigger="Root.Events.On 100Hz"/></Component>
+   <Component Classname="BuiltIn.FuncUser" Filename="T.B Later.m1scr" Name="Root.T.B Later"><Props SelectedTrigger="Root.Events.On 100Hz"/></Component>
+  </List></ComponentStream>
+ </Project>
+</MoTeCM1BuildSession>
+"#,
+        )
+        .expect("write project");
+        std::fs::write(scripts.join("T.A Failing.m1scr"), "A = Missing;\n")
+            .expect("write failing script");
+        std::fs::write(scripts.join("T.B Later.m1scr"), "B = System.Ticks();\n")
+            .expect("write later script");
+
+        let loaded = load(&temp.path().join("Project.m1prj"), None).expect("project loads");
+        let scenario = Scenario::from_toml_str(
+            "mode = \"whole-project\"\nduration_s = 0.01\nbase_rate_hz = 100.0\n",
+        )
+        .expect("scenario parses");
+        let mut probe = CallProbe::default();
+        let error = run_with_adapter(&loaded, &scenario, &mut probe)
+            .expect_err("failing function aborts the due set");
+
+        assert!(error.to_string().contains("Missing"), "{error}");
+        assert!(
+            probe.calls.is_empty(),
+            "the later function must not execute after an earlier failure: {:?}",
+            probe.calls
+        );
     }
 
     #[test]
@@ -2149,9 +2452,6 @@ const = 6.0
         //   tick 4 (t=0.04, Seed=5): Slow Echo = 10    (run)
         //   tick 5 (t=0.05):         Slow Echo = 10    (held)
         //
-        // `Slow Out` is seeded to its steady value so the cross-rate Fast Writer
-        // read on tick 0 succeeds (the schedule runs the fast group first); the
-        // seed is constant so it never masks the held-value check on Slow Echo.
         let loaded = multirate();
         let toml = r#"
 mode = "whole-project"
@@ -2161,10 +2461,6 @@ base_rate_hz = 100.0
 [[inputs]]
 channel = "Root.MR.Seed"
 series = [[0.0, 1.0], [0.01, 2.0], [0.02, 3.0], [0.03, 4.0], [0.04, 5.0], [0.05, 6.0]]
-
-[[inputs]]
-channel = "Root.MR.Slow Out"
-const = 2.0
 "#;
         let scenario = Scenario::from_toml_str(toml).unwrap();
         let trace = run(&loaded, &scenario).expect("rate-gated run succeeds");
@@ -2217,10 +2513,6 @@ base_rate_hz = 100.0
 [[inputs]]
 channel = "Root.MR.Seed"
 const = 2.0
-
-[[inputs]]
-channel = "Root.MR.Slow Out"
-const = 4.0
 "#;
         let scenario = Scenario::from_toml_str(toml).unwrap();
         let trace = run(&loaded, &scenario).expect("rate-gated integral run succeeds");
@@ -2262,10 +2554,6 @@ duration_s = 0.05
 [[inputs]]
 channel = "Root.MR.Seed"
 const = 3.0
-
-[[inputs]]
-channel = "Root.MR.Slow Out"
-const = 6.0
 "#;
         let scenario = Scenario::from_toml_str(toml).unwrap();
         let trace = run(&loaded, &scenario).expect("auto-base-rate run succeeds");
@@ -2276,8 +2564,8 @@ const = 6.0
             5,
             "auto base = lcm of scheduled rates (100 Hz)"
         );
-        // The fast group ran every tick: Slow Out = Seed*2 = 6 on the even ticks
-        // it ran; Fast Writer reads it (stale-tolerant) and writes Fast Shared.
+        // The fast function runs every tick. It reads freshly written Slow Out
+        // on common due ticks and the held value between them.
         let fast = trace.channels.get("Root.MR.Fast Out").expect("Fast Out");
         assert_eq!(fast.len(), 5, "fast channel present every tick");
     }
