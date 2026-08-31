@@ -1,11 +1,19 @@
 // SPDX-License-Identifier: GPL-3.0-or-later
-//! Typed boundary between script hardware calls and an external adapter.
+//! Typed boundary between script calls and an external adapter.
+//!
+//! Most calls crossing this boundary read hardware or request a hardware side
+//! effect. A small set of capture-only library calls also uses it when the
+//! pinned signature is known but the executable formula or state contract is
+//! not. `MPSE`, `TC`, and `Switch` are in that second group. This does not label
+//! those libraries as physical hardware. It lets a consumer with the missing
+//! implementation supply it without making the evaluator guess.
 //!
 //! The evaluator resolves a receiver before it builds a [`HardwareCall`]. An
-//! adapter therefore sees the canonical library object or project-object path,
-//! the source spelling, the exact [`CallSite`], evaluated
-//! arguments, and deterministic evaluator time. It never has to parse a dotted
-//! string or consult wall-clock time.
+//! adapter sees the canonical library object or project-object path, the source
+//! spelling, exact [`CallSite`], evaluated arguments, and deterministic
+//! evaluator time. Capture-only library routes normalize arguments to their
+//! captured M1 families before this call. It never has to parse a dotted string
+//! or consult wall-clock time.
 //!
 //! ```no_run
 //! use m1_eval::{AdapterReply, EvalError, HardwareAdapter, HardwareCall, Value};
@@ -113,7 +121,7 @@ impl EvalTime {
     }
 }
 
-/// One fully-resolved hardware call offered to a [`HardwareAdapter`].
+/// One fully-resolved external call offered to a [`HardwareAdapter`].
 #[derive(Debug, Clone, PartialEq)]
 pub struct HardwareCall {
     /// Canonical or explicitly unresolved receiver identity.
@@ -125,7 +133,9 @@ pub struct HardwareCall {
     pub method: String,
     /// Exact script and byte offset of this call occurrence.
     pub site: CallSite,
-    /// Arguments after expression evaluation, in source order.
+    /// Arguments after expression evaluation, in source order. Capture-only
+    /// library routes normalize these to the captured M1 families. Existing
+    /// hardware routes retain their evaluated values.
     pub arguments: Vec<Value>,
     /// Deterministic evaluator time for this execution.
     pub time: EvalTime,
@@ -143,8 +153,9 @@ impl HardwareCall {
     }
 }
 
-/// An adapter either supplies the call's value or declines it so the evaluator
-/// can continue through its deterministic model and documented fallback rules.
+/// An adapter either supplies the call's value or declines it. The evaluator
+/// then continues through a deterministic model or documented fallback when
+/// that route has one. Otherwise it fails loud.
 #[derive(Debug, Clone, PartialEq)]
 pub enum AdapterReply {
     /// The adapter did not handle this receiver and method.
@@ -160,10 +171,11 @@ impl From<Value> for AdapterReply {
     }
 }
 
-/// External implementation of hardware-backed calls.
+/// External implementation of hardware-backed or capture-only library calls.
 pub trait HardwareAdapter {
-    /// Handle one call or return [`AdapterReply::Unhandled`] to let evaluation
-    /// continue through the built-in offline model and fallback rules.
+    /// Handle one call or return [`AdapterReply::Unhandled`]. Evaluation then
+    /// uses a built-in model or fallback when one exists, or fails loud when it
+    /// does not.
     fn call(&mut self, call: &HardwareCall) -> Result<AdapterReply, EvalError>;
 }
 

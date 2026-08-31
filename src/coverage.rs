@@ -64,9 +64,10 @@ pub struct CoverageReport {
     pub supported: Vec<CoverageItem>,
     /// Items dispatched through an explicit deterministic offline model.
     pub assumed: Vec<CoverageItem>,
-    /// Calls routed through a typed adapter. This includes both user-supplied
-    /// adapters and evaluator-owned adapters such as virtual serial. Required
-    /// external metadata is a subset of this category.
+    /// Calls routed through a typed adapter. This includes user-supplied
+    /// adapters, evaluator-owned adapters such as virtual serial, and
+    /// capture-only library behavior whose executable contract is absent.
+    /// Required external metadata is a subset of this category.
     pub adapter_backed: Vec<CoverageItem>,
     /// Hardware calls handled by documented typed offline fallbacks.
     pub stubbed: Vec<CoverageItem>,

@@ -5,6 +5,14 @@
 pub enum EvalError {
     /// A builtin object/method we do not implement (Tier-3 or unknown).
     UnsupportedBuiltin { object: String, method: String },
+    /// A known builtin whose captured signature is not enough to reproduce its
+    /// runtime behavior. The reason names the missing contract or evidence so
+    /// callers can distinguish this from an unknown builtin.
+    UnsupportedBuiltinBehavior {
+        object: String,
+        method: String,
+        reason: String,
+    },
     /// A syntactic construct the evaluator does not handle.
     UnsupportedConstruct { kind: String, at: usize },
     /// An identifier that resolves to no project symbol / local / builtin.
@@ -64,6 +72,14 @@ impl std::fmt::Display for EvalError {
             EvalError::UnsupportedBuiltin { object, method } => {
                 write!(f, "unsupported builtin: {object}.{method}")
             }
+            EvalError::UnsupportedBuiltinBehavior {
+                object,
+                method,
+                reason,
+            } => write!(
+                f,
+                "unsupported builtin behavior: {object}.{method}: {reason}"
+            ),
             EvalError::UnsupportedConstruct { kind, at } => {
                 write!(f, "unsupported construct {kind} at byte {at}")
             }
@@ -143,6 +159,19 @@ mod tests {
         assert_eq!(
             err.to_string(),
             "in MR.Init.m1scr at startup: missing scenario input: Root.Demo.Speed"
+        );
+    }
+
+    #[test]
+    fn known_missing_builtin_behavior_names_the_evidence_gap() {
+        let err = EvalError::UnsupportedBuiltinBehavior {
+            object: "MPSE".to_string(),
+            method: "Solve".to_string(),
+            reason: "the captured integration equation is unavailable".to_string(),
+        };
+        assert_eq!(
+            err.to_string(),
+            "unsupported builtin behavior: MPSE.Solve: the captured integration equation is unavailable"
         );
     }
 }
