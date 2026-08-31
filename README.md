@@ -32,7 +32,7 @@ do not compare computed channel values with captured M1 results.
 | --- | --- | --- |
 | Expressions, statements, enums, and inline user functions | **Assumed** | Covered by unit and synthetic-project tests. M1 evaluation results have not been captured for comparison. |
 | `.m1cfg` parameters and 1/2/3-D table lookup | **Assumed** | The reader honors explicit `Site="x,y,z"` coordinates with X changing fastest, enum axes, and each project's clamp or extrapolation flags. Synthetic vectors cover exact sites, interpolation, every boundary, and malformed tables. No M1 Sim table capture is available yet. Use the matching calibration for actual values. Without it, parameters use typed external defaults. Table `.Lookup()` and `.Get()` fail in strict modes; whole-project mode may opt in to an external `0.0` fallback. |
-| `Calculate.*`, `Limit.*`, `Convert.*`, enum conversions, core value-object methods, and table methods | **Assumed** | Implemented methods have hand-derived tests. `AsString`, `Validate`, `Constrain`, `GetUnscheduled`, and `Set` resolve against eligible receiver classes; channel `Set` applies its project validation range before writing. `--coverage` remains authoritative for the methods a project uses. |
+| `Calculate.*`, `Limit.*`, `Convert.*`, `UnixTime.*`, enum conversions, core value-object methods, and table methods | **Assumed** | Implemented methods have hand-derived or independent-reference tests. `UnixTime` uses deterministic Gregorian/POSIX arithmetic and evaluator-local timezone state; it never reads the host clock or timezone. `AsString`, `Validate`, `Constrain`, `GetUnscheduled`, and `Set` resolve against eligible receiver classes; channel `Set` applies its project validation range before writing. `--coverage` remains authoritative for the methods a project uses. |
 | Filters, integrals, derivatives, debounce, delay, change detection, timers, and `static local` state | **Assumed** | Update laws and startup behavior are explicit implementation assumptions with hand-derived tests, not M1 value comparisons. Timer countdowns use absolute evaluator time: `Remaining` is a read-only observation, while `Start`, `Stop`, and `Reset` are the only state transitions. |
 | `CanComms.*`, `Serial.*`, `System.*`, `Logging.*`, DBC objects, and other hardware-backed calls | **Assumed / Stubbed** | Each call crosses a typed adapter boundary with its resolved receiver, source call site, arguments, and evaluator time. Exact-site scenario values take precedence over wildcard values and an attached adapter. `System.ElapsedTime` reports the interval since that call site last ran. Its first tick-zero call returns zero, while a site first reached later uses its function step. Tick calls use the deterministic base timeline. `System.FlashSize` and `System.FlashFree` require scenario or adapter data; they never become a dangerous zero. Remaining unhandled calls use documented typed stubs or fail loud. |
 | Scenario parsing, tick grids, trace output, and `--coverage` | **Assumed** | These are deterministic m1-eval contracts tested with synthetic data. A `Supported` coverage entry means implemented, not M1-verified. |
@@ -55,8 +55,8 @@ dependency-cone runners.
   cells. Body sites use X-fastest M1 coordinates. Numeric boundaries clamp by
   default and extrapolate only when the project enables that end. Enum axes
   select calibrated values exactly.
-- **Tier-1 pure builtins** — `Calculate.*`, `Limit.*`, `Convert.*`, table
-  `.Lookup()`.
+- **Tier-1 direct builtins** — `Calculate.*`, `Limit.*`, `Convert.*`,
+  deterministic `UnixTime.*`, and table `.Lookup()`.
 - **Tier-2 stateful builtins** (the hard core) — `Filter.FirstOrder`,
   `Filter.{Maximum,Minimum}`, `Integral.Normal`, `Derivative.*`, `Debounce.*`,
   `Delay.*`, `Change.*`, timers, and `static local` persistence. Each is a small
@@ -98,6 +98,13 @@ The implemented behavior is still **Assumed** under the maturity contract above:
   Whole-number inputs `-214..=214` fit the documented signed 32-bit, seven-place
   representation; values immediately outside that domain fail with a range
   error.
+- `UnixTime.*` uses signed 32-bit POSIX timestamps, proleptic-Gregorian calendar
+  arithmetic, and a fixed evaluator-local timezone. Constructors accept the
+  catalogue's 1970–2038 range and fail if the result exceeds M1 `Integer`.
+  `FromGPS` floors fractional seconds and maps two-digit years `70..99` to
+  1970–1999 and `00..38` to 2000–2038. Constructor seconds `60` and `61` are
+  normalized into the next minute. Those M1-specific choices remain Assumed;
+  every ordinary calendar vector is checked against an independent library.
 
 ## What it adds (Phase 2 — the whole-project multi-rate scheduler)
 

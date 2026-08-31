@@ -255,6 +255,25 @@ impl Env {
             .insert(site_override_key(&call, &site), value);
     }
 
+    /// The evaluator-local Unix-timezone offset, in seconds east of UTC.
+    ///
+    /// The state lives in a private NUL-prefixed namespace inside the existing
+    /// override map so adding `UnixTime.Timezone` does not change the public
+    /// [`Env`] struct shape. M1 identifiers cannot contain NUL, so a script or
+    /// scenario value cannot collide with this key. A fresh environment is UTC.
+    pub(crate) fn unix_timezone_offset_seconds(&self) -> i32 {
+        match self.io_overrides.get(UNIX_TIMEZONE_KEY) {
+            Some(Value::M1(M1Scalar::Integer(seconds))) => *seconds,
+            _ => 0,
+        }
+    }
+
+    /// Replace the evaluator-local Unix-timezone offset.
+    pub(crate) fn set_unix_timezone_offset_seconds(&mut self, seconds: i32) {
+        self.io_overrides
+            .insert(UNIX_TIMEZONE_KEY.to_string(), Value::m1_integer(seconds));
+    }
+
     /// Write the current frame's `Out` return slot — the value an `Out = <expr>;`
     /// statement assigns inside a user-function body.
     pub fn set_out(&mut self, value: Value) {
@@ -297,6 +316,9 @@ fn site_override_key(call: &str, site: &CallSite) -> String {
         site.offset()
     )
 }
+
+/// Private `Env::io_overrides` key for `UnixTime.Timezone` state.
+const UNIX_TIMEZONE_KEY: &str = "\0m1-eval-unix-timezone";
 
 #[cfg(test)]
 mod tests {

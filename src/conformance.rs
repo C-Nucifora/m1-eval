@@ -104,6 +104,9 @@ pub struct FixtureProvenance {
 pub enum ProvenanceKind {
     /// Hand-derived expected values used to test the runner itself.
     Synthetic,
+    /// Expected values checked against a named independent implementation or
+    /// published standard, but not captured from M1 Sim.
+    Independent,
     /// Values captured from M1 Sim.
     M1Sim,
 }
@@ -112,6 +115,7 @@ impl fmt::Display for ProvenanceKind {
     fn fmt(&self, formatter: &mut fmt::Formatter<'_>) -> fmt::Result {
         match self {
             Self::Synthetic => formatter.write_str("synthetic"),
+            Self::Independent => formatter.write_str("independent"),
             Self::M1Sim => formatter.write_str("m1-sim"),
         }
     }

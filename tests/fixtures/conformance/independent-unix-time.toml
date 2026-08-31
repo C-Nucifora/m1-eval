@@ -1,0 +1,114 @@
+# SPDX-License-Identifier: GPL-3.0-or-later
+# Public Gregorian/POSIX reference vectors. This is not M1 Sim evidence.
+schema_version = 1
+name = "independent UnixTime catalogue vectors"
+calculation_rate_hz = 10.0
+
+[project]
+root = "../conformance-unix-time"
+project = "Project.m1prj"
+
+[[project.files]]
+path = "Project.m1prj"
+sha256 = "363a4de3369e9d91dee1c1e1dcfb33a813480d281e4c24efd968b59ad766d8b0"
+
+[[project.files]]
+path = "Scripts/Unix.Update.m1scr"
+sha256 = "28c8e2e5c831e16e4652636bd6aa750206aa127316c5f5fbfddd36dee5871aea"
+
+[provenance]
+kind = "independent"
+source = "POSIX seconds-since-Epoch rules and time crate 0.3.47"
+procedure = "docs/conformance.md#independent-reference-fixtures"
+notes = "M1-specific GPS pivot, leap-second normalization, and timezone encoding remain Assumed."
+
+[run]
+mode = "function"
+target = "Unix.Update"
+
+[[steps]]
+time_s = 0.0
+
+[[steps.expected]]
+channel = "Root.Unix.From GPS"
+value = { type = "integer", value = 1078058096 }
+
+[[steps.expected]]
+channel = "Root.Unix.From UTC"
+value = { type = "integer", value = 1078058096 }
+
+[[steps.expected]]
+channel = "Root.Unix.From Local"
+value = { type = "integer", value = 1078058096 }
+
+[[steps.expected]]
+channel = "Root.Unix.Arithmetic"
+value = { type = "integer", value = 1078058156 }
+
+[[steps.expected]]
+channel = "Root.Unix.Comparison"
+value = { type = "boolean", value = true }
+
+[[steps.expected]]
+channel = "Root.Unix.UTC Day"
+value = { type = "integer", value = 29 }
+
+[[steps.expected]]
+channel = "Root.Unix.UTC Hour"
+value = { type = "integer", value = 12 }
+
+[[steps.expected]]
+channel = "Root.Unix.UTC Minute"
+value = { type = "integer", value = 34 }
+
+[[steps.expected]]
+channel = "Root.Unix.UTC Month"
+value = { type = "integer", value = 1 }
+
+[[steps.expected]]
+channel = "Root.Unix.UTC Second"
+value = { type = "integer", value = 56 }
+
+[[steps.expected]]
+channel = "Root.Unix.UTC Week Day"
+value = { type = "integer", value = 0 }
+
+[[steps.expected]]
+channel = "Root.Unix.UTC Year"
+value = { type = "integer", value = 2004 }
+
+[[steps.expected]]
+channel = "Root.Unix.UTC Year Day"
+value = { type = "integer", value = 59 }
+
+[[steps.expected]]
+channel = "Root.Unix.Local Day"
+value = { type = "integer", value = 29 }
+
+[[steps.expected]]
+channel = "Root.Unix.Local Hour"
+value = { type = "integer", value = 18 }
+
+[[steps.expected]]
+channel = "Root.Unix.Local Minute"
+value = { type = "integer", value = 4 }
+
+[[steps.expected]]
+channel = "Root.Unix.Local Month"
+value = { type = "integer", value = 1 }
+
+[[steps.expected]]
+channel = "Root.Unix.Local Second"
+value = { type = "integer", value = 56 }
+
+[[steps.expected]]
+channel = "Root.Unix.Local Week Day"
+value = { type = "integer", value = 0 }
+
+[[steps.expected]]
+channel = "Root.Unix.Local Year"
+value = { type = "integer", value = 2004 }
+
+[[steps.expected]]
+channel = "Root.Unix.Local Year Day"
+value = { type = "integer", value = 59 }
