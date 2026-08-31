@@ -2096,15 +2096,20 @@ mod tests {
     #[test]
     fn unimplemented_builtin_call_still_fails_loud() {
         let mut h = Harness::new();
-        // A buffered sample-delay (Delay.Signal15) is intentionally not
-        // implemented in Phase 1, so a call to it must fail loud rather than
-        // no-op — the stateful object is recognised but this method is not.
+        // The catalogue identifies Delay.Signal15 but does not define its queue
+        // behavior. Evaluation must report that evidence gap rather than use a
+        // guessed buffer or generic unsupported-method error.
         match rhs_value("Delay.Signal15(1.0, 3)", &mut h) {
-            Err(EvalError::UnsupportedBuiltin { object, method }) => {
+            Err(EvalError::UnsupportedBuiltinBehavior {
+                object,
+                method,
+                reason,
+            }) => {
                 assert_eq!(object, "Delay");
                 assert_eq!(method, "Signal15");
+                assert!(reason.contains("startup output"));
             }
-            other => panic!("expected UnsupportedBuiltin, got {other:?}"),
+            other => panic!("expected missing Signal15 behavior, got {other:?}"),
         }
     }
 
