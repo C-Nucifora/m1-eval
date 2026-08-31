@@ -66,8 +66,8 @@ pub struct CoverageReport {
     /// Items dispatched through an explicit deterministic offline model.
     pub assumed: Vec<CoverageItem>,
     /// Calls routed through a typed adapter. This includes user-supplied
-    /// adapters, evaluator-owned adapters such as virtual serial, and
-    /// capture-only library behavior whose executable contract is absent.
+    /// adapters, evaluator-owned adapters such as virtual CAN or virtual serial,
+    /// and capture-only library behavior whose executable contract is absent.
     /// Required external metadata is a subset of this category.
     pub adapter_backed: Vec<CoverageItem>,
     /// Hardware calls handled by documented typed offline fallbacks.
@@ -107,7 +107,7 @@ impl CoverageReport {
     /// [`CoverageReport::analyse_in`] for project-accurate receiver and
     /// user-function coverage.
     pub fn analyse(scripts: &[ParsedScript]) -> CoverageReport {
-        Self::analyse_with_triggers(scripts, None, None)
+        Self::analyse_with_triggers(scripts, None, None, None)
     }
 
     /// Analyse every script with optional project context. When a [`Project`] is
@@ -117,7 +117,7 @@ impl CoverageReport {
     /// Bits.Update` vs `Slip Control.Update`). Runtime dispatch and coverage both
     /// use the same receiver-aware capability classifier.
     pub fn analyse_in(scripts: &[ParsedScript], project: Option<&Project>) -> CoverageReport {
-        Self::analyse_with_triggers(scripts, project, None)
+        Self::analyse_with_triggers(scripts, project, None, None)
     }
 
     /// Analyse a complete loaded project, including the loader's exact startup
@@ -127,6 +127,7 @@ impl CoverageReport {
             &loaded.scripts,
             Some(&loaded.project),
             Some(&loaded.triggers),
+            Some(&loaded.can),
         );
         match build_schedule_plan(loaded) {
             Ok(plan) => {
@@ -148,6 +149,7 @@ impl CoverageReport {
         scripts: &[ParsedScript],
         project: Option<&Project>,
         triggers: Option<&TriggerMap>,
+        can: Option<&m1_can::CanRuntimeModel>,
     ) -> CoverageReport {
         let mut buckets = CoverageBuckets::default();
         for script in scripts {
@@ -156,6 +158,7 @@ impl CoverageReport {
             let fn_symbol = project.and_then(|p| p.function_symbol_for_script(&script.name));
             let cx = WalkCtx {
                 project,
+                can,
                 group: group.as_deref(),
                 fn_symbol: fn_symbol.as_deref(),
                 scripts,
@@ -478,6 +481,7 @@ fn is_reportable_construct(kind: Kind) -> bool {
 /// receiver and any script-backed user function exactly as runtime dispatch does.
 struct WalkCtx<'a> {
     project: Option<&'a Project>,
+    can: Option<&'a m1_can::CanRuntimeModel>,
     group: Option<&'a str>,
     fn_symbol: Option<&'a str>,
     scripts: &'a [ParsedScript],
@@ -506,6 +510,7 @@ fn walk(
     {
         let scope = CapabilityScope {
             project: cx.project,
+            can: cx.can,
             group: cx.group,
             fn_symbol: cx.fn_symbol,
             locals: Some(locals),
@@ -619,8 +624,15 @@ Output = i;
         let assumed: Vec<&str> = report.assumed.iter().map(|i| i.name.as_str()).collect();
         assert!(assumed.contains(&"Integral.Normal"), "{assumed:?}");
 
-        let stub_names: Vec<&str> = report.stubbed.iter().map(|i| i.name.as_str()).collect();
-        assert!(stub_names.contains(&"CanComms.GetFloat"), "{stub_names:?}");
+        let adapter_names: Vec<&str> = report
+            .adapter_backed
+            .iter()
+            .map(|i| i.name.as_str())
+            .collect();
+        assert!(
+            adapter_names.contains(&"CanComms.GetFloat"),
+            "{adapter_names:?}"
+        );
 
         // Without a project, coverage cannot prove that Demo.Map is a table.
         let unsupported: Vec<&str> = report.unsupported.iter().map(|i| i.name.as_str()).collect();
@@ -649,7 +661,7 @@ Output = i;
         );
         assert!(
             report
-                .stubbed
+                .adapter_backed
                 .iter()
                 .any(|item| item.name == "CanComms.GetFloat"),
             "{report:?}"
@@ -766,7 +778,7 @@ Output = i;
         }
         assert!(
             report
-                .stubbed
+                .adapter_backed
                 .iter()
                 .any(|item| item.name == "Library.CanComms.GetFloat"),
             "{report:?}"

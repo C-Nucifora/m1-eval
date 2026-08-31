@@ -38,10 +38,13 @@ pub use ident::{Target, classify};
 
 pub mod trace;
 pub use trace::{
-    ScheduleExecution, ScheduleInputProvenance, ScheduleInputSource, SerialDirection, SerialEvent,
-    Trace,
+    CanEvent, CanTransferDirection, ScheduleExecution, ScheduleInputProvenance,
+    ScheduleInputSource, SerialDirection, SerialEvent, Trace,
 };
 
+pub use m1_can::{CanDbcSource, CanFrameFormat, CanRuntimeModel, runtime_model_loaded};
+
+mod virtual_can;
 mod virtual_serial;
 
 pub mod expr;
@@ -54,7 +57,8 @@ pub use stmt::{exec, exec_at_time, exec_script, exec_script_at_time};
 
 pub mod scenario;
 pub use scenario::{
-    InitialValue, InputKind, InputSeries, IoSeries, RunMode, Scenario, SerialRx, SerialScenario,
+    CanRx, CanScenario, InitialValue, InputKind, InputSeries, IoSeries, RunMode, Scenario,
+    SerialRx, SerialScenario,
 };
 
 pub mod log;

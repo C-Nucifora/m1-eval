@@ -1253,6 +1253,7 @@ fn fixture_scenario(
         overrides: Vec::new(),
         io: Vec::new(),
         serial: Default::default(),
+        can: Default::default(),
         allow_default_inputs: false,
     })
 }

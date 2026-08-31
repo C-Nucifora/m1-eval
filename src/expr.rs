@@ -93,6 +93,34 @@ pub(crate) struct EvalRuntime<'h> {
     pub(crate) time: EvalTime,
     pub(crate) hardware: Option<&'h mut dyn HardwareAdapter>,
     pub(crate) serial: SerialRuntime<'h>,
+    pub(crate) can: CanRuntime<'h>,
+}
+
+/// A direct evaluator call owns an empty CAN adapter, while a runner borrows
+/// the model-backed adapter shared across startup and every scheduled call.
+pub(crate) enum CanRuntime<'h> {
+    Fresh(Box<crate::virtual_can::VirtualCan>),
+    Shared(&'h mut crate::virtual_can::VirtualCan),
+}
+
+impl CanRuntime<'_> {
+    pub(crate) fn fresh() -> Self {
+        CanRuntime::Fresh(Box::new(crate::virtual_can::VirtualCan::empty()))
+    }
+
+    pub(crate) fn as_mut(&mut self) -> &mut crate::virtual_can::VirtualCan {
+        match self {
+            CanRuntime::Fresh(can) => can.as_mut(),
+            CanRuntime::Shared(can) => can,
+        }
+    }
+
+    pub(crate) fn as_ref(&self) -> &crate::virtual_can::VirtualCan {
+        match self {
+            CanRuntime::Fresh(can) => can.as_ref(),
+            CanRuntime::Shared(can) => can,
+        }
+    }
 }
 
 /// A public evaluator call owns a fresh adapter, while a runner borrows one
@@ -131,6 +159,7 @@ impl EvalRuntime<'static> {
             time,
             hardware: None,
             serial: SerialRuntime::fresh(),
+            can: CanRuntime::fresh(),
         }
     }
 }

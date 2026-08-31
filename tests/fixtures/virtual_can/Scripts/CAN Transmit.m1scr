@@ -1,0 +1,6 @@
+// Synthetic virtual-CAN fixture. No proprietary content.
+DBC.Vehicle Network.Init(0);
+local <Unsigned Integer> handle = DBC.Vehicle Network.Command Frame.TxOpen();
+DBC.Vehicle Network.Command Frame.TxInitialise(handle);
+DBC.Vehicle Network.Command Frame.Command.SetScaled(handle, Tx Value);
+DBC.Vehicle Network.Command Frame.Tx(handle);

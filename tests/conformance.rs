@@ -319,7 +319,7 @@ fn undeclared_io_stubs_cannot_supply_conformance_outputs() {
     let root = copy_mini_bundle(&temp);
     let script = std::fs::read_to_string(root.join("Scripts/Demo.Update.m1scr"))
         .expect("read script")
-        .replace("Output = scaled;", "Output = CanComms.GetFloat(1u, 2);");
+        .replace("Output = scaled;", "Output = Logging.Used(0);");
     std::fs::write(root.join("Scripts/Demo.Update.m1scr"), &script)
         .expect("write IO-backed script");
     let script_hash = format!("{:x}", Sha256::digest(script.as_bytes()));
@@ -342,7 +342,7 @@ fn undeclared_io_stubs_cannot_supply_conformance_outputs() {
     let ConformanceError::InvalidFixture { detail, .. } = error else {
         panic!("expected invalid fixture, got {error}");
     };
-    assert!(detail.contains("undeclared external source \"CanComms.GetFloat\""));
+    assert!(detail.contains("undeclared external source \"Logging.Used\""));
 }
 
 #[test]

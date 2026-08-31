@@ -1,16 +1,11 @@
 // SPDX-License-Identifier: GPL-3.0-or-later
-//! Synthetic CAN-stub regression test (the CI-safe guard for the gated EV-M1
+//! Synthetic virtual-CAN regression test (the CI-safe guard for the gated EV-M1
 //! whole-project test).
 //!
 //! Loads `tests/fixtures/can_stub` — a hand-authored synthetic project with NO
 //! proprietary content — whose single scheduled function reads from a CAN bus
-//! (`CanComms.RxOpenStandard` to open a handle, `CanComms.GetUnsignedInteger` /
-//! `CanComms.GetFloat` to read it). Offline there is no bus, so each Tier-3 IO
-//! call returns its documented, type-correct externally-driven default instead of
-//! failing loud. This proves the property the gated EV-M1 test depends on — a
-//! whole-project run whose scripts read CAN COMPLETES, returning externally-driven
-//! stub values — without touching any proprietary corpus, so it runs on plain
-//! `cargo test`.
+//! (`CanComms.RxOpenStandard` to open a handle, `CanComms.RxMessage` to consume
+//! a timed frame, and raw accessors to read it). It uses only hand-authored data.
 
 use std::path::Path;
 
@@ -24,7 +19,7 @@ fn can_stub_engine() -> Engine {
 }
 
 #[test]
-fn whole_project_run_with_can_reads_completes_with_external_stubs() {
+fn whole_project_run_consumes_a_virtual_can_frame() {
     let engine = can_stub_engine();
 
     // A short whole-project run. The one 100 Hz function reads CAN every tick.
@@ -34,6 +29,12 @@ fn whole_project_run_with_can_reads_completes_with_external_stubs() {
 mode = "whole-project"
 duration_s = 0.05
 base_rate_hz = 100.0
+
+[[can.rx]]
+time_s = 0.0
+bus = 0
+id = 0x123
+bytes = [63, 128, 0, 0]
 "#,
     )
     .expect("whole-project scenario parses");
@@ -45,29 +46,24 @@ base_rate_hz = 100.0
     // 0.05 s at 100 Hz = 5 ticks; the trace has a dense time axis.
     assert_eq!(trace.time.len(), 5, "expected 5 base ticks");
 
-    // The output channel was written from `CanComms.GetFloat`, which has no offline
-    // value — so it holds the documented FloatingPoint stub 0.0, dense over the
-    // whole grid (zero-order hold), on every tick.
+    // The frame contains the big-endian IEEE-754 representation of 1.0.
     let bus_value = trace
         .channels
         .get("Root.CanDemo.Bus Value")
         .expect("Bus Value channel present in the trace");
     assert_eq!(
         bus_value,
-        &vec![Value::m1_float(0.0); 5],
-        "Bus Value holds the CanComms.GetFloat external stub on every tick"
+        &vec![Value::m1_float(1.0); 5],
+        "the current RX frame remains readable between polls"
     );
 
-    // The CAN reads are flagged externally driven (simulated input, not evaluated
-    // output) so a consumer can distinguish them.
+    // Scenario-backed receive state is external. Handle setup is deterministic
+    // evaluator state and must not be mislabeled external.
     assert!(
         trace.is_external("CanComms.GetFloat"),
         "CanComms.GetFloat is flagged externally driven"
     );
-    assert!(
-        trace.is_external("CanComms.RxOpenStandard"),
-        "CanComms.RxOpenStandard is flagged externally driven"
-    );
+    assert!(!trace.is_external("CanComms.RxOpenStandard"));
     assert!(
         trace.is_external("CanComms.GetUnsignedInteger"),
         "CanComms.GetUnsignedInteger is flagged externally driven"
@@ -86,6 +82,12 @@ mode = "function"
 target = "Root.CanDemo.Read"
 duration_s = 0.03
 base_rate_hz = 100.0
+
+[[can.rx]]
+time_s = 0.0
+bus = 0
+id = 0x123
+bytes = [63, 128, 0, 0]
 "#,
     )
     .expect("function scenario parses");
@@ -102,7 +104,7 @@ base_rate_hz = 100.0
     // The CAN-read output is the externally-driven float stub on every tick.
     assert_eq!(
         first.channels.get("Root.CanDemo.Bus Value"),
-        Some(&vec![Value::m1_float(0.0); 3])
+        Some(&vec![Value::m1_float(1.0); 3])
     );
 }
 
@@ -123,6 +125,12 @@ base_rate_hz = 100.0
 [[io]]
 call = "CanComms.GetFloat"
 series = [[0.0, 12.5], [0.03, 99.0]]
+
+[[can.rx]]
+time_s = 0.0
+bus = 0
+id = 0x123
+bytes = [0, 0, 0, 0]
 "#,
     )
     .expect("io-override scenario parses");
@@ -169,6 +177,12 @@ base_rate_hz = 100.0
 [[io]]
 call = "CanComms.GetFloat"
 const = 7.25
+
+[[can.rx]]
+time_s = 0.0
+bus = 0
+id = 0x123
+bytes = [0, 0, 0, 0]
 "#,
     )
     .expect("io-override scenario parses");

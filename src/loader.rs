@@ -19,10 +19,11 @@ use crate::calib::Calibration;
 use crate::error::EvalError;
 use crate::triggers::{TriggerMap, TriggerStatus};
 use crate::value::M1ScalarKind;
+use m1_can::{CanDbcSource, CanRuntimeModel, runtime_model_loaded};
 use m1_typecheck::Project;
 use m1_typecheck::parsed::{ParsedScript, parse_all};
 use std::collections::HashMap;
-use std::path::Path;
+use std::path::{Path, PathBuf};
 
 /// Exact numeric storage families declared by project function signatures.
 ///
@@ -52,13 +53,24 @@ impl SignatureM1Types {
     }
 }
 
-/// The result of loading a project: the typed symbol model, the parsed scripts,
-/// and the numeric calibration read from the `.m1cfg` (empty when none given).
+/// The result of loading a project: the typed symbol model, parsed scripts,
+/// exact CAN model, and numeric calibration read from the `.m1cfg` (empty when
+/// none given).
+///
+/// Adding [`Loaded::can`] is a source migration for callers that construct this
+/// public struct directly. Prefer [`load`], which reads each `.m1dbc` once and
+/// builds the field from the same project and script snapshot. A manual loader
+/// can build the field with the re-exported
+/// [`crate::runtime_model_loaded`] and [`crate::CanDbcSource`] API before using
+/// its existing `Loaded` struct literal.
 pub struct Loaded {
     /// The `m1-typecheck` project (symbols + resolution model).
     pub project: Project,
     /// Every discovered `*.m1scr`, parsed once (name + owned CST).
     pub scripts: Vec<ParsedScript>,
+    /// Exact DBC layout and bus bindings built from the same project, parsed
+    /// scripts, and caller-owned `.m1dbc` byte snapshot as this load.
+    pub can: CanRuntimeModel,
     /// Numeric calibration values (parameters + table cells).
     pub calib: Calibration,
     /// Exact numeric families from raw function signatures. This complements
@@ -109,6 +121,24 @@ pub fn load(project_path: &Path, cfg_path: Option<&Path>) -> Result<Loaded, Eval
     // evaluator runs, so call sites and `Out =` reads see concrete types.
     project.infer_return_types(&scripts);
 
+    // Read every DBC source exactly once, retain its project-relative identity,
+    // and build the runtime model from this same Project + ParsedScript
+    // snapshot. m1-can performs no filesystem I/O on this path.
+    let can_source_bytes = collect_can_sources(project_dir)?;
+    let can_sources = can_source_bytes
+        .iter()
+        .map(|source| CanDbcSource {
+            path: &source.path,
+            bytes: &source.bytes,
+        })
+        .collect::<Vec<_>>();
+    let can = runtime_model_loaded(&project, &scripts, &can_sources).map_err(|error| {
+        EvalError::UnsupportedConstruct {
+            kind: format!("CAN runtime model load failed: {error}"),
+            at: 0,
+        }
+    })?;
+
     // Read the calibration *values*. We read the file ourselves (rather than
     // re-using `m1-typecheck`'s loader) because `with_config` keeps only the
     // shape; `Calibration::from_m1cfg_str` keeps the numbers.
@@ -135,12 +165,94 @@ pub fn load(project_path: &Path, cfg_path: Option<&Path>) -> Result<Loaded, Eval
     Ok(Loaded {
         project,
         scripts,
+        can,
         calib,
         signature_m1_types,
         object_rules,
         startup_fn_symbols,
         triggers,
     })
+}
+
+struct LoadedCanSource {
+    path: String,
+    bytes: Vec<u8>,
+}
+
+fn collect_can_sources(project_dir: &Path) -> Result<Vec<LoadedCanSource>, EvalError> {
+    let mut paths = Vec::new();
+    collect_extension_paths(project_dir, "m1dbc", &mut paths)?;
+    paths.sort();
+    paths
+        .into_iter()
+        .map(|path| {
+            let relative = path.strip_prefix(project_dir).map_err(|error| {
+                EvalError::UnsupportedConstruct {
+                    kind: format!(
+                        "CAN source {} is outside project directory {}: {error}",
+                        path.display(),
+                        project_dir.display()
+                    ),
+                    at: 0,
+                }
+            })?;
+            let source_path = relative
+                .to_str()
+                .ok_or_else(|| EvalError::UnsupportedConstruct {
+                    kind: format!(
+                        "CAN source path {} is not valid UTF-8 and cannot be preserved exactly",
+                        relative.display()
+                    ),
+                    at: 0,
+                })?;
+            let bytes = std::fs::read(&path).map_err(|error| EvalError::UnsupportedConstruct {
+                kind: format!("cannot read CAN source {}: {error}", path.display()),
+                at: 0,
+            })?;
+            Ok(LoadedCanSource {
+                path: source_path.to_string(),
+                bytes,
+            })
+        })
+        .collect()
+}
+
+fn collect_extension_paths(
+    dir: &Path,
+    extension: &str,
+    out: &mut Vec<PathBuf>,
+) -> Result<(), EvalError> {
+    let entries = std::fs::read_dir(dir).map_err(|error| EvalError::UnsupportedConstruct {
+        kind: format!("cannot read project directory {}: {error}", dir.display()),
+        at: 0,
+    })?;
+    for entry in entries {
+        let entry = entry.map_err(|error| EvalError::UnsupportedConstruct {
+            kind: format!(
+                "cannot enumerate project directory {}: {error}",
+                dir.display()
+            ),
+            at: 0,
+        })?;
+        let path = entry.path();
+        let file_type = entry
+            .file_type()
+            .map_err(|error| EvalError::UnsupportedConstruct {
+                kind: format!("cannot inspect project path {}: {error}", path.display()),
+                at: 0,
+            })?;
+        if file_type.is_dir() {
+            collect_extension_paths(&path, extension, out)?;
+        } else if file_type.is_file()
+            && path
+                .extension()
+                .and_then(|value| value.to_str())
+                .is_some_and(|value| value.eq_ignore_ascii_case(extension))
+        {
+            out.push(path);
+        }
+    }
+    Ok(())
 }
 
 fn signature_m1_types(xml: &str) -> Result<SignatureM1Types, EvalError> {
@@ -259,6 +371,10 @@ mod tests {
         std::path::Path::new(env!("CARGO_MANIFEST_DIR")).join("tests/fixtures/mini")
     }
 
+    fn virtual_can_dir() -> std::path::PathBuf {
+        std::path::Path::new(env!("CARGO_MANIFEST_DIR")).join("tests/fixtures/virtual_can")
+    }
+
     #[test]
     fn loads_project_scripts_and_calibration() {
         let dir = mini_dir();
@@ -312,6 +428,45 @@ mod tests {
         // No cfg means an empty calibration, not a guessed value.
         assert_eq!(loaded.calib.param("Demo.Gain"), None);
         assert!(loaded.calib.tables.is_empty());
+    }
+
+    #[test]
+    fn loads_nested_dbc_from_the_same_owned_source_and_script_snapshot() {
+        let source = virtual_can_dir();
+        let temp = tempfile::tempdir().expect("temporary virtual-CAN fixture");
+        let scripts = temp.path().join("Scripts");
+        let dbc_dir = temp.path().join("dbc/vendor files");
+        std::fs::create_dir_all(&scripts).unwrap();
+        std::fs::create_dir_all(&dbc_dir).unwrap();
+        std::fs::copy(
+            source.join("Project.m1prj"),
+            temp.path().join("Project.m1prj"),
+        )
+        .unwrap();
+        for script in ["CAN Receive.m1scr", "CAN Transmit.m1scr"] {
+            std::fs::copy(source.join("Scripts").join(script), scripts.join(script)).unwrap();
+        }
+        let dbc = dbc_dir.join("Vehicle Network.m1dbc");
+        std::fs::copy(source.join("dbc/vendor files/Vehicle Network.m1dbc"), &dbc).unwrap();
+
+        let loaded = load(&temp.path().join("Project.m1prj"), None)
+            .expect("copied virtual-CAN fixture loads");
+        let module = &loaded.can.modules[0];
+        assert_eq!(module.path, "Vehicle Network");
+        assert_eq!(module.source_path, "dbc/vendor files/Vehicle Network.m1dbc");
+        assert_eq!(module.bus_value, Some(0));
+        assert_eq!(module.messages[0].frame_id, 0x123);
+
+        // Changing both source files after load cannot alter the caller-owned
+        // bytes, parsed scripts, or runtime model retained by `Loaded`.
+        std::fs::write(&dbc, "<DBC><broken-after-load/></DBC>").unwrap();
+        std::fs::write(scripts.join("CAN Receive.m1scr"), "broken after load").unwrap();
+        assert_eq!(loaded.can.modules[0].bus_value, Some(0));
+        assert_eq!(loaded.can.modules[0].messages[0].frame_id, 0x123);
+        assert!(loaded.scripts.iter().any(|script| {
+            script.name == "CAN Receive.m1scr"
+                && script.cst.source().contains("Status Frame.Receive")
+        }));
     }
 
     #[test]

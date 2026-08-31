@@ -82,8 +82,8 @@ pub fn run(loaded: &Loaded, scenario: &Scenario) -> Result<Trace, EvalError> {
 /// Run a scenario with a typed external hardware adapter.
 ///
 /// Scenario call-site overrides still win. Calls not handled by `hardware`
-/// continue through deterministic `System` behavior, documented stubs, and the
-/// normal fail-loud boundary.
+/// continue through run-owned virtual CAN/serial, deterministic `System`
+/// behavior, documented stubs, and the normal fail-loud boundary.
 pub fn run_with_adapter(
     loaded: &Loaded,
     scenario: &Scenario,
@@ -483,6 +483,7 @@ fn tick_loop(
     // A virtual serial adapter is run-local state. Repeating the same scenario
     // starts with fresh ports, handles, cursors, and buffers.
     let mut serial = crate::virtual_serial::VirtualSerial::new(&scenario.serial)?;
+    let mut can = crate::virtual_can::VirtualCan::new(&loaded.can, &scenario.can)?;
 
     // Unseeded-channel defaulting is the scenario's EXPLICIT opt-in
     // (`allow_default_inputs = true`, whole-project mode only): an unseeded
@@ -574,6 +575,7 @@ fn tick_loop(
                     None => None,
                 },
                 serial: crate::expr::SerialRuntime::Shared(&mut serial),
+                can: crate::expr::CanRuntime::Shared(&mut can),
             };
             exec_script_with_runtime(&root, &mut ctx, &mut runtime)
                 .map_err(|e| e.in_script(&sched.script.name, None))?;
@@ -582,6 +584,7 @@ fn tick_loop(
         trace.external.extend(startup_trace.external);
         trace.hardware.extend(startup_trace.hardware);
         trace.serial.extend(startup_trace.serial);
+        trace.can.extend(startup_trace.can);
     }
 
     for i in 0..ticks {
@@ -669,6 +672,7 @@ fn tick_loop(
                     None => None,
                 },
                 serial: crate::expr::SerialRuntime::Shared(&mut serial),
+                can: crate::expr::CanRuntime::Shared(&mut can),
             };
             exec_script_with_runtime(&root, &mut ctx, &mut runtime)
                 .map_err(|e| e.in_script(&sched.script.name, Some(t)))?;
@@ -1351,6 +1355,8 @@ fn run_counterfactual_inner(
     let mut state = StateStore::new();
     let mut trace = Trace::new();
     let mut serial = crate::virtual_serial::VirtualSerial::empty();
+    let mut can =
+        crate::virtual_can::VirtualCan::new(&loaded.can, &crate::scenario::CanScenario::default())?;
     // A counterfactual seeds every logged channel as ground truth, so an unseeded
     // *channel* read still fails loud (like function/cone mode): a cone function
     // reading a channel the log does not carry is a genuine error, not a guess.
@@ -1427,6 +1433,7 @@ fn run_counterfactual_inner(
                             None => None,
                         },
                         serial: crate::expr::SerialRuntime::Shared(&mut serial),
+                        can: crate::expr::CanRuntime::Shared(&mut can),
                     };
                     crate::expr::eval_with_runtime(&value_node, &mut ctx, &mut runtime)?
                 }
@@ -1436,6 +1443,7 @@ fn run_counterfactual_inner(
         trace.external.extend(override_trace.external);
         trace.hardware.extend(override_trace.hardware);
         trace.serial.extend(override_trace.serial);
+        trace.can.extend(override_trace.can);
         for (path, value) in pending {
             let value = crate::expr::coerce_for_channel(&path, value, &loaded.project)?;
             env.set(path, value);
@@ -1476,6 +1484,7 @@ fn run_counterfactual_inner(
                     None => None,
                 },
                 serial: crate::expr::SerialRuntime::Shared(&mut serial),
+                can: crate::expr::CanRuntime::Shared(&mut can),
             };
             exec_script_with_runtime(&root, &mut ctx, &mut runtime)
                 .map_err(|e| e.in_script(&sched.script.name, Some(t)))?;
@@ -1688,6 +1697,7 @@ mod tests {
             overrides: vec![],
             io: vec![],
             serial: Default::default(),
+            can: Default::default(),
             allow_default_inputs: false,
         };
         let trace = run(&loaded, &scenario).expect("enum-seeded run evaluates");
@@ -1721,6 +1731,7 @@ mod tests {
             overrides: vec![],
             io: vec![],
             serial: Default::default(),
+            can: Default::default(),
             allow_default_inputs: false,
         };
         let err = run(&loaded, &scenario).expect_err("string input fails loud");
@@ -1746,6 +1757,7 @@ mod tests {
             overrides: vec![],
             io: vec![],
             serial: Default::default(),
+            can: Default::default(),
             allow_default_inputs: false,
         };
         let err = run(&loaded, &scenario).expect_err("unseeded input fails loud");
@@ -2000,6 +2012,10 @@ const = 3.0
 mode = "whole-project"
 duration_s = 0.01
 base_rate_hz = 100.0
+
+[[io]]
+call = "CanComms.GetFloat"
+const = 0.0
 "#,
         )
         .expect("scenario parses");
@@ -2008,7 +2024,7 @@ base_rate_hz = 100.0
         assert!(trace.external.contains("CanComms.GetFloat"));
         assert!(trace.hardware.iter().any(|item| {
             item.source_call == "CanComms.GetFloat"
-                && item.source == crate::hardware::HardwareValueSource::GenericStub
+                && item.source == crate::hardware::HardwareValueSource::ScenarioWildcard
         }));
         assert_eq!(
             trace.channel_value_at_tick("Root.T.Started", 0),
@@ -2989,6 +3005,35 @@ base_rate_hz = 100.0
             error.to_string(),
             "in Serial Test.Counterfactual Receive.m1scr at t = 0.000 s: bad call: Serial.Receive: invalid handle 77; handles are nonzero and owned by this run"
         );
+    }
+
+    #[test]
+    fn counterfactual_keeps_can_events_and_starts_each_run_with_fresh_can_state() {
+        let loaded = counterfactual();
+        let log = consistent_log();
+        let overrides = vec![
+            Override::parse("Root.CF.Sensor=Can Tx()")
+                .expect("CAN helper override expression parses"),
+        ];
+        let cfg = CounterfactualCfg {
+            base_rate_hz: 100.0,
+            duration_s: 0.01,
+        };
+
+        let first = run_counterfactual(&loaded, &log, &overrides, &cfg).expect("first CAN CF run");
+        let second =
+            run_counterfactual(&loaded, &log, &overrides, &cfg).expect("second CAN CF run");
+        for trace in [&first, &second] {
+            assert_eq!(trace.can.len(), 1, "override CAN event is retained");
+            let event = &trace.can[0];
+            assert_eq!(event.direction, crate::trace::CanTransferDirection::Tx);
+            assert_eq!(event.bus, 0);
+            assert_eq!(event.frame_id, 0x123);
+            assert_eq!(event.bytes, [42]);
+            assert_eq!(event.handle, Some(1), "fresh run allocates handle one");
+            assert_eq!(event.message, None);
+        }
+        assert_eq!(first.can, second.can, "separate runs are deterministic");
     }
 
     fn floats(trace: &Trace, channel: &str) -> Vec<f64> {
