@@ -28,7 +28,7 @@ sha2 = "0.10"
 toml = "1.1"
 roxmltree = "0.21"
 m1-core = { git = "https://github.com/C-Nucifora/m1-core.git", tag = "v0.15.0" }
-m1-typecheck = { git = "https://github.com/C-Nucifora/m1-typecheck.git", tag = "v0.50.0" }
+m1-typecheck = { git = "https://github.com/C-Nucifora/m1-typecheck.git", tag = "v0.51.0" }
 # MIT, GPL-3.0-compatible, pure-std clean-room `.ld`/`.ldx` file-format
 # reader+writer. Optional: only compiled in under the `ld` feature. We use its
 # reader to import `.ld` telemetry and its writer to generate the tiny synthetic
