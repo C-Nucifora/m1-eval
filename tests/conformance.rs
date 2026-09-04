@@ -7,7 +7,17 @@ use m1_eval::{
     run_conformance_suite,
 };
 use sha2::{Digest, Sha256};
+use std::fmt::Write as _;
 use std::path::{Path, PathBuf};
+
+fn sha256_hex(bytes: impl AsRef<[u8]>) -> String {
+    let digest = Sha256::digest(bytes);
+    let mut output = String::with_capacity(digest.len() * 2);
+    for byte in digest {
+        write!(&mut output, "{byte:02x}").expect("writing to a String cannot fail");
+    }
+    output
+}
 
 fn fixture(name: &str) -> PathBuf {
     Path::new(env!("CARGO_MANIFEST_DIR"))
@@ -281,7 +291,7 @@ fn conditional_static_write_does_not_hide_an_external_initial_seed() {
         .replace("Output = scaled;", "if (false)\n{\n\tOutput = scaled;\n}");
     std::fs::write(root.join("Scripts/Demo.Update.m1scr"), &script)
         .expect("write conditional script");
-    let script_hash = format!("{:x}", Sha256::digest(script.as_bytes()));
+    let script_hash = sha256_hex(script.as_bytes());
 
     let template =
         std::fs::read_to_string(fixture("synthetic-mini.toml")).expect("read template fixture");
@@ -322,7 +332,7 @@ fn undeclared_io_stubs_cannot_supply_conformance_outputs() {
         .replace("Output = scaled;", "Output = Logging.Used(0);");
     std::fs::write(root.join("Scripts/Demo.Update.m1scr"), &script)
         .expect("write IO-backed script");
-    let script_hash = format!("{:x}", Sha256::digest(script.as_bytes()));
+    let script_hash = sha256_hex(script.as_bytes());
 
     let template =
         std::fs::read_to_string(fixture("synthetic-mini.toml")).expect("read template fixture");

@@ -20,7 +20,7 @@ use m1_typecheck::types::ValueType;
 use serde::Deserialize;
 use sha2::{Digest, Sha256};
 use std::collections::{BTreeMap, BTreeSet};
-use std::fmt;
+use std::fmt::{self, Write as _};
 use std::fs;
 use std::path::{Component, Path, PathBuf};
 
@@ -1078,7 +1078,7 @@ fn resolve_and_verify_bundle(
             path: path.clone(),
             source,
         })?;
-        let actual = format!("{:x}", Sha256::digest(bytes));
+        let actual = sha256_hex(bytes);
         if !actual.eq_ignore_ascii_case(&declared_hash) {
             return Err(ConformanceError::HashMismatch {
                 path,
@@ -1089,6 +1089,15 @@ fn resolve_and_verify_bundle(
     }
 
     Ok(ResolvedBundle { project, config })
+}
+
+fn sha256_hex(bytes: impl AsRef<[u8]>) -> String {
+    let digest = Sha256::digest(bytes);
+    let mut output = String::with_capacity(digest.len() * 2);
+    for byte in digest {
+        write!(&mut output, "{byte:02x}").expect("writing to a String cannot fail");
+    }
+    output
 }
 
 fn validate_relative_path(
