@@ -24,7 +24,7 @@ ld = ["dep:motec-i2"]
 clap = { version = "4", features = ["derive"] }
 serde = { version = "1", features = ["derive"] }
 serde_json = "1"
-sha2 = "0.10"
+sha2 = "0.11"
 toml = "1.1"
 roxmltree = "0.21"
 m1-core = { git = "https://github.com/C-Nucifora/m1-core.git", tag = "v0.15.0" }
