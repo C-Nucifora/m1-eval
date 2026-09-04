@@ -1,5 +1,5 @@
 // SPDX-License-Identifier: GPL-3.0-or-later
-//! Deterministic classic-CAN model for `CanComms` and M1 DBC objects.
+//! Deterministic classic-CAN model for `CanComms`, `J1939`, and M1 DBC objects.
 //!
 //! The adapter is constructed from the loader's exact m1-can runtime model and
 //! one scenario. It owns all mutable state for one evaluation run: bus
@@ -48,6 +48,30 @@ pub(crate) const LIBRARY_METHODS: &[&str] = &[
     "XOR8",
 ];
 
+/// J1939 methods implemented on the shared deterministic CAN transport.
+pub(crate) const J1939_METHODS: &[&str] = &[
+    "Address",
+    "DTC",
+    "DTCActive",
+    "DTCCount",
+    "DTCRegister",
+    "DTCSetActive",
+    "DTCSetInactive",
+    "GetLength",
+    "GetUnsignedInteger",
+    "Open",
+    "Request",
+    "RxParameterGroup",
+    "RxRegister",
+    "RxTicks",
+    "State",
+    "TxClear",
+    "TxParameterGroup",
+    "TxRegister",
+    "TxSetUnsignedInteger",
+    "TxTransmit",
+];
+
 /// DBC module methods backed by the runtime layout model.
 pub(crate) const MODULE_METHODS: &[&str] = &["Init"];
 
@@ -73,6 +97,10 @@ pub(crate) const SIGNAL_SET_METHODS: &[&str] = &[
 
 pub(crate) fn is_library_method(method: &str) -> bool {
     LIBRARY_METHODS.contains(&method)
+}
+
+pub(crate) fn is_j1939_method(method: &str) -> bool {
+    J1939_METHODS.contains(&method)
 }
 
 pub(crate) fn model_handles_project_call(
@@ -269,6 +297,42 @@ struct SignalDef {
     offset: f64,
 }
 
+#[derive(Debug, Clone, PartialEq, Eq)]
+struct J1939Node {
+    bus: i32,
+    address: u8,
+    name_fields: [u32; 8],
+    arbitrary_address: bool,
+}
+
+#[derive(Debug, Clone)]
+struct J1939RxGroup {
+    pgn: u32,
+    source_address: Option<u8>,
+    max_length: usize,
+    node: Option<u32>,
+    cursor: usize,
+    current: Option<ReceivedFrame>,
+}
+
+#[derive(Debug, Clone)]
+struct J1939TxGroup {
+    pgn: u32,
+    priority: u8,
+    max_length: usize,
+    node: Option<u32>,
+    bytes: Vec<u8>,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+struct J1939Dtc {
+    spn: u32,
+    fmi: u8,
+    node: Option<u32>,
+    active: bool,
+    count: u8,
+}
+
 #[derive(Clone, Copy)]
 enum ProjectArgKind {
     Handle,
@@ -292,6 +356,10 @@ pub(crate) struct VirtualCan {
     handles: BTreeMap<u32, HandleState>,
     site_handles: BTreeMap<(CallSite, String), u32>,
     dbc_rx: BTreeMap<String, ReceiverState>,
+    j1939_nodes: BTreeMap<u32, J1939Node>,
+    j1939_rx: BTreeMap<u32, J1939RxGroup>,
+    j1939_tx: BTreeMap<u32, J1939TxGroup>,
+    j1939_dtcs: BTreeMap<u32, J1939Dtc>,
     next_handle: u32,
 }
 
@@ -377,6 +445,10 @@ impl VirtualCan {
             handles: BTreeMap::new(),
             site_handles: BTreeMap::new(),
             dbc_rx: BTreeMap::new(),
+            j1939_nodes: BTreeMap::new(),
+            j1939_rx: BTreeMap::new(),
+            j1939_tx: BTreeMap::new(),
+            j1939_dtcs: BTreeMap::new(),
             next_handle: 1,
         })
     }
@@ -401,19 +473,33 @@ impl VirtualCan {
         &mut self,
         call: &HardwareCall,
     ) -> Result<Option<CanReply>, EvalError> {
-        if call.receiver.name() == "CanComms" {
-            if !is_library_method(&call.method) {
-                return self.call_library(call);
+        match call.receiver.name() {
+            "CanComms" => {
+                if !is_library_method(&call.method) {
+                    return self.call_library(call);
+                }
+                let normalized = self.normalize_library_call("CanComms", call)?;
+                return self.call_library(&normalized);
             }
-            let normalized = self.normalize_library_call(call)?;
-            return self.call_library(&normalized);
+            "J1939" => {
+                if !is_j1939_method(&call.method) {
+                    return Ok(None);
+                }
+                let normalized = self.normalize_library_call("J1939", call)?;
+                return self.call_j1939(&normalized);
+            }
+            _ => {}
         }
         let normalized = self.normalize_project_call(call)?;
         self.call_project(&normalized)
     }
 
-    fn normalize_library_call(&self, call: &HardwareCall) -> Result<HardwareCall, EvalError> {
-        let overloads = intrinsics::get().library_overloads("CanComms", &call.method);
+    fn normalize_library_call(
+        &self,
+        object: &str,
+        call: &HardwareCall,
+    ) -> Result<HardwareCall, EvalError> {
+        let overloads = intrinsics::get().library_overloads(object, &call.method);
         let Some(overload) = overloads
             .iter()
             .find(|overload| overload.params.len() == call.arguments.len())
@@ -723,6 +809,436 @@ impl VirtualCan {
             _ => return Ok(None),
         };
         Ok(Some(reply))
+    }
+
+    fn call_j1939(&mut self, call: &HardwareCall) -> Result<Option<CanReply>, EvalError> {
+        let reply = match call.method.as_str() {
+            "Open" => {
+                let bus = bus_arg(call, 0)?;
+                let address = bounded_integer_arg(call, 1, "address", 0, 253)? as u8;
+                let limits = [
+                    ("identity", 0x1F_FFFF),
+                    ("manufacturer", 0x7FF),
+                    ("ecu_instance", 0x7),
+                    ("function_instance", 0x1F),
+                    ("function", 0xFF),
+                    ("vehicle_system", 0x7F),
+                    ("vehicle_instance", 0xF),
+                    ("industry_group", 0x7),
+                ];
+                let mut name_fields = [0_u32; 8];
+                for (offset, (name, maximum)) in limits.into_iter().enumerate() {
+                    name_fields[offset] =
+                        bounded_integer_arg(call, offset + 2, name, 0, maximum)? as u32;
+                }
+                let config = J1939Node {
+                    bus,
+                    address,
+                    name_fields,
+                    arbitrary_address: bool_arg(call, 10)?,
+                };
+                let key = (call.site.clone(), call.canonical_name());
+                let handle = if let Some(handle) = self.site_handles.get(&key).copied() {
+                    if self.j1939_nodes.get(&handle) != Some(&config) {
+                        return Err(can_call_error(
+                            call,
+                            format!(
+                                "call site already opened J1939 handle {handle} with different configuration"
+                            ),
+                        ));
+                    }
+                    handle
+                } else {
+                    let handle = self.allocate_handle(call)?;
+                    self.site_handles.insert(key, handle);
+                    self.j1939_nodes.insert(handle, config);
+                    handle
+                };
+                self.initialize_bus(&call.method, bus, None)?;
+                CanReply::value(Value::m1_unsigned(handle))
+            }
+            "Address" => {
+                let node = self.j1939_node(call, handle_arg(call, 0)?)?;
+                CanReply::value(Value::m1_integer(i32::from(node.address)))
+            }
+            "State" => {
+                self.j1939_node(call, handle_arg(call, 0)?)?;
+                CanReply::value(Value::m1_integer(1))
+            }
+            "RxParameterGroup" => {
+                let pgn = j1939_pgn_arg(call, 0)?;
+                let source = bounded_integer_arg(call, 1, "source address", -1, 255)?;
+                let max_length = j1939_length_arg(call, 2)?;
+                let config = J1939RxGroup {
+                    pgn,
+                    source_address: (source >= 0).then_some(source as u8),
+                    max_length,
+                    node: None,
+                    cursor: 0,
+                    current: None,
+                };
+                let handle = self.open_j1939_rx(call, config)?;
+                CanReply::value(Value::m1_unsigned(handle))
+            }
+            "RxRegister" => {
+                let rx_handle = handle_arg(call, 0)?;
+                let node_handle = handle_arg(call, 1)?;
+                self.j1939_node(call, node_handle)?;
+                let group = self.j1939_rx.get_mut(&rx_handle).ok_or_else(|| {
+                    can_call_error(call, format!("invalid J1939 receive handle {rx_handle}"))
+                })?;
+                register_j1939_handle(call, "receive", rx_handle, &mut group.node, node_handle)?;
+                CanReply::value(Value::Bool(true))
+            }
+            "RxTicks" | "GetLength" | "GetUnsignedInteger" => {
+                let rx_handle = handle_arg(call, 0)?;
+                let event = self.poll_j1939_rx(call, rx_handle)?;
+                let group = self.j1939_rx.get(&rx_handle).ok_or_else(|| {
+                    can_call_error(call, format!("invalid J1939 receive handle {rx_handle}"))
+                })?;
+                let value = match call.method.as_str() {
+                    "RxTicks" => Value::m1_unsigned(match group.current.as_ref() {
+                        Some(frame) => u32::try_from(frame.base_tick).map_err(|_| {
+                            can_call_error(
+                                call,
+                                format!(
+                                    "receive tick {} exceeds the M1 UnsignedInteger range",
+                                    frame.base_tick
+                                ),
+                            )
+                        })?,
+                        None => 0,
+                    }),
+                    "GetLength" => Value::m1_integer(
+                        group.current.as_ref().map_or(0, |frame| frame.bytes.len()) as i32,
+                    ),
+                    "GetUnsignedInteger" => {
+                        let frame = group.current.as_ref().ok_or_else(|| {
+                            can_call_error(
+                                call,
+                                format!("J1939 receive handle {rx_handle} has no current parameter group"),
+                            )
+                        })?;
+                        let bit_offset = j1939_bit_offset(call, 1, 2)?;
+                        let width = integer_bit_width(call, 3)?;
+                        let raw = read_j1939_field(&frame.bytes, bit_offset, width, call)?;
+                        Value::m1_unsigned(u32::try_from(raw).map_err(|_| {
+                            can_call_error(call, "J1939 unsigned field exceeds 32 bits")
+                        })?)
+                    }
+                    _ => unreachable!(),
+                };
+                CanReply {
+                    value,
+                    event,
+                    external: true,
+                }
+            }
+            "TxParameterGroup" => {
+                let pgn = j1939_pgn_arg(call, 0)?;
+                let priority = bounded_integer_arg(call, 1, "priority", 0, 7)? as u8;
+                let max_length = j1939_length_arg(call, 2)?;
+                let config = J1939TxGroup {
+                    pgn,
+                    priority,
+                    max_length,
+                    node: None,
+                    bytes: vec![0; max_length],
+                };
+                let handle = self.open_j1939_tx(call, config)?;
+                CanReply::value(Value::m1_unsigned(handle))
+            }
+            "TxRegister" => {
+                let tx_handle = handle_arg(call, 0)?;
+                let node_handle = handle_arg(call, 1)?;
+                self.j1939_node(call, node_handle)?;
+                let group = self.j1939_tx.get_mut(&tx_handle).ok_or_else(|| {
+                    can_call_error(call, format!("invalid J1939 transmit handle {tx_handle}"))
+                })?;
+                register_j1939_handle(call, "transmit", tx_handle, &mut group.node, node_handle)?;
+                CanReply::value(Value::Bool(true))
+            }
+            "TxClear" => {
+                let tx_handle = handle_arg(call, 0)?;
+                let group = self.j1939_tx.get_mut(&tx_handle).ok_or_else(|| {
+                    can_call_error(call, format!("invalid J1939 transmit handle {tx_handle}"))
+                })?;
+                group.bytes.fill(0);
+                CanReply::value(Value::Bool(true))
+            }
+            "TxSetUnsignedInteger" => {
+                let tx_handle = handle_arg(call, 0)?;
+                let bit_offset = j1939_bit_offset(call, 1, 2)?;
+                let width = integer_bit_width(call, 3)?;
+                let value = numeric_u32_arg(call, 4)?;
+                let raw = encode_unsigned(value, width, call)?;
+                let group = self.j1939_tx.get_mut(&tx_handle).ok_or_else(|| {
+                    can_call_error(call, format!("invalid J1939 transmit handle {tx_handle}"))
+                })?;
+                write_j1939_field(&mut group.bytes, bit_offset, width, raw, call)?;
+                CanReply::value(Value::Bool(true))
+            }
+            "TxTransmit" => {
+                let tx_handle = handle_arg(call, 0)?;
+                let node_handle = handle_arg(call, 1)?;
+                let destination =
+                    bounded_integer_arg(call, 2, "destination address", 0, 255)? as u8;
+                let group = self.j1939_tx.get(&tx_handle).ok_or_else(|| {
+                    can_call_error(call, format!("invalid J1939 transmit handle {tx_handle}"))
+                })?;
+                require_j1939_registration(call, "transmit", tx_handle, group.node, node_handle)?;
+                let node = self.j1939_node(call, node_handle)?;
+                self.require_bus(call, node.bus)?;
+                let frame_id =
+                    encode_j1939_identifier(group.priority, group.pgn, destination, node.address);
+                CanReply::event(
+                    Value::Bool(true),
+                    CanEvent {
+                        direction: CanTransferDirection::Tx,
+                        time: call.time,
+                        bus: node.bus,
+                        frame_id,
+                        format: CanFrameFormat::Extended,
+                        bytes: group.bytes.clone(),
+                        handle: Some(tx_handle),
+                        message: Some(format!("J1939 PGN 0x{:05X}", group.pgn)),
+                        site: call.site.clone(),
+                    },
+                    false,
+                )
+            }
+            "Request" => {
+                let node_handle = handle_arg(call, 0)?;
+                let pgn = j1939_pgn_arg(call, 1)?;
+                let destination =
+                    bounded_integer_arg(call, 2, "destination address", 0, 255)? as u8;
+                let node = self.j1939_node(call, node_handle)?;
+                self.require_bus(call, node.bus)?;
+                CanReply::event(
+                    Value::Bool(true),
+                    CanEvent {
+                        direction: CanTransferDirection::Tx,
+                        time: call.time,
+                        bus: node.bus,
+                        frame_id: encode_j1939_identifier(6, 0xEA00, destination, node.address),
+                        format: CanFrameFormat::Extended,
+                        bytes: vec![pgn as u8, (pgn >> 8) as u8, (pgn >> 16) as u8],
+                        handle: Some(node_handle),
+                        message: Some("J1939 Request PGN 0x0EA00".to_string()),
+                        site: call.site.clone(),
+                    },
+                    false,
+                )
+            }
+            "DTC" => {
+                let spn = bounded_integer_arg(call, 0, "SPN", 0, 0x7_FFFF)? as u32;
+                let fmi = bounded_integer_arg(call, 1, "FMI", 0, 31)? as u8;
+                let handle = self.open_j1939_dtc(call, spn, fmi)?;
+                CanReply::value(Value::m1_unsigned(handle))
+            }
+            "DTCRegister" => {
+                let dtc_handle = handle_arg(call, 0)?;
+                let node_handle = handle_arg(call, 1)?;
+                self.j1939_node(call, node_handle)?;
+                let dtc = self.j1939_dtcs.get_mut(&dtc_handle).ok_or_else(|| {
+                    can_call_error(call, format!("invalid J1939 DTC handle {dtc_handle}"))
+                })?;
+                register_j1939_handle(call, "DTC", dtc_handle, &mut dtc.node, node_handle)?;
+                CanReply::value(Value::Bool(true))
+            }
+            "DTCActive" | "DTCCount" => {
+                let handle = handle_arg(call, 0)?;
+                let dtc = self.j1939_dtcs.get(&handle).ok_or_else(|| {
+                    can_call_error(call, format!("invalid J1939 DTC handle {handle}"))
+                })?;
+                let value = if call.method == "DTCActive" {
+                    Value::Bool(dtc.active)
+                } else {
+                    Value::m1_integer(i32::from(dtc.count))
+                };
+                CanReply::value(value)
+            }
+            "DTCSetActive" => {
+                let dtc_handle = handle_arg(call, 0)?;
+                let node_handle = handle_arg(call, 1)?;
+                for index in 2..6 {
+                    bounded_integer_arg(call, index, "lamp state", 0, 3)?;
+                }
+                let dtc = self.j1939_dtcs.get_mut(&dtc_handle).ok_or_else(|| {
+                    can_call_error(call, format!("invalid J1939 DTC handle {dtc_handle}"))
+                })?;
+                require_j1939_registration(call, "DTC", dtc_handle, dtc.node, node_handle)?;
+                if !dtc.active {
+                    dtc.count = dtc.count.saturating_add(1);
+                }
+                dtc.active = true;
+                CanReply::value(Value::Bool(true))
+            }
+            "DTCSetInactive" => {
+                let dtc_handle = handle_arg(call, 0)?;
+                let node_handle = handle_arg(call, 1)?;
+                let dtc = self.j1939_dtcs.get_mut(&dtc_handle).ok_or_else(|| {
+                    can_call_error(call, format!("invalid J1939 DTC handle {dtc_handle}"))
+                })?;
+                require_j1939_registration(call, "DTC", dtc_handle, dtc.node, node_handle)?;
+                dtc.active = false;
+                CanReply::value(Value::Bool(true))
+            }
+            _ => return Ok(None),
+        };
+        Ok(Some(reply))
+    }
+
+    fn j1939_node(&self, call: &HardwareCall, handle: u32) -> Result<&J1939Node, EvalError> {
+        self.j1939_nodes
+            .get(&handle)
+            .ok_or_else(|| can_call_error(call, format!("invalid J1939 node handle {handle}")))
+    }
+
+    fn open_j1939_rx(
+        &mut self,
+        call: &HardwareCall,
+        config: J1939RxGroup,
+    ) -> Result<u32, EvalError> {
+        let key = (call.site.clone(), call.canonical_name());
+        if let Some(handle) = self.site_handles.get(&key).copied() {
+            let existing = &self.j1939_rx[&handle];
+            if (existing.pgn, existing.source_address, existing.max_length)
+                != (config.pgn, config.source_address, config.max_length)
+            {
+                return Err(can_call_error(
+                    call,
+                    format!(
+                        "call site already opened J1939 receive handle {handle} with different configuration"
+                    ),
+                ));
+            }
+            return Ok(handle);
+        }
+        let handle = self.allocate_handle(call)?;
+        self.site_handles.insert(key, handle);
+        self.j1939_rx.insert(handle, config);
+        Ok(handle)
+    }
+
+    fn open_j1939_tx(
+        &mut self,
+        call: &HardwareCall,
+        config: J1939TxGroup,
+    ) -> Result<u32, EvalError> {
+        let key = (call.site.clone(), call.canonical_name());
+        if let Some(handle) = self.site_handles.get(&key).copied() {
+            let existing = &self.j1939_tx[&handle];
+            if (existing.pgn, existing.priority, existing.max_length)
+                != (config.pgn, config.priority, config.max_length)
+            {
+                return Err(can_call_error(
+                    call,
+                    format!(
+                        "call site already opened J1939 transmit handle {handle} with different configuration"
+                    ),
+                ));
+            }
+            return Ok(handle);
+        }
+        let handle = self.allocate_handle(call)?;
+        self.site_handles.insert(key, handle);
+        self.j1939_tx.insert(handle, config);
+        Ok(handle)
+    }
+
+    fn open_j1939_dtc(&mut self, call: &HardwareCall, spn: u32, fmi: u8) -> Result<u32, EvalError> {
+        let key = (call.site.clone(), call.canonical_name());
+        if let Some(handle) = self.site_handles.get(&key).copied() {
+            let existing = &self.j1939_dtcs[&handle];
+            if (existing.spn, existing.fmi) != (spn, fmi) {
+                return Err(can_call_error(
+                    call,
+                    format!(
+                        "call site already created J1939 DTC handle {handle} for a different SPN/FMI"
+                    ),
+                ));
+            }
+            return Ok(handle);
+        }
+        let handle = self.allocate_handle(call)?;
+        self.site_handles.insert(key, handle);
+        self.j1939_dtcs.insert(
+            handle,
+            J1939Dtc {
+                spn,
+                fmi,
+                node: None,
+                active: false,
+                count: 0,
+            },
+        );
+        Ok(handle)
+    }
+
+    fn poll_j1939_rx(
+        &mut self,
+        call: &HardwareCall,
+        handle: u32,
+    ) -> Result<Option<CanEvent>, EvalError> {
+        let group = self.j1939_rx.get(&handle).ok_or_else(|| {
+            can_call_error(call, format!("invalid J1939 receive handle {handle}"))
+        })?;
+        let node_handle = group.node.ok_or_else(|| {
+            can_call_error(
+                call,
+                format!("J1939 receive handle {handle} is not registered"),
+            )
+        })?;
+        let node = self.j1939_node(call, node_handle)?.clone();
+        self.require_bus(call, node.bus)?;
+        let match_config = (
+            group.cursor,
+            group.pgn,
+            group.source_address,
+            group.max_length,
+        );
+        let Some((cursor, injection)) = next_j1939_injection(
+            &self.injections,
+            match_config.0,
+            call.time.elapsed_s,
+            node.bus,
+            node.address,
+            match_config.1,
+            match_config.2,
+        )
+        .map(|(cursor, injection)| (cursor, injection.clone())) else {
+            return Ok(None);
+        };
+        if injection.bytes.len() > match_config.3 {
+            return Err(can_call_error(
+                call,
+                format!(
+                    "J1939 PGN 0x{:05X} payload has {} bytes, exceeding receive limit {}",
+                    match_config.1,
+                    injection.bytes.len(),
+                    match_config.3
+                ),
+            ));
+        }
+        let state = self.j1939_rx.get_mut(&handle).expect("validated above");
+        state.cursor = cursor;
+        state.current = Some(ReceivedFrame {
+            frame_id: injection.frame_id,
+            bytes: injection.bytes.clone(),
+            base_tick: arrival_base_tick(injection.time_s, call.time.base_period_s, call)?,
+        });
+        Ok(Some(CanEvent {
+            direction: CanTransferDirection::Rx,
+            time: call.time,
+            bus: injection.bus,
+            frame_id: injection.frame_id,
+            format: CanFrameFormat::Extended,
+            bytes: injection.bytes,
+            handle: Some(handle),
+            message: Some(format!("J1939 PGN 0x{:05X}", match_config.1)),
+            site: call.site.clone(),
+        }))
     }
 
     fn call_project(&mut self, call: &HardwareCall) -> Result<Option<CanReply>, EvalError> {
@@ -1613,6 +2129,101 @@ fn next_injection<'a>(
     None
 }
 
+fn next_j1939_injection(
+    injections: &[Injection],
+    cursor: usize,
+    now: f64,
+    bus: i32,
+    node_address: u8,
+    pgn: u32,
+    source_address: Option<u8>,
+) -> Option<(usize, &Injection)> {
+    let mut next_cursor = cursor;
+    while let Some(frame) = injections.get(next_cursor) {
+        if frame.time_s > now {
+            break;
+        }
+        next_cursor += 1;
+        if frame.bus != bus || frame.format != CanFrameFormat::Extended {
+            continue;
+        }
+        let (frame_pgn, frame_source, destination) = decode_j1939_identifier(frame.frame_id);
+        let addressed_to_node =
+            destination.is_none_or(|address| address == node_address || address == u8::MAX);
+        if frame_pgn == pgn
+            && addressed_to_node
+            && source_address.is_none_or(|source| source == frame_source)
+        {
+            return Some((next_cursor, frame));
+        }
+    }
+    None
+}
+
+fn decode_j1939_identifier(identifier: u32) -> (u32, u8, Option<u8>) {
+    let raw_pgn = (identifier >> 8) & 0x3_FFFF;
+    let pdu_format = (raw_pgn >> 8) & 0xFF;
+    let (pgn, destination) = if pdu_format < 240 {
+        (raw_pgn & !0xFF, Some((identifier >> 8) as u8))
+    } else {
+        (raw_pgn, None)
+    };
+    (pgn, identifier as u8, destination)
+}
+
+fn encode_j1939_identifier(priority: u8, pgn: u32, destination: u8, source: u8) -> u32 {
+    let pdu_format = (pgn >> 8) & 0xFF;
+    let pgn_and_destination = if pdu_format < 240 {
+        ((pgn & !0xFF) | u32::from(destination)) << 8
+    } else {
+        pgn << 8
+    };
+    (u32::from(priority) << 26) | pgn_and_destination | u32::from(source)
+}
+
+fn register_j1939_handle(
+    call: &HardwareCall,
+    kind: &str,
+    handle: u32,
+    registered: &mut Option<u32>,
+    node: u32,
+) -> Result<(), EvalError> {
+    if let Some(existing) = *registered
+        && existing != node
+    {
+        return Err(can_call_error(
+            call,
+            format!(
+                "J1939 {kind} handle {handle} is already registered to node {existing}, then requested node {node}"
+            ),
+        ));
+    }
+    *registered = Some(node);
+    Ok(())
+}
+
+fn require_j1939_registration(
+    call: &HardwareCall,
+    kind: &str,
+    handle: u32,
+    registered: Option<u32>,
+    node: u32,
+) -> Result<(), EvalError> {
+    match registered {
+        Some(existing) if existing == node => Ok(()),
+        Some(existing) => Err(can_call_error(
+            call,
+            format!(
+                "J1939 {kind} handle {handle} is registered to node {existing}, not node {node}"
+            ),
+        )),
+        None => Err(can_call_error(
+            call,
+            format!("J1939 {kind} handle {handle} is not registered"),
+        )),
+    }
+}
+
 /// Base-grid tick on which a timed scenario frame first exists.
 ///
 /// Exact grid points retain their integer tick. Off-grid arrivals round up to
@@ -1984,6 +2595,59 @@ fn bit_mask(width: u16) -> u64 {
     }
 }
 
+fn read_j1939_field(
+    bytes: &[u8],
+    start_bit: u16,
+    width: u16,
+    call: &HardwareCall,
+) -> Result<u64, EvalError> {
+    let end = usize::from(start_bit) + usize::from(width);
+    if end > bytes.len() * 8 {
+        return Err(can_call_error(
+            call,
+            format!(
+                "J1939 bit range {start_bit}..{end} exceeds the {}-byte parameter group",
+                bytes.len()
+            ),
+        ));
+    }
+    let mut value = 0_u64;
+    for offset in 0..width {
+        let bit = usize::from(start_bit + offset);
+        value |= u64::from((bytes[bit / 8] >> (bit % 8)) & 1) << offset;
+    }
+    Ok(value)
+}
+
+fn write_j1939_field(
+    bytes: &mut [u8],
+    start_bit: u16,
+    width: u16,
+    value: u64,
+    call: &HardwareCall,
+) -> Result<(), EvalError> {
+    let end = usize::from(start_bit) + usize::from(width);
+    if end > bytes.len() * 8 {
+        return Err(can_call_error(
+            call,
+            format!(
+                "J1939 bit range {start_bit}..{end} exceeds the {}-byte parameter group",
+                bytes.len()
+            ),
+        ));
+    }
+    for offset in 0..width {
+        let bit = usize::from(start_bit + offset);
+        let mask = 1_u8 << (bit % 8);
+        if ((value >> offset) & 1) != 0 {
+            bytes[bit / 8] |= mask;
+        } else {
+            bytes[bit / 8] &= !mask;
+        }
+    }
+    Ok(())
+}
+
 /// Accept only values on an integer raw grid, allowing at most a few host-f64
 /// ULPs of arithmetic noise and never more than one millionth of a raw count.
 /// This is intentionally fail-loud and does not claim M1 rounding parity.
@@ -2043,6 +2707,56 @@ fn bus_arg(call: &HardwareCall, index: usize) -> Result<i32, EvalError> {
             format!("bus must be in the catalogue range 0..=2, got {bus}"),
         ))
     }
+}
+
+fn bounded_integer_arg(
+    call: &HardwareCall,
+    index: usize,
+    name: &str,
+    minimum: i32,
+    maximum: i32,
+) -> Result<i32, EvalError> {
+    let value = integer_arg(call, index)?;
+    if (minimum..=maximum).contains(&value) {
+        Ok(value)
+    } else {
+        Err(can_call_error(
+            call,
+            format!("{name} must be in {minimum}..={maximum}, got {value}"),
+        ))
+    }
+}
+
+fn j1939_pgn_arg(call: &HardwareCall, index: usize) -> Result<u32, EvalError> {
+    let pgn = numeric_u32_arg(call, index)?;
+    if pgn > 0x3_FFFF {
+        Err(can_call_error(
+            call,
+            format!("PGN 0x{pgn:X} exceeds the 18-bit J1939 range"),
+        ))
+    } else if ((pgn >> 8) & 0xFF) < 240 && pgn & 0xFF != 0 {
+        Err(can_call_error(
+            call,
+            format!("PDU1 PGN 0x{pgn:05X} must leave its destination byte zero"),
+        ))
+    } else {
+        Ok(pgn)
+    }
+}
+
+fn j1939_length_arg(call: &HardwareCall, index: usize) -> Result<usize, EvalError> {
+    let length = bounded_integer_arg(call, index, "parameter-group length", 1, 8)?;
+    Ok(length as usize)
+}
+
+fn j1939_bit_offset(
+    call: &HardwareCall,
+    byte_index: usize,
+    bit_index: usize,
+) -> Result<u16, EvalError> {
+    let byte = bounded_integer_arg(call, byte_index, "byte offset", 0, 7)? as u16;
+    let bit = bounded_integer_arg(call, bit_index, "bit offset", 0, 7)? as u16;
+    Ok(byte * 8 + bit)
 }
 
 /// Apply the captured CAN call-boundary widening for floating-point
@@ -2312,6 +3026,38 @@ mod tests {
         }
     }
 
+    fn j1939_call(method: &str, site: usize, arguments: Vec<Value>, time: f64) -> HardwareCall {
+        HardwareCall {
+            receiver: ResolvedReceiver::Library {
+                object: "J1939".to_string(),
+            },
+            source_receiver: "J1939".to_string(),
+            method: method.to_string(),
+            site: CallSite::new("J1939.Test.m1scr", site),
+            arguments,
+            time: EvalTime::periodic((time * 100.0) as u64, time, 0.01, 0.01),
+        }
+    }
+
+    fn j1939_invoke(
+        can: &mut VirtualCan,
+        method: &str,
+        site: usize,
+        arguments: Vec<Value>,
+        time: f64,
+    ) -> CanReply {
+        can.call_routed(&j1939_call(method, site, arguments, time))
+            .expect("J1939 call succeeds")
+            .expect("J1939 method is handled")
+    }
+
+    fn unsigned_handle(reply: CanReply) -> u32 {
+        match reply.value {
+            Value::M1(M1Scalar::UnsignedInteger(handle)) => handle,
+            other => panic!("unexpected handle {other:?}"),
+        }
+    }
+
     fn project_call(
         receiver: &str,
         method: &str,
@@ -2576,6 +3322,292 @@ mod tests {
             assert_eq!(received.value, Value::Bool(true));
             assert_eq!(received.event.unwrap().bytes, vec![0x34, 0x12]);
         }
+    }
+
+    #[test]
+    fn j1939_protocol_vectors_share_virtual_bus_receive_and_transmit_state() {
+        let scenario = CanScenario {
+            rx: vec![
+                CanRx {
+                    time_s: 0.05,
+                    bus: 1,
+                    id: 0x18_EF_77_22,
+                    extended: true,
+                    bytes: vec![0xEE],
+                },
+                CanRx {
+                    time_s: 0.1,
+                    bus: 1,
+                    id: 0x0C_F0_04_22,
+                    extended: true,
+                    bytes: vec![0xAA, 0x34, 0x12, 0x55],
+                },
+                CanRx {
+                    time_s: 0.1,
+                    bus: 1,
+                    id: 0x18_EF_80_22,
+                    extended: true,
+                    bytes: vec![0xCC],
+                },
+            ],
+        };
+        let mut can = VirtualCan::new(
+            &CanRuntimeModel {
+                modules: Vec::new(),
+                skipped_scripts: Vec::new(),
+            },
+            &scenario,
+        )
+        .unwrap();
+
+        let node = unsigned_handle(j1939_invoke(
+            &mut can,
+            "Open",
+            1,
+            vec![
+                Value::m1_integer(1),
+                Value::m1_integer(0x80),
+                Value::m1_integer(1),
+                Value::m1_integer(2),
+                Value::m1_integer(0),
+                Value::m1_integer(0),
+                Value::m1_integer(3),
+                Value::m1_integer(4),
+                Value::m1_integer(0),
+                Value::m1_integer(0),
+                Value::Bool(false),
+            ],
+            0.0,
+        ));
+        assert_ne!(node, 0);
+        assert_eq!(
+            j1939_invoke(&mut can, "Address", 2, vec![Value::m1_unsigned(node)], 0.0,).value,
+            Value::m1_integer(0x80)
+        );
+        assert_eq!(
+            j1939_invoke(&mut can, "State", 2, vec![Value::m1_unsigned(node)], 0.0).value,
+            Value::m1_integer(1)
+        );
+
+        let rx = unsigned_handle(j1939_invoke(
+            &mut can,
+            "RxParameterGroup",
+            3,
+            vec![
+                Value::m1_unsigned(0xF004),
+                Value::m1_integer(0x22),
+                Value::m1_integer(8),
+            ],
+            0.0,
+        ));
+        j1939_invoke(
+            &mut can,
+            "RxRegister",
+            4,
+            vec![Value::m1_unsigned(rx), Value::m1_unsigned(node)],
+            0.0,
+        );
+        let ticks = j1939_invoke(&mut can, "RxTicks", 5, vec![Value::m1_unsigned(rx)], 0.1);
+        assert_eq!(ticks.value, Value::m1_unsigned(10));
+        assert_eq!(ticks.event.as_ref().unwrap().frame_id, 0x0C_F0_04_22);
+        assert_eq!(
+            j1939_invoke(&mut can, "GetLength", 5, vec![Value::m1_unsigned(rx)], 0.1).value,
+            Value::m1_integer(4)
+        );
+        assert_eq!(
+            j1939_invoke(
+                &mut can,
+                "GetUnsignedInteger",
+                6,
+                vec![
+                    Value::m1_unsigned(rx),
+                    Value::m1_integer(1),
+                    Value::m1_integer(0),
+                    Value::m1_integer(16),
+                ],
+                0.1,
+            )
+            .value,
+            Value::m1_unsigned(0x1234)
+        );
+
+        let addressed_rx = unsigned_handle(j1939_invoke(
+            &mut can,
+            "RxParameterGroup",
+            6,
+            vec![
+                Value::m1_unsigned(0xEF00),
+                Value::m1_integer(0x22),
+                Value::m1_integer(8),
+            ],
+            0.0,
+        ));
+        j1939_invoke(
+            &mut can,
+            "RxRegister",
+            6,
+            vec![Value::m1_unsigned(addressed_rx), Value::m1_unsigned(node)],
+            0.0,
+        );
+        let addressed = j1939_invoke(
+            &mut can,
+            "RxTicks",
+            6,
+            vec![Value::m1_unsigned(addressed_rx)],
+            0.1,
+        );
+        assert_eq!(addressed.event.unwrap().frame_id, 0x18_EF_80_22);
+
+        let tx = unsigned_handle(j1939_invoke(
+            &mut can,
+            "TxParameterGroup",
+            7,
+            vec![
+                Value::m1_unsigned(0xEF00),
+                Value::m1_integer(6),
+                Value::m1_integer(8),
+            ],
+            0.1,
+        ));
+        j1939_invoke(
+            &mut can,
+            "TxRegister",
+            8,
+            vec![Value::m1_unsigned(tx), Value::m1_unsigned(node)],
+            0.1,
+        );
+        j1939_invoke(&mut can, "TxClear", 8, vec![Value::m1_unsigned(tx)], 0.1);
+        j1939_invoke(
+            &mut can,
+            "TxSetUnsignedInteger",
+            9,
+            vec![
+                Value::m1_unsigned(tx),
+                Value::m1_integer(0),
+                Value::m1_integer(0),
+                Value::m1_integer(16),
+                Value::m1_unsigned(0x1234),
+            ],
+            0.1,
+        );
+        let sent = j1939_invoke(
+            &mut can,
+            "TxTransmit",
+            10,
+            vec![
+                Value::m1_unsigned(tx),
+                Value::m1_unsigned(node),
+                Value::m1_integer(0x55),
+            ],
+            0.1,
+        );
+        let event = sent.event.unwrap();
+        assert_eq!(event.frame_id, 0x18_EF_55_80);
+        assert_eq!(event.bytes, [0x34, 0x12, 0, 0, 0, 0, 0, 0]);
+
+        let request = j1939_invoke(
+            &mut can,
+            "Request",
+            11,
+            vec![
+                Value::m1_unsigned(node),
+                Value::m1_unsigned(0xF004),
+                Value::m1_integer(0x55),
+            ],
+            0.1,
+        )
+        .event
+        .unwrap();
+        assert_eq!(request.frame_id, 0x18_EA_55_80);
+        assert_eq!(request.bytes, [0x04, 0xF0, 0x00]);
+    }
+
+    #[test]
+    fn j1939_dtc_state_and_invalid_protocol_inputs_are_precise() {
+        let mut can = VirtualCan::empty();
+        let node = unsigned_handle(j1939_invoke(
+            &mut can,
+            "Open",
+            1,
+            vec![
+                Value::m1_integer(0),
+                Value::m1_integer(0x90),
+                Value::m1_integer(1),
+                Value::m1_integer(2),
+                Value::m1_integer(0),
+                Value::m1_integer(0),
+                Value::m1_integer(3),
+                Value::m1_integer(4),
+                Value::m1_integer(0),
+                Value::m1_integer(0),
+                Value::Bool(false),
+            ],
+            0.0,
+        ));
+        let dtc = unsigned_handle(j1939_invoke(
+            &mut can,
+            "DTC",
+            2,
+            vec![Value::m1_integer(1234), Value::m1_integer(5)],
+            0.0,
+        ));
+        j1939_invoke(
+            &mut can,
+            "DTCRegister",
+            3,
+            vec![Value::m1_unsigned(dtc), Value::m1_unsigned(node)],
+            0.0,
+        );
+        assert_eq!(
+            j1939_invoke(&mut can, "DTCActive", 4, vec![Value::m1_unsigned(dtc)], 0.0).value,
+            Value::Bool(false)
+        );
+        j1939_invoke(
+            &mut can,
+            "DTCSetActive",
+            5,
+            vec![
+                Value::m1_unsigned(dtc),
+                Value::m1_unsigned(node),
+                Value::m1_integer(1),
+                Value::m1_integer(0),
+                Value::m1_integer(2),
+                Value::m1_integer(3),
+            ],
+            0.0,
+        );
+        assert_eq!(
+            j1939_invoke(&mut can, "DTCCount", 6, vec![Value::m1_unsigned(dtc)], 0.0).value,
+            Value::m1_integer(1)
+        );
+        j1939_invoke(
+            &mut can,
+            "DTCSetInactive",
+            7,
+            vec![Value::m1_unsigned(dtc), Value::m1_unsigned(node)],
+            0.0,
+        );
+        assert_eq!(
+            j1939_invoke(&mut can, "DTCActive", 8, vec![Value::m1_unsigned(dtc)], 0.0).value,
+            Value::Bool(false)
+        );
+
+        let error = can
+            .call_routed(&j1939_call(
+                "RxParameterGroup",
+                9,
+                vec![
+                    Value::m1_unsigned(0xEF55),
+                    Value::m1_integer(-1),
+                    Value::m1_integer(8),
+                ],
+                0.0,
+            ))
+            .unwrap_err();
+        assert_eq!(
+            error.to_string(),
+            "bad call: J1939.RxParameterGroup: PDU1 PGN 0x0EF55 must leave its destination byte zero"
+        );
     }
 
     #[test]

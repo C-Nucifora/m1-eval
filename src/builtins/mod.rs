@@ -1036,7 +1036,7 @@ const MODELED_STATEFUL_METHODS: &[(&str, &str)] = &[
 
 /// Hardware library objects routed through scenario values, an optional adapter,
 /// deterministic `System` behavior, and documented typed fallbacks.
-const STUB_OBJECTS: &[&str] = &["CanComms", "Serial", "System", "Logging"];
+const STUB_OBJECTS: &[&str] = &["CanComms", "J1939", "Serial", "System", "Logging"];
 
 /// `System` calls computed from the evaluator's deterministic base timeline.
 const MODELED_SYSTEM_METHODS: &[&str] = &[
@@ -1193,6 +1193,12 @@ fn classify_library(object: &str, method: &str) -> CallCapability {
         if object == "CanComms" && known {
             return capability(
                 BuiltinSupport::Unsupported,
+                CallRoute::IoLibrary(object.to_string()),
+            );
+        }
+        if object == "J1939" && known && crate::virtual_can::is_j1939_method(method) {
+            return capability(
+                BuiltinSupport::AdapterBacked,
                 CallRoute::IoLibrary(object.to_string()),
             );
         }
@@ -3609,7 +3615,9 @@ mod tests {
                     BuiltinSupport::AdapterBacked
                 } else if object == "CanComms" {
                     BuiltinSupport::Unsupported
-                } else if object == "Serial" && crate::virtual_serial::is_adapter_backed(method) {
+                } else if (object == "J1939" && crate::virtual_can::is_j1939_method(method))
+                    || (object == "Serial" && crate::virtual_serial::is_adapter_backed(method))
+                {
                     BuiltinSupport::AdapterBacked
                 } else if object == "Serial"
                     && crate::virtual_serial::is_explicitly_unsupported(method)

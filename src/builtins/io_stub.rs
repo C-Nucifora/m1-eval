@@ -7,7 +7,7 @@
 //! 1. An exact-call-site scenario override.
 //! 2. A wildcard scenario override for the call name.
 //! 3. An external [`HardwareAdapter`](crate::hardware::HardwareAdapter).
-//! 4. The deterministic virtual CAN adapter.
+//! 4. The deterministic virtual CAN adapter, including J1939.
 //! 5. The deterministic virtual RS232 adapter.
 //! 6. The deterministic `System` clock/tick model.
 //! 7. A generic typed stub for explicitly retained non-CAN hardware methods.
@@ -90,7 +90,7 @@ pub(crate) fn call_with_runtime(
         return complete(ctx, &call, value, HardwareValueSource::Adapter);
     }
 
-    if library_object == "CanComms"
+    if matches!(library_object, "CanComms" | "J1939")
         && let Some(reply) = runtime.can.as_mut().call_routed(&call)?
     {
         let value = coerce_hardware_value(reply.value, returns, &call, ctx)?;
@@ -107,7 +107,7 @@ pub(crate) fn call_with_runtime(
         return complete(ctx, &call, value, source);
     }
 
-    if library_object == "CanComms"
+    if matches!(library_object, "CanComms" | "J1939")
         && !intrinsics::get()
             .library_overloads(library_object, method)
             .is_empty()
