@@ -38,7 +38,8 @@ use crate::{CallSite, EvalError, Value};
 pub enum ResolvedReceiver {
     /// A firmware library object, such as `System` or `CanComms`.
     Library { object: String },
-    /// A project-owned object at its canonical `Root.*` path.
+    /// A project-owned object at its canonical loaded-project path, such as
+    /// `Root.*` for ordinary symbols or `DBC.*` for an augmented DBC identity.
     Project { path: String },
     /// A project-style receiver that the loaded symbol model could not resolve.
     ///
@@ -192,6 +193,10 @@ pub enum HardwareValueSource {
     VirtualSerial,
     /// A virtual serial result depended on scenario-controlled receive data.
     VirtualSerialRx,
+    /// The evaluator's deterministic virtual CAN adapter handled the call.
+    VirtualCan,
+    /// A virtual CAN result depended on a scenario-controlled receive frame.
+    VirtualCanRx,
     /// The evaluator's deterministic `System` model supplied the value.
     SystemModel,
     /// A documented type-correct offline stub supplied the value.
@@ -207,6 +212,8 @@ impl HardwareValueSource {
             HardwareValueSource::Adapter => "adapter",
             HardwareValueSource::VirtualSerial => "virtual-serial",
             HardwareValueSource::VirtualSerialRx => "virtual-serial-rx",
+            HardwareValueSource::VirtualCan => "virtual-can",
+            HardwareValueSource::VirtualCanRx => "virtual-can-rx",
             HardwareValueSource::SystemModel => "system-model",
             HardwareValueSource::GenericStub => "generic-stub",
         }
@@ -216,7 +223,9 @@ impl HardwareValueSource {
     pub fn is_external(self) -> bool {
         !matches!(
             self,
-            HardwareValueSource::SystemModel | HardwareValueSource::VirtualSerial
+            HardwareValueSource::SystemModel
+                | HardwareValueSource::VirtualSerial
+                | HardwareValueSource::VirtualCan
         )
     }
 }

@@ -26,11 +26,11 @@
 use std::collections::BTreeMap;
 use std::path::{Path, PathBuf};
 
+use m1_can::{CanDirection, CanFrameFormat};
 use m1_core::{Field, Kind, Node};
 use m1_eval::{
-    AdapterReply, Engine, Env, EvalCtx, EvalError, FixedPoint7dps, HardwareAdapter, HardwareCall,
-    HardwareValueSource, InputKind, InputSeries, Loaded, M1Scalar, Scenario, StateStore, Trace,
-    Value, eval, io_sets, load,
+    CanRx, Engine, Env, EvalCtx, FixedPoint7dps, HardwareValueSource, InputKind, InputSeries,
+    Loaded, M1Scalar, Scenario, StateStore, Trace, Value, eval, io_sets, load,
 };
 use m1_typecheck::parsed::ParsedScript;
 use m1_typecheck::symbols::{Symbol, SymbolKind};
@@ -43,23 +43,6 @@ const AV_ENV: &str = "M1_EVAL_AVM1_DIR";
 struct CorpusLayout {
     project: PathBuf,
     config: PathBuf,
-}
-
-/// A corpus-independent offline bus source. A successful receive lets the real
-/// receive scripts consume the evaluator's typed zero-valued signal stubs;
-/// returning `false` would deliberately send those scripts down their
-/// communication-timeout paths, where the projects write NaN sentinels that
-/// later transmit functions correctly refuse to narrow to integers.
-struct SmokeBus;
-
-impl HardwareAdapter for SmokeBus {
-    fn call(&mut self, call: &HardwareCall) -> Result<AdapterReply, EvalError> {
-        Ok(if call.method == "Receive" {
-            Value::Bool(true).into()
-        } else {
-            AdapterReply::Unhandled
-        })
-    }
 }
 
 /// Resolve the EV-M1 corpus hint. `None` makes the test print its explicit
@@ -286,11 +269,11 @@ fn evm1_parameterized_suspension_triggers_resolve_to_200_hz() {
 /// the externally-driven CAN/sensor IO falls back to its documented stubs — all
 /// without a single fail-loud `EvalError`.
 ///
-/// External values use typed IO defaults plus a receive-only adapter that
-/// presents an offline bus frame; otherwise the real timeout branches
-/// deliberately write NaN sentinels which later fail-loud integer conversions
-/// correctly reject. We assert the trace is non-empty and disclose every
-/// ordinary, calibration, and receive substitution.
+/// External values use typed IO defaults plus zero-filled scenario frames
+/// derived from the loaded DBC snapshot. This exercises the real virtual-CAN
+/// lifecycle instead of intercepting `.Receive()` before the model can update
+/// its current message buffers. We assert the trace is non-empty and disclose
+/// every ordinary, calibration, and receive substitution.
 #[test]
 fn evm1_whole_project_runs_end_to_end() {
     let Some(dir) = evm1_dir() else {
@@ -307,6 +290,61 @@ fn avm1_whole_project_runs_end_to_end() {
         return;
     };
     run_whole_project_smoke(&dir, "AV", 0.02);
+}
+
+/// Focused real-corpus CAN gate. This proves only that one real project
+/// function routes its twelve DBC module initializers through VirtualCan. It is
+/// not an RX/TX codec or whole-project conformance claim.
+#[test]
+fn avm1_can_init_function_routes_every_dbc_module_through_virtual_can() {
+    let Some(dir) = corpus_dir(AV_ENV) else {
+        eprintln!("M1_EVAL_AVM1_DIR unset; skipping AV-M1 focused CAN init smoke");
+        return;
+    };
+    let layout = discover_corpus(&dir).expect("discover AV corpus for focused CAN smoke");
+    let engine = Engine::load(&layout.project, Some(&layout.config))
+        .expect("load AV corpus for focused CAN smoke");
+    let scenario = Scenario::from_toml_str(
+        r#"
+mode = "function"
+target = "Root.CAN.CAN Init"
+duration_s = 0.001
+base_rate_hz = 1000.0
+
+[[inputs]]
+channel = "Root.CAN.Active Bus"
+const = { integer = 0 }
+
+[[inputs]]
+channel = "Root.CAN.Datalogger Bus"
+const = { integer = 2 }
+"#,
+    )
+    .expect("focused CAN init scenario parses");
+    let trace = engine
+        .run(&scenario)
+        .expect("real CAN init function runs through VirtualCan");
+    let initializers = trace
+        .hardware
+        .iter()
+        .filter(|item| item.method == "Init" && item.source_call.starts_with("DBC."))
+        .collect::<Vec<_>>();
+    assert_eq!(
+        initializers.len(),
+        12,
+        "the real CAN init function contains twelve DBC module calls"
+    );
+    assert!(
+        initializers
+            .iter()
+            .all(|item| item.source == HardwareValueSource::VirtualCan),
+        "every DBC module Init must use the run-owned CAN model: {initializers:#?}"
+    );
+    assert!(trace.hardware.iter().all(|item| {
+        !(item.method == "Init"
+            && item.source_call.starts_with("DBC.")
+            && item.source == HardwareValueSource::GenericStub)
+    }));
 }
 
 fn run_whole_project_smoke(dir: &Path, label: &str, duration_s: f64) -> Trace {
@@ -343,6 +381,7 @@ const = {{ unsigned = 2097152 }}
     ))
     .expect("whole-project smoke scenario parses");
     scenario.inputs.extend(calibration_inputs);
+    scenario.can.rx.extend(zero_can_frames(&loaded));
     eprintln!(
         "{label}: {} neutralized zero-denominator calibration input(s)",
         scenario.inputs.len()
@@ -356,7 +395,7 @@ const = {{ unsigned = 2097152 }}
     );
 
     let trace = engine
-        .run_with_adapter(&scenario, &mut SmokeBus)
+        .run(&scenario)
         .unwrap_or_else(|error| panic!("{label} whole-project run failed: {error}"));
     assert!(
         trace.time.len() >= 2,
@@ -393,20 +432,20 @@ const = {{ unsigned = 2097152 }}
         );
     }
 
-    let bus_substitutions = trace
+    let bus_receives = trace
         .hardware
         .iter()
-        .filter(|item| item.source == HardwareValueSource::Adapter)
+        .filter(|item| item.source == HardwareValueSource::VirtualCanRx)
         .collect::<Vec<_>>();
     assert!(
-        !bus_substitutions.is_empty(),
-        "{label}: the offline bus supplied no receive calls"
+        !bus_receives.is_empty(),
+        "{label}: the virtual bus supplied no receive calls"
     );
     eprintln!(
-        "{label}: {} external-adapter receive substitution(s)",
-        bus_substitutions.len()
+        "{label}: {} virtual-CAN receive operation(s)",
+        bus_receives.len()
     );
-    for item in bus_substitutions {
+    for item in bus_receives {
         eprintln!(
             "  {} at {}:{}",
             item.canonical_call(),
@@ -414,6 +453,20 @@ const = {{ unsigned = 2097152 }}
             item.site.offset()
         );
     }
+    assert!(
+        trace
+            .hardware
+            .iter()
+            .any(|item| item.source == HardwareValueSource::VirtualCan),
+        "{label}: the run exercised no deterministic virtual-CAN setup or transmit call"
+    );
+    assert!(
+        trace.can.iter().any(|event| {
+            event.direction == m1_eval::CanTransferDirection::Rx
+                && event.bytes.iter().all(|byte| *byte == 0)
+        }),
+        "{label}: no zero-filled scenario CAN frame was consumed"
+    );
 
     assert!(
         !trace.defaulted.is_empty(),
@@ -439,6 +492,33 @@ const = {{ unsigned = 2097152 }}
     }
 
     trace
+}
+
+/// One zero-filled, time-zero frame for every receive-capable message whose bus
+/// binding is concrete in the same loaded DBC snapshot. This remains entirely
+/// read-only with respect to the proprietary corpus and commits no corpus data.
+fn zero_can_frames(loaded: &Loaded) -> Vec<CanRx> {
+    loaded
+        .can
+        .modules
+        .iter()
+        .flat_map(|module| {
+            let bus = module.bus_value.and_then(|value| i32::try_from(value).ok());
+            module.messages.iter().filter_map(move |message| {
+                let bus = bus?;
+                if message.direction == Some(CanDirection::Tx) {
+                    return None;
+                }
+                Some(CanRx {
+                    time_s: 0.0,
+                    bus,
+                    id: message.frame_id,
+                    extended: message.format == CanFrameFormat::Extended,
+                    bytes: vec![0; usize::from(message.dlc)],
+                })
+            })
+        })
+        .collect()
 }
 
 /// Supply a neutral, type-correct one for a configured zero parameter only

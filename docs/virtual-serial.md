@@ -161,9 +161,11 @@ serial event records.
 ## Library API
 
 `Scenario::serial` contains the exported `SerialScenario` and `SerialRx` types.
+The same public struct now also has `can: CanScenario` for virtual CAN frames.
 `Trace::serial` contains ordered exported `SerialEvent` records with a
-`SerialDirection`. `HardwareValueSource` adds `VirtualSerial` for deterministic
-adapter results and `VirtualSerialRx` for scenario-derived results.
+`SerialDirection`; `Trace::can` contains ordered `CanEvent` records.
+`HardwareValueSource` adds `VirtualSerial`/`VirtualSerialRx` and
+`VirtualCan`/`VirtualCanRx`.
 
 Rust callers that construct these public structs or match the provenance enum
 must update their source:
@@ -172,17 +174,19 @@ must update their source:
 let scenario = Scenario {
     // existing fields
     serial: Default::default(),
+    can: Default::default(),
     // existing fields
 };
 
 let trace = Trace::new(); // `Trace::default()` is equivalent
 ```
 
-Code that still builds a `Trace` literal must add `serial: Vec::new()`. Prefer
+Code that still builds a `Trace` literal must add `serial: Vec::new()` and
+`can: Vec::new()`. Prefer
 `Trace::new()` or `Trace::default()` so metadata fields start empty. Exhaustive
 matches on `HardwareValueSource` need arms for `VirtualSerial` and
-`VirtualSerialRx`. JSON readers must also accept the new top-level `serial`
-array.
+`VirtualSerialRx`, `VirtualCan`, and `VirtualCanRx`. JSON readers must also
+accept the top-level `serial` and `can` arrays.
 
 These additions leave the public `EvalCtx` shape unchanged. Each direct `eval`
 or `exec` call gets a fresh adapter. `exec_script` keeps one fresh adapter for
@@ -192,6 +196,6 @@ fresh per-call serial state, so handles do not persist across separate helper
 calls.
 
 The sibling `m1-lsp` crate's `src/eval/engine.rs::offline_scenario` literal needs
-`serial: Default::default()` when its m1-eval dependency advances. That is a
-release-coordination follow-up; this m1-eval change does not modify the sibling
-repository.
+both `serial: Default::default()` and `can: Default::default()` when its m1-eval
+dependency advances. That is a release-coordination follow-up; this m1-eval
+change does not modify the sibling repository.

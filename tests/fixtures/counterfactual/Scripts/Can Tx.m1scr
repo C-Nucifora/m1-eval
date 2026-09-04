@@ -1,0 +1,9 @@
+// Synthetic m1-eval counterfactual fixture. No proprietary content.
+// An override expression calls this helper to prove that temporary CAN trace
+// events survive and that every counterfactual run starts with fresh handles.
+CanComms.Init(0, 500);
+local <Unsigned Integer> handle = CanComms.TxOpen(true);
+CanComms.TxInitialise(handle, 1);
+CanComms.SetUnsignedInteger(handle, 0, 8, 42);
+CanComms.TxStandard(handle, 0, 0x123);
+Out = 1.0;

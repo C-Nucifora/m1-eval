@@ -1,14 +1,9 @@
 <?xml version="1.0"?>
 <!-- Synthetic m1-eval CAN-stub fixture. No proprietary MoTeC content. -->
 <!--                                                                    -->
-<!-- A single 100 Hz function exercises the Tier-3 IO library stubs: it -->
-<!-- opens a CAN receive handle and reads a float and an unsigned from  -->
-<!-- the bus, then writes the float to an output channel. Offline there -->
-<!-- is no CAN bus, so each `CanComms.*` call returns its documented,    -->
-<!-- type-correct externally-driven default (a Handle -> unsigned zero,  -->
-<!-- a FloatingPoint read -> 0.0, an Integer read -> 0) instead of       -->
-<!-- failing loud. This is the CI-safe guard for the gated EV-M1 whole-  -->
-<!-- project test: it proves a run whose script reads CAN completes.     -->
+<!-- A single 100 Hz function exercises deterministic virtual CanComms: -->
+<!-- it initializes a bus, opens a receive handle, consumes a scenario   -->
+<!-- frame, and reads a float and unsigned integer from the same buffer. -->
 <MoTeCM1BuildSession>
  <Project Name="CanStub" TargetHardware="ecu120">
   <ComponentStream><List>

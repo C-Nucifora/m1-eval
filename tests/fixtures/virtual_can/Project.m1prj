@@ -1,0 +1,21 @@
+<?xml version="1.0"?>
+<!-- Synthetic virtual-CAN fixture. No proprietary content. -->
+<MoTeCM1BuildSession>
+ <Project Name="VirtualCan" TargetHardware="ecu120">
+  <ComponentStream><List>
+   <Component Classname="BuiltIn.GroupCompound" Name="Root.CAN Demo"/>
+   <Component Classname="BuiltIn.GroupCompound" Name="Root.Events"/>
+   <Component Classname="BuiltIn.EventKernel" Name="Root.Events.On 100Hz"/>
+   <Component Classname="BuiltIn.Channel" Name="Root.CAN Demo.Rx Value"><Props Type="f32"/></Component>
+   <Component Classname="BuiltIn.Channel" Name="Root.CAN Demo.Tx Value"><Props Type="f32"/></Component>
+   <Component Classname="BuiltIn.CAN.DBCRoot" Name="DBC"/>
+   <Component Classname="BuiltIn.CAN.DBC" Name="DBC.Vehicle Network"/>
+   <Component Classname="BuiltIn.FuncUser" Filename="CAN Receive.m1scr" Name="Root.CAN Demo.Receive">
+    <Props SelectedTrigger="Root.Events.On 100Hz"/>
+   </Component>
+   <Component Classname="BuiltIn.FuncUser" Filename="CAN Transmit.m1scr" Name="Root.CAN Demo.Transmit">
+    <Props SelectedTrigger="Root.Events.On 100Hz"/>
+   </Component>
+  </List></ComponentStream>
+ </Project>
+</MoTeCM1BuildSession>

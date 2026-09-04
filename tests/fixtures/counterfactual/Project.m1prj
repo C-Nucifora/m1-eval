@@ -10,6 +10,9 @@
    <Component Classname="BuiltIn.FuncUser" Filename="Z.A.m1scr" Name="Root.CF.A"/>
    <Component Classname="BuiltIn.FuncUser" Filename="B.B.m1scr" Name="Root.CF.B"/>
    <Component Classname="BuiltIn.FuncUser" Filename="C.C.m1scr" Name="Root.CF.C"/>
+   <Component Classname="BuiltIn.FuncUser" Filename="Can Tx.m1scr" Name="Root.CF.Can Tx">
+    <Props ReturnType="f32"/>
+   </Component>
   </List></ComponentStream>
  </Project>
 </MoTeCM1BuildSession>
