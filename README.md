@@ -36,7 +36,7 @@ do not compare computed channel values with captured M1 results.
 | `MPSE.*`, `TC.*`, and `Switch.*` | **Unsupported internally / Adapter-backed** | The pinned help captures define seven signatures but omit the formulas and Switch-bank state contract. Calls validate their captured M1 families and ranges, then require a handling `HardwareAdapter`. There is no scenario or generic-zero fallback. See [the method-by-method contract](docs/mpse-tc-switch.md). |
 | Filters, integrals, derivatives, implemented debounce and delay methods, change detection, timers, and `static local` state | **Assumed / Unsupported** | Implemented update laws and startup behavior are explicit assumptions with hand-derived tests, not M1 value comparisons. `Debounce.Fast`, `Debounce.Verify`, and `Delay.Signal15` through `Delay.Signal1023` stay unsupported because the pinned catalogue does not define their distinct transition and buffer behavior. Calls to those methods validate the captured signature, then fail with the missing evidence named. See [the discrete stateful evidence boundary](docs/discrete-stateful.md). Timer countdowns use absolute evaluator time: `Remaining` is a read-only observation, while `Start`, `Stop`, and `Reset` are the only state transitions. |
 | Virtual `Serial.*` RS232 byte buffers | **Assumed** | A fresh adapter per run provides stable nonzero handles, timed scenario RX, independent handle cursors, endian-aware numeric access, TX capture, and real port status. LIN stays unsupported. The exact evaluator contracts and evidence boundaries are in [`docs/virtual-serial.md`](docs/virtual-serial.md). |
-| Virtual `CanComms.*` and `.m1dbc` objects | **Assumed** | A fresh classic-CAN adapter per run provides stable nonzero handles, timed scenario frames, independent raw receive cursors, strict M1 raw bit addressing, DBC signal decoding, and TX capture. The loader preserves exact DBC source identity and builds layout and bus bindings from one owned source/script/project snapshot. See [`docs/virtual-can.md`](docs/virtual-can.md). |
+| Virtual `CanComms.*`, `J1939.*`, and `.m1dbc` objects | **Assumed** | A fresh classic-CAN adapter per run provides stable nonzero handles, timed scenario frames, independent receive cursors, strict M1 raw bit addressing, J1939 PGN/address handling, DBC signal decoding, and TX capture. The loader preserves exact DBC source identity and builds layout and bus bindings from one owned source/script/project snapshot. See [`docs/virtual-can.md`](docs/virtual-can.md). |
 | `System.*`, `Logging.*`, and other hardware-backed calls | **Assumed / Stubbed** | Each call crosses a typed adapter boundary with its resolved receiver, source call site, arguments, and evaluator time. Exact-site scenario values take precedence over wildcard values and an attached adapter. `System.ElapsedTime` reports the interval since that call site last ran. Its first tick-zero call returns zero, while a site first reached later uses its function step. Tick calls use the deterministic base timeline. `System.FlashSize` and `System.FlashFree` require scenario or adapter data; they never become a dangerous zero. Remaining unhandled calls use documented typed stubs or fail loud. |
 | Scenario parsing, tick grids, trace output, and `--coverage` | **Assumed** | These are deterministic m1-eval contracts tested with synthetic data. A `Supported` coverage entry means implemented, not M1-verified. |
 | Typed conformance fixture parser and runner | **Assumed** | Synthetic fixtures cover typed values, project hashes, initial-state reset, tolerances, and mismatch reporting. No genuine M1 Sim capture is committed yet, so this runner does not make another area Verified by itself. |
@@ -256,12 +256,13 @@ function and cone selections must initialize serial in their own call chain.
 Counterfactual replay has no serial scenario or startup pass.
 
 Inject classic-CAN frames with `[[can.rx]]`. Each entry carries evaluator time,
-bus, standard or extended ID, and zero to eight wire bytes. DBC message receivers
-and raw `CanComms` handles consume those frames; JSON traces retain ordered RX/TX
-frame events. See [`docs/virtual-can.md`](docs/virtual-can.md) for the supported
-methods, raw and DBC bit conventions, lifecycle, route ownership, and release
-dependency. Counterfactual replay starts with empty CAN scenario input and fresh
-CAN state.
+bus, standard or extended ID, and zero to eight wire bytes. DBC message
+receivers, raw `CanComms` handles, and registered `J1939` parameter groups
+consume those frames; JSON traces retain ordered RX/TX frame events. See
+[`docs/virtual-can.md`](docs/virtual-can.md) for the supported methods, raw,
+J1939, and DBC bit conventions, lifecycle, route ownership, and release
+dependency. Counterfactual replay starts with empty CAN scenario input and
+fresh CAN state.
 
 Whole-project mode is strict about ordinary missing channels unless
 `allow_default_inputs = true` or `--allow-default-inputs` is set. The CLI then

@@ -1,8 +1,9 @@
 # Virtual CAN adapter
 
 Virtual CAN is a deterministic, run-owned classic-CAN model for supported
-`CanComms.*` calls and loaded M1 DBC objects. It does not open a host CAN device,
-model arbitration, reproduce ECU electrical timing, or send live traffic.
+`CanComms.*`, `J1939.*`, and loaded M1 DBC objects. It does not open a host CAN
+device, model arbitration, reproduce ECU electrical timing, or send live
+traffic.
 
 ## Scenario input
 
@@ -79,6 +80,33 @@ Known CanComms methods outside this list remain available to a scenario value or
 external adapter first. If neither owns the call, they fail loud rather than
 using the old generic zero stub.
 
+## J1939 over virtual CAN
+
+The `J1939` library uses the same buses, timed scenario frames, handle allocator,
+and ordered CAN trace as `CanComms` and DBC objects. `Open` validates the SAE
+J1939 NAME field widths, establishes the node address, and initializes its bus.
+`Address` and `State` then report the run-owned node state.
+
+Receive parameter groups match an 18-bit PGN and either one source address or
+the `-1` wildcard. `RxRegister` binds the group to a node. `RxTicks`,
+`GetLength`, and `GetUnsignedInteger` consume due extended frames on that node's
+bus and expose their arrival tick, payload length, and little-endian fields.
+PDU1 PGNs require a zero destination byte; the destination comes from the
+29-bit identifier. PDU2 PGNs retain their group-extension byte.
+
+Transmit parameter groups validate priority, PGN, and length, then bind to a
+node through `TxRegister`. `TxClear`, `TxSetUnsignedInteger`, and `TxTransmit`
+own one zero-initialized, little-endian payload buffer. `Request` emits the
+standard request PGN (`0x0EA00`) with the requested PGN in three wire-order
+bytes. This classic-CAN model deliberately restricts parameter groups to one
+`1..=8` byte frame; J1939 transport-protocol segmentation is not inferred.
+
+`DTC`, `DTCRegister`, `DTCSetActive`, `DTCSetInactive`, `DTCActive`, and
+`DTCCount` provide deterministic run-local diagnostic-handle state. SPN, FMI,
+lamp, address, PGN, priority, field, registration, and ownership errors fail
+with the exact offending value or handle. Coverage reports every captured
+`J1939` method as adapter-backed because it is handled by this virtual adapter.
+
 ## Raw bit addressing
 
 CanComms uses a fixed 64-bit internal buffer with MSB-first bit numbering. For
@@ -154,7 +182,7 @@ Hardware calls use this order:
 1. exact call-site `[[io]]` value;
 2. wildcard `[[io]]` value;
 3. external `HardwareAdapter`;
-4. run-owned virtual CAN;
+4. run-owned virtual CAN, including J1939;
 5. later built-in models or documented fallbacks where applicable;
 6. fail loud.
 
