@@ -41,7 +41,7 @@ motec-i2 = { version = "0.2", optional = true }
 assert_cmd = "2"
 tempfile = "3"
 insta = "1"
-time = { version = "=0.3.47", default-features = false }
+time = { version = "=0.3.55", default-features = false }
 
 [profile.release]
 opt-level = 3
