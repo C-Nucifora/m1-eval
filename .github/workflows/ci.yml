@@ -81,6 +81,6 @@ jobs:
     steps:
       - uses: actions/checkout@v7
       # Keep in sync with `rust-version` in Cargo.toml (m1-tools#23).
-      - uses: dtolnay/rust-toolchain@1.88
+      - uses: dtolnay/rust-toolchain@1.120
       - uses: Swatinem/rust-cache@v2
       - run: cargo check --all-targets
