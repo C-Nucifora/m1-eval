@@ -1123,7 +1123,7 @@ Output = i;
     }
 
     #[test]
-    fn loaded_coverage_keeps_trigger_schedule_when_planning_fails() {
+    fn loaded_coverage_keeps_feedback_dependencies_in_the_schedule_plan() {
         let temp = tempfile::tempdir().expect("temp project");
         let scripts = temp.path().join("Scripts");
         std::fs::create_dir(&scripts).expect("create scripts directory");
@@ -1153,14 +1153,12 @@ Output = i;
             crate::loader::load(&temp.path().join("Project.m1prj"), None).expect("project loads");
         let report = CoverageReport::analyse_loaded(&loaded);
 
-        assert!(report.schedule_plan.is_none());
-        assert!(
-            report
-                .schedule_error
-                .as_deref()
-                .is_some_and(|error| error.contains("periodic dependency cycle")),
-            "schedule error must describe the rejected plan: {report:?}"
-        );
+        let plan = report
+            .schedule_plan
+            .as_ref()
+            .expect("feedback has a deterministic schedule plan");
+        assert_eq!(plan.dependencies.len(), 2);
+        assert!(report.schedule_error.is_none());
         assert_eq!(
             report.schedule,
             vec![

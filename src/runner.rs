@@ -280,8 +280,8 @@ struct ScheduledRated<'a> {
 
 /// Build the whole-project schedule: every periodically scheduled function, in
 /// the owned [`SchedulePlan`] order. Dependencies are global across rates. The
-/// ready-node tie policy remains documented as assumed until genuine M1 schedule
-/// captures replace it.
+/// ready-node tie policy remains documented as assumed because the manuals do
+/// not define cross-event order or dependency-conflict tie-breaking.
 fn build_whole_project_schedule(
     loaded: &Loaded,
 ) -> Result<(SchedulePlan, Vec<ScheduledRated<'_>>), EvalError> {

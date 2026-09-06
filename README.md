@@ -41,7 +41,7 @@ do not compare computed channel values with captured M1 results.
 | Scenario parsing, tick grids, trace output, and `--coverage` | **Assumed** | These are deterministic m1-eval contracts tested with synthetic data. A `Supported` coverage entry means implemented, not M1-verified. |
 | Typed conformance fixture parser and runner | **Assumed** | Synthetic fixtures cover typed values, project hashes, initial-state reset, tolerances, and mismatch reporting. No genuine M1 Sim capture is committed yet, so this runner does not make another area Verified by itself. |
 | Single-function and upstream dependency-cone runners | **Assumed** | Selection, ordering, and zero-order hold are tested on synthetic projects. |
-| Whole-project multi-rate scheduling | **Assumed** | Trigger rates come from `Project.m1prj`; periodic ordering uses the evaluator's global writer-before-reader plan across rates, with a documented rate-descending/name tie-break only for otherwise independent ready functions. Startup order is separate. Genuine M1 schedule captures are still required before this moves beyond Assumed. |
+| Whole-project multi-rate scheduling | **Assumed** | Trigger rates come from `Project.m1prj`. The planner retains every discovered writer-reader dependency, orders a deterministic acyclic subset, and records whether each input was written earlier on the current tick or held. Feedback cycles and otherwise independent functions use the explicit rate-descending/name rule. Startup order is separate. The M1 manuals do not define cross-event ordering or dependency-conflict tie-breaking. |
 | CSV log replay, overrides, downstream-cone recomputation, and diffs | **Assumed** | Synthetic tests cover import, resampling, source precedence, recomputation, and the no-op invariant. They do not establish M1 execution fidelity. |
 | Binary `.ld` import | **Assumed** | Synthetic decode tests run in CI. An optional real-log test checks structure and numeric plausibility only, not values against an independent oracle. |
 | Real-time/HIL execution, ECU budgets or preemption, watchdog behavior, live CAN/serial I/O, unlisted constructs or builtins, and LSP integration | **Unsupported** | These are outside the current evaluator. Unknown executable behavior fails loud rather than being inferred. |
@@ -155,17 +155,18 @@ The multi-rate model:
   tick keeps its last value (the shared value store carries it forward), so a
   slow channel holds steady between its updates while fast channels move every
   tick.
-- **Global dependency ordering.** The planner builds one writer-before-reader
-  graph from the scripts' actual reads and writes, including reachable
-  script-backed callees, then filters that global order to the functions due at
-  each base tick. Dependencies are kept across rates. A slower writer due on the
-  same timestamp therefore runs before a faster reader of that channel; when the
-  writer is not due, the reader sees the held value from the previous writer
-  execution. Multiple periodic writers, incomplete `expand` templates, missing
-  script bodies, and dependency cycles fail loudly instead of falling back to an
-  unverified order. Independent ready functions tie by rate descending, then by
-  canonical function name. That tie-break is still an explicit evaluator
-  assumption until captured M1 schedule evidence replaces it.
+- **Global dependency ordering.** The planner builds one writer-reader graph
+  from the scripts' actual reads and writes, including reachable script-backed
+  callees. It retains every edge as trace metadata and selects a deterministic
+  acyclic subset for execution order. Acyclic cross-rate dependencies therefore
+  put a due writer before its reader. A feedback cycle cannot satisfy every
+  edge, so edges consistent with rate descending and canonical function name
+  take priority. The trace records whether each dependency input came from an
+  earlier execution on the current tick or a held value. Multiple periodic
+  writers, incomplete `expand` templates, and missing script bodies still fail
+  loudly. The M1 Development Manual documents dependency analysis within an
+  event, but not cross-event order or the order used when Build reports a
+  dependency conflict. The fallback remains an explicit evaluator assumption.
 - **Hardware calls keep base-grid time.** The adapter sees both the current
   function step and the base tick, elapsed seconds, and base period. CAN and
   sensor calls reach the typed adapter boundary. Implemented CAN calls then use
