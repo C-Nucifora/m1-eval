@@ -232,13 +232,7 @@ impl Walker<'_> {
                 .project
                 .symbols()
                 .get(&canonical)
-                .is_some_and(|symbol| {
-                    matches!(
-                        symbol.kind,
-                        m1_typecheck::symbols::SymbolKind::Function
-                            | m1_typecheck::symbols::SymbolKind::Method
-                    )
-                })
+                .is_some_and(is_script_backed_symbol)
             {
                 self.sets.calls.insert(canonical);
             }
@@ -426,6 +420,22 @@ impl Walker<'_> {
             }
         }
     }
+}
+
+fn is_script_backed_symbol(symbol: &m1_typecheck::symbols::Symbol) -> bool {
+    if !matches!(
+        symbol.kind,
+        m1_typecheck::symbols::SymbolKind::Function | m1_typecheck::symbols::SymbolKind::Method
+    ) {
+        return false;
+    }
+
+    symbol.filename.is_some()
+        || symbol.classname.as_deref().is_some_and(|classname| {
+            classname.starts_with("BuiltIn.FuncUser")
+                || classname.starts_with("BuiltIn.CalFuncUser")
+                || classname == "BuiltIn.MethodUser"
+        })
 }
 
 fn expand_binding(node: &Node) -> Result<(String, i32, i32), String> {

@@ -648,6 +648,37 @@ mod tests {
     }
 
     #[test]
+    fn generated_object_method_is_not_a_script_backed_callee() {
+        let loaded = load_project(
+            r#"
+   <Component Classname="BuiltIn.Timer" Name="Root.T.Timeout"/>
+   <Component Classname="BuiltIn.FuncGenerated.Timer.Remaining" Caps="AutoCreated" Name="Root.T.Timeout.Remaining"/>
+   <Component Classname="BuiltIn.FuncUser" Filename="T.Writer.m1scr" Name="Root.T.Writer"><Props SelectedTrigger="Root.Events.On 100Hz"/></Component>"#,
+            &[("T.Writer.m1scr", "A = Timeout.Remaining();\n")],
+        );
+        let generated = loaded
+            .project
+            .symbols()
+            .get("Root.T.Timeout.Remaining")
+            .expect("generated method symbol loads");
+        assert_eq!(generated.kind, SymbolKind::Function);
+        assert_eq!(
+            generated.classname.as_deref(),
+            Some("BuiltIn.FuncGenerated.Timer.Remaining")
+        );
+        assert_eq!(generated.filename, None);
+
+        let plan = build_schedule_plan(&loaded)
+            .expect("generated object methods do not require script I/O summaries");
+        assert_eq!(
+            plan.periodic_entries()
+                .map(|entry| entry.function.as_str())
+                .collect::<Vec<_>>(),
+            vec!["Root.T.Writer"]
+        );
+    }
+
+    #[test]
     fn nested_expand_templates_create_every_dependency_channel() {
         let loaded = load_project(
             r#"
