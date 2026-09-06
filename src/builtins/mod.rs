@@ -1330,6 +1330,8 @@ fn classify_project_method(
     {
         let support = if crate::virtual_can::model_handles_project_call(model, canon, method) {
             BuiltinSupport::AdapterBacked
+        } else if crate::virtual_can::model_stubs_project_call(model, canon, method) {
+            BuiltinSupport::Stubbed
         } else {
             BuiltinSupport::Unsupported
         };
@@ -1379,6 +1381,8 @@ fn classify_unresolved_project_method(
     {
         let support = if crate::virtual_can::model_handles_project_call(model, object, method) {
             BuiltinSupport::AdapterBacked
+        } else if crate::virtual_can::model_stubs_project_call(model, object, method) {
+            BuiltinSupport::Stubbed
         } else {
             BuiltinSupport::Unsupported
         };

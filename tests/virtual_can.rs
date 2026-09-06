@@ -85,6 +85,10 @@ fn dbc_rx_decode_and_tx_capture_share_the_loaded_layout() {
         item.source == HardwareValueSource::VirtualCan
             && item.canonical_call() == "DBC.Vehicle Network.Command Frame.Tx"
     }));
+    assert!(trace.hardware.iter().any(|item| {
+        item.source == HardwareValueSource::GenericStub
+            && item.canonical_call() == "DBC.Vehicle Network.Command Frame.Command.SetFromBaseUnit"
+    }));
 }
 
 #[derive(Default)]

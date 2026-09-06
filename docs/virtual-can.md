@@ -156,6 +156,13 @@ The supported DBC call shapes are:
   `SetUnsignedInteger`, `SetFloat`, and `SetScaled`, each with
   `(message_handle, value)`.
 
+`SetFromBaseUnit` needs the signal quantity and display-unit conversion. The
+current runtime layout does not retain that metadata. An external adapter may
+handle the call. Otherwise it is a reported generic no-op and does not modify
+the virtual transmit buffer. This is narrower than treating it as `SetScaled`,
+which would silently encode the wrong value when the display unit differs from
+the M1 base unit.
+
 An RX-only parent rejects setters and transmit methods. A TX-only parent rejects
 getters and `Receive`. Unknown direction permits both. One DBC message receive
 updates the current frame shared by its child getters. Transmit handles own
@@ -169,11 +176,13 @@ traversal. Overlapping signal writes preserve unrelated bits and use ordinary
 last-write-wins behavior for shared bits.
 
 `GetScaled` applies the loaded multiplier and offset. `SetScaled` inverts them
-only when the result is on an integer raw grid within a small ULP-bounded check.
-It does not guess an M1 rounding rule. Non-finite physical values, non-invertible
-metadata, off-grid values, and raw range overflow fail loud. Raw `Get*` accessor
-choice determines signed or unsigned interpretation; scaled decode continues to
-use the DBC signal's declared signedness.
+using M1 binary32 arithmetic, including the exact widened binary32 multipliers
+written by `.m1dbc` exports. Integer signals still require an exact raw integer
+after that calculation. The evaluator does not add a separate rounding rule.
+Non-finite physical values, non-invertible metadata, off-grid values, and raw
+range overflow fail loud. Raw `Get*` accessor choice determines signed or
+unsigned interpretation; scaled decode continues to use the DBC signal's
+declared signedness.
 
 ## Routing and whole-call ownership
 
@@ -183,7 +192,8 @@ Hardware calls use this order:
 2. wildcard `[[io]]` value;
 3. external `HardwareAdapter`;
 4. run-owned virtual CAN, including J1939;
-5. later built-in models or documented fallbacks where applicable;
+5. later built-in models or documented fallbacks where applicable, including
+   the reported `SetFromBaseUnit` no-op;
 6. fail loud.
 
 A returned value means that route owns the entire call. Lower routes do not also
