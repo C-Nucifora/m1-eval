@@ -329,10 +329,7 @@ fn try_table_lookup(
         // single-function / cone mode a `.Lookup` with no cells is still fail-loud
         // `MissingCalibration` — the user must supply the calibration.
         None if ctx.env.default_unseeded_channels => {
-            if let Some(trace) = ctx.trace.as_deref_mut() {
-                trace.mark_external(canon.clone());
-            }
-            return Ok(Some(Value::m1_float(0.0)));
+            return Ok(Some(default_table_value(&canon, ctx)));
         }
         None => {
             return Err(EvalError::MissingCalibration {
@@ -343,8 +340,25 @@ fn try_table_lookup(
 
     // `table::lookup` validates arity and the coordinate family for every
     // axis. Numeric axes interpolate; enum axes select an exact member site.
-    let value = crate::table::lookup_values(table, args, ctx.project)?;
-    Ok(Some(Value::M1(value)))
+    match crate::table::lookup_values(table, args, ctx.project) {
+        Ok(value) => Ok(Some(Value::M1(value))),
+        Err(EvalError::MissingCalibration { .. }) if ctx.env.default_unseeded_channels => {
+            Ok(Some(default_table_value(&canon, ctx)))
+        }
+        Err(error) => Err(error),
+    }
+}
+
+/// Use the explicit whole-project default for a table whose calibration is
+/// missing or invalid. M1 tables return FloatingPoint values. The trace records
+/// the substitution and its first reader so permissive runs cannot hide it.
+fn default_table_value(canon: &str, ctx: &mut EvalCtx) -> Value {
+    let value = Value::m1_float(0.0);
+    if let Some(trace) = ctx.trace.as_deref_mut() {
+        trace.mark_defaulted(canon.to_string(), value.clone(), ctx.script_name);
+        trace.mark_external(canon.to_string());
+    }
+    value
 }
 
 /// Attempt a table `.Get(site)` — a raw read of one body cell by flat site
@@ -394,10 +408,7 @@ fn try_table_get(
         // reads the externally-driven default rather than aborting the run;
         // strict modes fail loud.
         None if ctx.env.default_unseeded_channels => {
-            if let Some(trace) = ctx.trace.as_deref_mut() {
-                trace.mark_external(canon.clone());
-            }
-            return Ok(Some(Value::m1_float(0.0)));
+            return Ok(Some(default_table_value(&canon, ctx)));
         }
         None => {
             return Err(EvalError::MissingCalibration {
