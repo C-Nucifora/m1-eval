@@ -1940,6 +1940,90 @@ const = 3.0
     }
 
     #[test]
+    fn invalid_table_is_strict_unless_whole_project_defaults_are_enabled() {
+        let temp = tempfile::tempdir().expect("temp project");
+        let scripts = temp.path().join("Scripts");
+        std::fs::create_dir(&scripts).expect("create scripts directory");
+        std::fs::write(
+            temp.path().join("Project.m1prj"),
+            r#"<?xml version="1.0"?>
+<MoTeCM1BuildSession>
+ <Project Name="Invalid table" TargetHardware="ecu120">
+  <ComponentStream><List>
+   <Component Classname="BuiltIn.GroupCompound" Name="Root.T"/>
+   <Component Classname="BuiltIn.GroupCompound" Name="Root.Events"/>
+   <Component Classname="BuiltIn.EventKernel" Name="Root.Events.On 100Hz"/>
+   <Component Classname="BuiltIn.Channel" Name="Root.T.Input"><Props Type="f32"/></Component>
+   <Component Classname="BuiltIn.Channel" Name="Root.T.Output"><Props Type="f32"/></Component>
+   <Component Classname="BuiltIn.Table" Name="Root.T.Map"><Props Type="f32"/></Component>
+   <Component Classname="BuiltIn.FuncUser" Filename="T.Update.m1scr" Name="Root.T.Update">
+    <Props SelectedTrigger="Root.Events.On 100Hz"/>
+   </Component>
+  </List></ComponentStream>
+ </Project>
+</MoTeCM1BuildSession>
+"#,
+        )
+        .expect("write project");
+        std::fs::write(
+            scripts.join("T.Update.m1scr"),
+            "Output = Map.Lookup(Input);\n",
+        )
+        .expect("write script");
+        std::fs::write(
+            temp.path().join("parameters.m1cfg"),
+            r#"<?xml version="1.0"?>
+<Configuration><Group Name="">
+ <Table Name="T.Map">
+  <X><Cells Type="f32"><Cell Site="0,0,0">0</Cell><Cell Site="1,0,0">0</Cell></Cells></X>
+  <Body><Cells Type="f32"><Cell Site="0,0,0">10</Cell><Cell Site="1,0,0">20</Cell></Cells></Body>
+ </Table>
+</Group></Configuration>
+"#,
+        )
+        .expect("write calibration");
+        let loaded = load(
+            &temp.path().join("Project.m1prj"),
+            Some(&temp.path().join("parameters.m1cfg")),
+        )
+        .expect("project loads");
+        let mut scenario = Scenario::from_toml_str(
+            r#"
+mode = "whole-project"
+duration_s = 0.01
+base_rate_hz = 100.0
+allow_default_inputs = true
+
+[[inputs]]
+channel = "Root.T.Input"
+const = 5.0
+"#,
+        )
+        .expect("scenario parses");
+
+        scenario.allow_default_inputs = false;
+        let error = run(&loaded, &scenario).expect_err("strict run rejects invalid calibration");
+        assert!(matches!(
+            error.root_cause(),
+            EvalError::MissingCalibration { .. }
+        ));
+
+        scenario.allow_default_inputs = true;
+        let trace = run(&loaded, &scenario).expect("permissive run defaults invalid table");
+        let substitution = trace
+            .defaulted
+            .get("Root.T.Map")
+            .expect("table substitution is reported");
+        assert_eq!(substitution.value, Value::m1_float(0.0));
+        assert_eq!(substitution.first_reader, "T.Update.m1scr");
+        assert!(trace.external.contains("Root.T.Map"));
+        assert_eq!(
+            trace.channel_value_at_tick("Root.T.Output", 0),
+            Some(&Value::m1_float(0.0))
+        );
+    }
+
+    #[test]
     fn startup_functions_run_once_before_the_periodic_loop() {
         // The multirate fixture's Root.MR.Init (On Startup) writes Started = 1.
         // Whole-project mode used to skip startup functions entirely; they now

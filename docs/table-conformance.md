@@ -27,6 +27,14 @@ breakpoints return a `MissingCalibration` diagnostic from `.Lookup()`. The
 evaluator does not choose one of two repeated sites; `.Get()` remains a raw
 flat-body read and does not inspect breakpoints.
 
+Strict function, cone, and whole-project runs return that diagnostic. A
+whole-project scenario may set `allow_default_inputs = true` for offline smoke
+testing. In that mode, `.Lookup()` returns the table value's `FloatingPoint`
+zero when calibration is missing or invalid. The trace records the table as an
+external default and names the first reading script. This fallback is an
+explicit evaluator policy. It does not claim that an ECU accepts the invalid
+calibration.
+
 Enum axis cells store exact declared enum values. At a call site, the evaluator
 resolves the runtime member through the loaded project's enum definition and
 selects the matching site. The axis `Source` attribute binds the axis to that
