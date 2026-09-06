@@ -122,6 +122,27 @@ pub(crate) fn model_handles_project_call(
     })
 }
 
+/// Whether a recognized DBC signal call has an honest generic offline stub.
+/// `SetFromBaseUnit` needs quantity/unit metadata that the runtime model does
+/// not retain, so a transmit signal may fall through without mutating its
+/// virtual payload. Directionally impossible receive-signal writes still fail.
+pub(crate) fn model_stubs_project_call(
+    model: &CanRuntimeModel,
+    receiver: &str,
+    method: &str,
+) -> bool {
+    method == "SetFromBaseUnit"
+        && model.modules.iter().any(|module| {
+            module.messages.iter().any(|message| {
+                message.direction != Some(CanDirection::Rx)
+                    && message
+                        .signals
+                        .iter()
+                        .any(|signal| signal.aliases.iter().any(|alias| alias == receiver))
+            })
+        })
+}
+
 /// Resolve any accepted source alias to the project-qualified identity exposed
 /// to adapters and provenance. m1-can lists the exact source path first and the
 /// registered project aliases after it; normal loaded projects register the
@@ -1314,6 +1335,9 @@ impl VirtualCan {
         if let Some(signal) = resolve_alias(&self.signal_aliases, call)? {
             let definition = &self.signals[&signal];
             let direction = self.messages[&definition.message].direction;
+            if call.method == "SetFromBaseUnit" && direction != Some(CanDirection::Rx) {
+                return Ok(None);
+            }
             if !signal_method_is_supported(direction, &call.method) {
                 return Err(unsupported_can_object(call));
             }
@@ -2526,7 +2550,13 @@ fn encode_scaled(
             format!("DBC signal `{signal_name}` has non-invertible scale/offset metadata"),
         ));
     }
-    let raw = (physical - signal.offset) / signal.scale;
+    // M1 script values and exported DBC multipliers are binary32. Perform the
+    // inverse conversion in that family before widening for range checks. A
+    // decimal such as 0.1 is exported as its exact widened binary32 value; f64
+    // division would otherwise turn an intended raw 800 into 799.999988...
+    let scale = signal.scale as f32;
+    let offset = signal.offset as f32;
+    let raw = f64::from(((physical as f32) - offset) / scale);
     if !raw.is_finite() {
         return Err(can_call_error(
             call,
@@ -4220,15 +4250,31 @@ mod tests {
             offset: 0.0,
         };
         let call = project_call("M.S", "SetScaled", 90, vec![], 0.0);
-        for raw in [1_000_000.25, 1_000_000_000.5] {
-            let error = encode_scaled(&call, "M.S", &definition, raw)
-                .expect_err("large non-grid raw values fail loud");
-            assert!(error.to_string().contains("non-integral"), "{error}");
-        }
+        let error = encode_scaled(&call, "M.S", &definition, 1_000_000.25)
+            .expect_err("large non-grid raw values fail loud");
+        assert!(error.to_string().contains("non-integral"), "{error}");
         assert_eq!(
             encode_scaled(&call, "M.S", &definition, 1_000_000_000.0).unwrap(),
             1_000_000_000
         );
+    }
+
+    #[test]
+    fn scaled_integer_encoding_uses_m1_binary32_metadata_arithmetic() {
+        let definition = SignalDef {
+            message: "M".to_string(),
+            raw_kind: ValueType::Unsigned,
+            signed: false,
+            float: false,
+            endian: CanEndian::Little,
+            start_bit: 0,
+            width: 16,
+            scale: f64::from(0.1_f32),
+            offset: 0.0,
+        };
+        let call = project_call("M.S", "SetScaled", 91, vec![], 0.0);
+
+        assert_eq!(encode_scaled(&call, "M.S", &definition, 80.0), Ok(800));
     }
 
     #[test]
@@ -4330,6 +4376,11 @@ mod tests {
             assert!(model_handles_project_call(&model, &tx_message, "TxOpen"));
             assert!(!model_handles_project_call(&model, &tx_message, "Receive"));
             assert!(model_handles_project_call(&model, &tx_signal, "SetInteger"));
+            assert!(model_stubs_project_call(
+                &model,
+                &tx_signal,
+                "SetFromBaseUnit"
+            ));
             assert!(!model_handles_project_call(
                 &model,
                 &tx_signal,
