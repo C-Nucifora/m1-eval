@@ -1,11 +1,13 @@
 // SPDX-License-Identifier: GPL-3.0-or-later
 //! Deterministic whole-project schedule planning.
 //!
-//! The plan is an evaluator contract, not a claim about M1 compiler parity.
-//! Trigger roles and rates come from [`crate::TriggerMap`]. Channel dependency
-//! edges come from the same CST I/O analysis used by the runners. The planner
-//! keeps edges across rates, rejects ambiguous periodic writers, and rejects
-//! cycles instead of choosing an order that has not been captured from M1.
+//! The M1 Development Manual documents dependency ordering for objects attached
+//! to the same event. It does not define the relative order of different events
+//! that become due at the same instant. Trigger roles and rates come from
+//! [`crate::TriggerMap`]. Channel dependency edges come from the same CST I/O
+//! analysis used by the runners. The planner preserves every dependency as
+//! trace metadata, orders a deterministic maximal acyclic subset, and breaks
+//! unavoidable feedback cycles with its explicit assumed tie policy.
 
 use crate::error::EvalError;
 use crate::loader::Loaded;
@@ -19,8 +21,8 @@ use std::collections::{BTreeMap, BTreeSet};
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 #[non_exhaustive]
 pub enum ScheduleMaturity {
-    /// Synthetic fixtures establish determinism, but no genuine M1 schedule
-    /// capture establishes compiler parity.
+    /// The manuals establish same-event dependency ordering, while ordering
+    /// between events remains an explicit deterministic evaluator assumption.
     Assumed,
 }
 
@@ -71,10 +73,11 @@ pub struct ScheduleDependency {
 /// The owned, deterministic whole-project schedule description.
 #[derive(Debug, Clone, PartialEq)]
 pub struct SchedulePlan {
-    /// Current evidence status. This remains `Assumed` until genuine M1
-    /// schedule captures establish the ordering contract.
+    /// Current evidence status. The manuals do not define how M1 orders
+    /// independent events or breaks dependency feedback.
     pub maturity: ScheduleMaturity,
-    /// Policy used only when two ready nodes have no dependency ordering.
+    /// Policy used when ready nodes have no dependency ordering and when a
+    /// dependency feedback edge must be omitted from the static order.
     pub ready_tie_policy: ReadyTiePolicy,
     /// Every script-backed function. Periodic entries appear in execution order,
     /// followed by nonperiodic entries in canonical-name order.
@@ -201,7 +204,8 @@ pub fn build_schedule_plan(loaded: &Loaded) -> Result<SchedulePlan, EvalError> {
             channels: channels.iter().cloned().collect(),
         })
         .collect();
-    let ordered = topological_periodic_order(&periodic, &dependencies)?;
+    let ordering_dependencies = select_ordering_dependencies(&periodic, &dependencies);
+    let ordered = topological_periodic_order(&periodic, &ordering_dependencies)?;
     let order_by_function: BTreeMap<&str, usize> = ordered
         .iter()
         .enumerate()
@@ -223,6 +227,65 @@ pub fn build_schedule_plan(loaded: &Loaded) -> Result<SchedulePlan, EvalError> {
         entries,
         dependencies,
     })
+}
+
+/// Select the dependency edges that can constrain one static global order.
+///
+/// M1 Build reports dependency conflicts but the real EV and AV projects contain
+/// feedback cycles and remain valid projects. An execution order cannot satisfy
+/// every edge in a cycle. Edges matching the assumed ready-node order are
+/// considered first, followed by the remaining edges in canonical order. An
+/// edge is selected unless it would create a cycle with an earlier selection.
+fn select_ordering_dependencies(
+    rates: &BTreeMap<String, f64>,
+    dependencies: &[ScheduleDependency],
+) -> Vec<ScheduleDependency> {
+    let mut candidates = dependencies.to_vec();
+    candidates.sort_by(|left, right| {
+        let left_matches_assumption =
+            assumed_ready_order(&left.writer, &left.reader, rates) == Ordering::Less;
+        let right_matches_assumption =
+            assumed_ready_order(&right.writer, &right.reader, rates) == Ordering::Less;
+        right_matches_assumption
+            .cmp(&left_matches_assumption)
+            .then_with(|| left.writer.cmp(&right.writer))
+            .then_with(|| left.reader.cmp(&right.reader))
+    });
+
+    let mut selected = Vec::new();
+    let mut successors: BTreeMap<String, BTreeSet<String>> = BTreeMap::new();
+    for dependency in candidates {
+        if path_exists(&successors, &dependency.reader, &dependency.writer) {
+            continue;
+        }
+        successors
+            .entry(dependency.writer.clone())
+            .or_default()
+            .insert(dependency.reader.clone());
+        selected.push(dependency);
+    }
+    selected
+}
+
+fn path_exists(successors: &BTreeMap<String, BTreeSet<String>>, start: &str, target: &str) -> bool {
+    let mut pending = vec![start];
+    let mut visited = BTreeSet::new();
+    while let Some(function) = pending.pop() {
+        if function == target {
+            return true;
+        }
+        if !visited.insert(function) {
+            continue;
+        }
+        pending.extend(
+            successors
+                .get(function)
+                .into_iter()
+                .flatten()
+                .map(String::as_str),
+        );
+    }
+    false
 }
 
 fn validate_script_bindings(loaded: &Loaded) -> Result<(), EvalError> {
@@ -505,9 +568,8 @@ fn visit_for_cycle<'a>(
     None
 }
 
-/// Assumed fallback for incomparable ready nodes. This is intentionally the
-/// only place that encodes a ready-node tie policy. A genuine M1 schedule
-/// capture can replace this comparator without touching graph construction.
+/// Assumed fallback for incomparable ready nodes and dependency feedback. This
+/// is the only place that encodes an order not established by project data.
 fn assumed_ready_order(left: &str, right: &str, rates: &BTreeMap<String, f64>) -> Ordering {
     rates[right]
         .total_cmp(&rates[left])
@@ -572,7 +634,7 @@ mod tests {
     }
 
     #[test]
-    fn cycle_error_names_each_dependency_channel() {
+    fn feedback_cycle_keeps_dependencies_and_uses_the_assumed_tie() {
         let temp = tempfile::tempdir().expect("temp project");
         write_project(
             temp.path(),
@@ -588,18 +650,34 @@ mod tests {
             ],
         );
         let loaded = load(&temp.path().join("Project.m1prj"), None).expect("project loads");
-        let error = build_schedule_plan(&loaded).expect_err("cycle fails loud");
-        let text = error.to_string();
+        let plan = build_schedule_plan(&loaded).expect("feedback has a deterministic plan");
+        assert_eq!(
+            plan.periodic_entries()
+                .map(|entry| entry.function.as_str())
+                .collect::<Vec<_>>(),
+            vec!["Root.T.One", "Root.T.Blocked", "Root.T.Two"]
+        );
+        assert_eq!(plan.dependencies.len(), 3, "no dependency evidence is lost");
+    }
 
-        assert!(
-            text.contains("Root.T.One -[Root.T.A]-> Root.T.Two")
-                && text.contains("Root.T.Two -[Root.T.B]-> Root.T.One"),
-            "cycle edge channels should be actionable: {text}"
+    #[test]
+    fn cross_rate_cycle_keeps_dependencies_and_uses_the_assumed_rate_tie() {
+        let loaded = load_project(
+            r#"
+   <Component Classname="BuiltIn.EventKernel" Name="Root.Events.On 50Hz"/>
+   <Component Classname="BuiltIn.FuncUser" Filename="T.Fast.m1scr" Name="Root.T.Fast"><Props SelectedTrigger="Root.Events.On 100Hz"/></Component>
+   <Component Classname="BuiltIn.FuncUser" Filename="T.Slow.m1scr" Name="Root.T.Slow"><Props SelectedTrigger="Root.Events.On 50Hz"/></Component>"#,
+            &[("T.Fast.m1scr", "A = B;\n"), ("T.Slow.m1scr", "B = A;\n")],
         );
-        assert!(
-            text.contains("downstream blocked periodic functions: Root.T.Blocked"),
-            "blocked non-cycle node should be separate: {text}"
+
+        let plan = build_schedule_plan(&loaded).expect("cross-rate feedback has a stable plan");
+        assert_eq!(
+            plan.periodic_entries()
+                .map(|entry| entry.function.as_str())
+                .collect::<Vec<_>>(),
+            vec!["Root.T.Fast", "Root.T.Slow"]
         );
+        assert_eq!(plan.dependencies.len(), 2);
     }
 
     #[test]
