@@ -141,6 +141,11 @@ pub(crate) fn dispatch_with_runtime(
                 .is_empty()
             {
                 validate_arity(&library_object, object, method, args.len())?;
+                if library_object == "CanComms"
+                    && matches!(method, "RxOpenStandardBuffered" | "RxOpenExtendedBuffered")
+                {
+                    validate_catalogued_argument_families(&library_object, method, object, args)?;
+                }
             }
             io_stub::call_with_runtime(&library_object, object, method, args, site, ctx, runtime)
         }
@@ -1575,6 +1580,126 @@ mod tests {
         fn call(&mut self, call: &HardwareCall) -> Result<AdapterReply, EvalError> {
             self.calls.push(call.clone());
             Ok(self.reply.clone())
+        }
+    }
+
+    // Both documented receive-buffer constructors must reach explicit IO
+    // providers. The virtual CAN model does not claim buffered semantics.
+    #[test]
+    fn buffered_can_overloads_reach_scenario_overrides_and_adapters() {
+        let forms = [
+            vec![Value::m1_integer(2), Value::Bool(true)],
+            vec![
+                Value::m1_integer(2),
+                Value::m1_unsigned(0x123),
+                Value::m1_unsigned(0),
+                Value::Bool(true),
+            ],
+        ];
+        for args in forms {
+            let mut h = Harness::new();
+            h.env
+                .set_io_override("CanComms.RxOpenStandardBuffered", Value::m1_unsigned(7));
+            assert_eq!(
+                h.call("CanComms", "RxOpenStandardBuffered", &args).unwrap(),
+                Value::m1_unsigned(7)
+            );
+
+            let mut h = Harness::new();
+            let mut adapter = CapturingAdapter::replying(Value::m1_unsigned(9));
+            assert_eq!(
+                h.call_with_adapter(
+                    "CanComms",
+                    "RxOpenStandardBuffered",
+                    &args,
+                    &mut adapter,
+                    None,
+                )
+                .unwrap(),
+                Value::m1_unsigned(9)
+            );
+            assert_eq!(adapter.calls.len(), 1);
+            assert_eq!(adapter.calls[0].arguments, args);
+
+            let mut h = Harness::new();
+            assert!(matches!(
+                h.call("CanComms", "RxOpenStandardBuffered", &args),
+                Err(EvalError::UnsupportedBuiltin { .. })
+            ));
+        }
+    }
+
+    #[test]
+    fn buffered_can_wrong_arity_still_fails_before_io_override() {
+        let mut h = Harness::new();
+        h.env
+            .set_io_override("CanComms.RxOpenStandardBuffered", Value::m1_unsigned(1));
+        for count in [0, 1, 3, 5] {
+            let args = vec![Value::m1_integer(2); count];
+            let Err(EvalError::BadCall { detail }) =
+                h.call("CanComms", "RxOpenStandardBuffered", &args)
+            else {
+                panic!("wrong arity {count} must not reach the override");
+            };
+            assert!(detail.contains("2 or 4"), "{detail}");
+        }
+        // The native/header evidence establishes StandardBuffered's overload;
+        // it does not establish a two-arg ExtendedBuffered overload.
+        assert!(matches!(
+            h.call(
+                "CanComms",
+                "RxOpenExtendedBuffered",
+                &[Value::m1_integer(2), Value::Bool(true)],
+            ),
+            Err(EvalError::BadCall { .. })
+        ));
+    }
+
+    #[test]
+    fn buffered_can_argument_types_cannot_be_bypassed_by_io_providers() {
+        let invalid = [
+            vec![Value::Str("bus".to_string()), Value::Bool(true)],
+            vec![Value::m1_integer(2), Value::m1_integer(1)],
+            vec![
+                Value::m1_integer(2),
+                Value::Bool(true),
+                Value::m1_unsigned(0),
+                Value::Bool(true),
+            ],
+            vec![
+                Value::m1_integer(2),
+                Value::m1_unsigned(0x123),
+                Value::Str("mask".to_string()),
+                Value::Bool(true),
+            ],
+            vec![
+                Value::m1_integer(2),
+                Value::m1_unsigned(0x123),
+                Value::m1_unsigned(0),
+                Value::m1_float(1.0),
+            ],
+        ];
+        for args in invalid {
+            let mut h = Harness::new();
+            h.env
+                .set_io_override("CanComms.RxOpenStandardBuffered", Value::m1_unsigned(1));
+            assert!(matches!(
+                h.call("CanComms", "RxOpenStandardBuffered", &args),
+                Err(EvalError::TypeError { .. })
+            ));
+            let mut h = Harness::new();
+            let mut adapter = CapturingAdapter::replying(Value::m1_unsigned(1));
+            assert!(matches!(
+                h.call_with_adapter(
+                    "CanComms",
+                    "RxOpenStandardBuffered",
+                    &args,
+                    &mut adapter,
+                    None
+                ),
+                Err(EvalError::TypeError { .. })
+            ));
+            assert!(adapter.calls.is_empty());
         }
     }
 

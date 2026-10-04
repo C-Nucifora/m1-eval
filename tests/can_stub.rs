@@ -194,3 +194,43 @@ bytes = [0, 0, 0, 0]
         "Bus Value reads the [[io]] const in function mode"
     );
 }
+
+#[test]
+fn native_buffered_receive_overloads_execute_with_scenario_handles() {
+    for args in ["2, true", "2, 0x123, 0, true"] {
+        let fixture = Path::new(env!("CARGO_MANIFEST_DIR")).join("tests/fixtures/can_stub");
+        let temp = tempfile::tempdir().unwrap();
+        std::fs::copy(
+            fixture.join("Project.m1prj"),
+            temp.path().join("Project.m1prj"),
+        )
+        .unwrap();
+        std::fs::create_dir(temp.path().join("Scripts")).unwrap();
+        std::fs::write(
+            temp.path().join("Scripts/CanDemo.Read.m1scr"),
+            format!(
+                "local <Unsigned Integer> h = CanComms.RxOpenStandardBuffered({args});\nBus Value = h;\n"
+            ),
+        )
+        .unwrap();
+        let engine = Engine::load(&temp.path().join("Project.m1prj"), None).unwrap();
+        let scenario = Scenario::from_toml_str(
+            r#"
+mode = "whole-project"
+duration_s = 0.02
+base_rate_hz = 100.0
+
+[[io]]
+call = "CanComms.RxOpenStandardBuffered"
+const = 1
+"#,
+        )
+        .unwrap();
+        let trace = engine.run(&scenario).unwrap();
+        assert_eq!(
+            trace.channels.get("Root.CanDemo.Bus Value"),
+            Some(&vec![Value::m1_float(1.0); 2])
+        );
+        assert!(trace.is_external("CanComms.RxOpenStandardBuffered"));
+    }
+}
