@@ -404,7 +404,7 @@ dependencies = [
 
 [[package]]
 name = "m1-eval"
-version = "0.6.0"
+version = "0.6.1"
 dependencies = [
  "assert_cmd",
  "clap",
