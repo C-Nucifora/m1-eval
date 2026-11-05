@@ -111,11 +111,22 @@ pub fn load(project_path: &Path, cfg_path: Option<&Path>) -> Result<Loaded, Eval
 
     // Discover scripts relative to the project file's directory (mirrors m1-doc).
     let project_dir = project_path.parent().unwrap_or_else(|| Path::new("."));
-    let pairs = collect_scripts(project_dir);
+    let pairs = collect_scripts(project_dir)?;
 
     // Parse each discovered script exactly once; the CSTs are shared with the
     // return-type inference pass and reused by the evaluator each tick.
     let scripts = parse_all(&pairs);
+    for script in &scripts {
+        if let Some(diagnostic) = script.cst.syntax_diagnostics().first() {
+            return Err(EvalError::UnsupportedConstruct {
+                kind: format!(
+                    "script {:?} has invalid syntax: {}",
+                    script.name, diagnostic.message
+                ),
+                at: diagnostic.byte_range.start,
+            });
+        }
+    }
 
     // Infer user-function return types from the script bodies before the
     // evaluator runs, so call sites and `Out =` reads see concrete types.
@@ -329,36 +340,43 @@ fn load_err(e: m1_typecheck::project::LoadError) -> EvalError {
 
 /// Collect every `.m1scr` under `dir` (recursively) as `(basename, source)`
 /// pairs. Sources are lossy-UTF-8 decoded. Mirrors `m1-doc/src/loader.rs`.
-fn collect_scripts(dir: &Path) -> Vec<(String, String)> {
+fn collect_scripts(dir: &Path) -> Result<Vec<(String, String)>, EvalError> {
+    let mut paths = Vec::new();
+    collect_extension_paths(dir, "m1scr", &mut paths)?;
+    paths.sort();
+    let mut names = HashMap::new();
     let mut out = Vec::new();
-    collect_scripts_rec(dir, &mut out);
-    // Deterministic order: sort by basename so the tick loop and traces are
-    // reproducible regardless of filesystem enumeration order.
-    out.sort_by(|a, b| a.0.cmp(&b.0));
-    out
-}
-
-fn collect_scripts_rec(dir: &Path, out: &mut Vec<(String, String)>) {
-    let Ok(entries) = std::fs::read_dir(dir) else {
-        return;
-    };
-    for entry in entries.flatten() {
-        let path = entry.path();
-        if path.is_dir() {
-            collect_scripts_rec(&path, out);
-        } else if path.extension().and_then(|e| e.to_str()) == Some("m1scr") {
-            let Some(name) = path
-                .file_name()
-                .and_then(|n| n.to_str())
-                .map(str::to_string)
-            else {
-                continue;
-            };
-            let bytes = std::fs::read(&path).unwrap_or_default();
-            let source = String::from_utf8_lossy(&bytes).into_owned();
-            out.push((name, source));
+    for path in paths {
+        // Preserve the script extension rule used by conformance manifests.
+        if path.extension().and_then(|extension| extension.to_str()) != Some("m1scr") {
+            continue;
         }
+        let name = path
+            .file_name()
+            .and_then(|name| name.to_str())
+            .ok_or_else(|| EvalError::UnsupportedConstruct {
+                kind: format!("script path {} is not valid UTF-8", path.display()),
+                at: 0,
+            })?
+            .to_string();
+        if let Some(first) = names.insert(name.clone(), path.clone()) {
+            return Err(EvalError::UnsupportedConstruct {
+                kind: format!(
+                    "duplicate script basename {name:?}: {} and {}",
+                    first.display(),
+                    path.display()
+                ),
+                at: 0,
+            });
+        }
+        let bytes = std::fs::read(&path).map_err(|error| EvalError::UnsupportedConstruct {
+            kind: format!("cannot read script {}: {error}", path.display()),
+            at: 0,
+        })?;
+        out.push((name, String::from_utf8_lossy(&bytes).into_owned()));
     }
+    out.sort_by(|a, b| a.0.cmp(&b.0));
+    Ok(out)
 }
 
 #[cfg(test)]
