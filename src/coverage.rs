@@ -153,6 +153,13 @@ impl CoverageReport {
     ) -> CoverageReport {
         let mut buckets = CoverageBuckets::default();
         for script in scripts {
+            if let Err(error) = crate::syntax::validate(&script.cst.root(), &script.name) {
+                buckets.unsupported.insert(CoverageItem {
+                    name: error.to_string(),
+                    kind: ItemKind::Construct,
+                });
+                continue;
+            }
             // The script's enclosing group, for resolving group-relative callees.
             let group = project.and_then(|p| p.group_for_script(&script.name));
             let fn_symbol = project.and_then(|p| p.function_symbol_for_script(&script.name));

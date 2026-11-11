@@ -116,6 +116,7 @@ pub fn load(project_path: &Path, cfg_path: Option<&Path>) -> Result<Loaded, Eval
     // Parse each discovered script exactly once; the CSTs are shared with the
     // return-type inference pass and reused by the evaluator each tick.
     let scripts = parse_all(&pairs);
+    crate::syntax::validate_scripts(&scripts)?;
 
     // Infer user-function return types from the script bodies before the
     // evaluator runs, so call sites and `Out =` reads see concrete types.
@@ -373,6 +374,23 @@ mod tests {
 
     fn virtual_can_dir() -> std::path::PathBuf {
         std::path::Path::new(env!("CARGO_MANIFEST_DIR")).join("tests/fixtures/virtual_can")
+    }
+
+    #[test]
+    fn recovered_syntax_in_unused_script_rejects_loading() {
+        let temp = tempfile::tempdir().unwrap();
+        let project = temp.path().join("Project.m1prj");
+        std::fs::copy(mini_dir().join("Project.m1prj"), &project).unwrap();
+        std::fs::write(temp.path().join("Unused.Broken.m1scr"), "Output = 1.0; @@@").unwrap();
+        let error = match load(&project, None) {
+            Ok(_) => panic!("a malformed script must fail loading even if unused"),
+            Err(error) => error.to_string(),
+        };
+        assert!(
+            error.contains("Unused.Broken.m1scr") && error.contains("syntax error"),
+            "{error}"
+        );
+        assert!(!error.contains("at startup"), "{error}");
     }
 
     #[test]

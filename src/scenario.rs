@@ -758,10 +758,10 @@ impl RawScenario {
         // the lcm of the scheduled rates). Every other mode needs an explicit
         // positive base tick — there is no schedule to derive one from. A
         // negative rate is always invalid.
-        if self.base_rate_hz < 0.0 {
+        if !self.base_rate_hz.is_finite() || self.base_rate_hz < 0.0 {
             return Err(EvalError::UnsupportedConstruct {
                 kind: format!(
-                    "base_rate_hz must be non-negative, got {}",
+                    "base_rate_hz must be finite and non-negative, got {}",
                     self.base_rate_hz
                 ),
                 at: 0,
@@ -776,9 +776,12 @@ impl RawScenario {
                 at: 0,
             });
         }
-        if self.duration_s < 0.0 {
+        if !self.duration_s.is_finite() || self.duration_s < 0.0 {
             return Err(EvalError::UnsupportedConstruct {
-                kind: format!("duration_s must be non-negative, got {}", self.duration_s),
+                kind: format!(
+                    "duration_s must be finite and non-negative, got {}",
+                    self.duration_s
+                ),
                 at: 0,
             });
         }

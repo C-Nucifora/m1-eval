@@ -97,6 +97,18 @@ fn run_inner(
     scenario: &Scenario,
     hardware: Option<&mut dyn HardwareAdapter>,
 ) -> Result<Trace, EvalError> {
+    let mut budget = crate::budget::ExpansionBudget::default();
+    crate::syntax::validate_scripts(&loaded.scripts)?;
+    if !scenario.duration_s.is_finite()
+        || scenario.duration_s < 0.0
+        || !scenario.base_rate_hz.is_finite()
+        || scenario.base_rate_hz < 0.0
+    {
+        return Err(EvalError::UnsupportedConstruct {
+            kind: "duration_s and base_rate_hz must be finite and non-negative".into(),
+            at: 0,
+        });
+    }
     match &scenario.mode {
         RunMode::Function(name) => {
             // A single function has no schedule rate of its own; it runs every
@@ -109,7 +121,7 @@ fn run_inner(
                 sched: scheduled,
                 rate_hz: base,
             }];
-            tick_loop(loaded, scenario, &rated, base, None, hardware)
+            tick_loop(loaded, scenario, &rated, base, None, hardware, &mut budget)
         }
         RunMode::Cone(target) => {
             let base = require_base_rate(scenario)?;
@@ -121,7 +133,7 @@ fn run_inner(
                     rate_hz: base,
                 })
                 .collect();
-            tick_loop(loaded, scenario, &rated, base, None, hardware)
+            tick_loop(loaded, scenario, &rated, base, None, hardware, &mut budget)
         }
         RunMode::WholeProject => {
             // Plan every periodic function once, then drive the rate-gated tick
@@ -129,7 +141,15 @@ fn run_inner(
             // rate divisor, with its own period as `dt`.
             let (plan, ordered) = build_whole_project_schedule(loaded)?;
             let base = resolve_base_rate(scenario, &ordered)?;
-            tick_loop(loaded, scenario, &ordered, base, Some(&plan), hardware)
+            tick_loop(
+                loaded,
+                scenario,
+                &ordered,
+                base,
+                Some(&plan),
+                hardware,
+                &mut budget,
+            )
         }
     }
 }
@@ -191,7 +211,7 @@ pub(crate) fn lcm_rate_hz(rates: impl IntoIterator<Item = f64>) -> Option<f64> {
         lcm_mhz = if lcm_mhz == 0 {
             mhz
         } else {
-            lcm_mhz / gcd(lcm_mhz, mhz) * mhz
+            (lcm_mhz / gcd(lcm_mhz, mhz)).checked_mul(mhz)?
         };
         if lcm_mhz > 1_000_000_000 {
             return None;
@@ -215,7 +235,7 @@ fn millihertz(rate_hz: f64) -> Option<u64> {
     }
     let m = rate_hz * 1000.0;
     let r = m.round();
-    if r >= 1.0 && (m - r).abs() < 1e-6 {
+    if r >= 1.0 && r < u64::MAX as f64 && (m - r).abs() < 1e-6 {
         Some(r as u64)
     } else {
         None
@@ -266,7 +286,10 @@ fn exact_divisor(
             at: 0,
         });
     }
-    Ok((base_mhz / rate_mhz) as usize)
+    usize::try_from(base_mhz / rate_mhz).map_err(|_| EvalError::UnsupportedConstruct {
+        kind: format!("tick divisor for {who} exceeds this platform's range"),
+        at: 0,
+    })
 }
 
 /// One scheduled function together with its resolved periodic execution rate.
@@ -446,8 +469,9 @@ fn tick_loop(
     base_rate_hz: f64,
     schedule_plan: Option<&SchedulePlan>,
     mut hardware: Option<&mut dyn HardwareAdapter>,
+    budget: &mut crate::budget::ExpansionBudget,
 ) -> Result<Trace, EvalError> {
-    let ticks = tick_count(scenario.duration_s, base_rate_hz);
+    let ticks = tick_count(scenario.duration_s, base_rate_hz)?;
 
     // Precompute each function's rate divisor (how many base ticks between runs)
     // and its per-run dt (its own period). Divisors are exact integers — a base
@@ -576,6 +600,9 @@ fn tick_loop(
                 },
                 serial: crate::expr::SerialRuntime::Shared(&mut serial),
                 can: crate::expr::CanRuntime::Shared(&mut can),
+                budget: crate::budget::Budget::Shared(&mut *budget),
+                source_origin: None,
+                evaluation_depth: 0,
             };
             exec_script_with_runtime(&root, &mut ctx, &mut runtime)
                 .map_err(|e| e.in_script(&sched.script.name, None))?;
@@ -673,6 +700,9 @@ fn tick_loop(
                 },
                 serial: crate::expr::SerialRuntime::Shared(&mut serial),
                 can: crate::expr::CanRuntime::Shared(&mut can),
+                budget: crate::budget::Budget::Shared(&mut *budget),
+                source_origin: None,
+                evaluation_depth: 0,
             };
             exec_script_with_runtime(&root, &mut ctx, &mut runtime)
                 .map_err(|e| e.in_script(&sched.script.name, Some(t)))?;
@@ -912,13 +942,39 @@ fn hold_trace_channels(env: &Env, trace: &mut Trace) {
     }
 }
 
-/// The number of ticks spanning `[0, duration_s)` at `base_rate_hz`. A
-/// half-second run at 100 Hz is 50 ticks (t = 0.00 .. 0.49). Rounds the product
-/// to the nearest integer first to absorb float error (e.g. `0.5 * 100`), so a
-/// clean grid yields the expected count.
-fn tick_count(duration_s: f64, base_rate_hz: f64) -> usize {
-    let n = (duration_s * base_rate_hz).round();
-    if n <= 0.0 { 0 } else { n as usize }
+/// Maximum trace grid size for one offline run, not an M1 language limit.
+const MAX_TICKS: usize = 1_000_000;
+
+/// Count the actual grid instants in `[0, duration_s)` without rounding away
+/// partial intervals or casting an unbounded floating-point product.
+fn tick_count(duration_s: f64, base_rate_hz: f64) -> Result<usize, EvalError> {
+    if !duration_s.is_finite()
+        || duration_s < 0.0
+        || !base_rate_hz.is_finite()
+        || base_rate_hz <= 0.0
+    {
+        return Err(EvalError::UnsupportedConstruct {
+            kind: "duration must be finite and non-negative; rate must be finite and positive"
+                .into(),
+            at: 0,
+        });
+    }
+    if MAX_TICKS as f64 / base_rate_hz < duration_s {
+        return Err(EvalError::UnsupportedConstruct {
+            kind: format!("run exceeds {MAX_TICKS} ticks"),
+            at: 0,
+        });
+    }
+    let (mut lo, mut hi) = (0, MAX_TICKS);
+    while lo < hi {
+        let mid = lo + (hi - lo) / 2;
+        if (mid as f64) / base_rate_hz < duration_s {
+            lo = mid + 1;
+        } else {
+            hi = mid;
+        }
+    }
+    Ok(lo)
 }
 
 /// Canonicalise each scenario [`InputSeries`] channel to its project-symbol path
@@ -1252,7 +1308,8 @@ pub fn run_counterfactual(
     overrides: &[Override],
     cfg: &CounterfactualCfg,
 ) -> Result<Trace, EvalError> {
-    run_counterfactual_inner(loaded, log, overrides, cfg, None)
+    let mut budget = crate::budget::ExpansionBudget::default();
+    run_counterfactual_inner(loaded, log, overrides, cfg, None, &mut budget)
 }
 
 /// Replay a counterfactual run with a typed external hardware adapter.
@@ -1263,7 +1320,8 @@ pub fn run_counterfactual_with_adapter(
     cfg: &CounterfactualCfg,
     hardware: &mut dyn HardwareAdapter,
 ) -> Result<Trace, EvalError> {
-    run_counterfactual_inner(loaded, log, overrides, cfg, Some(hardware))
+    let mut budget = crate::budget::ExpansionBudget::default();
+    run_counterfactual_inner(loaded, log, overrides, cfg, Some(hardware), &mut budget)
 }
 
 fn run_counterfactual_inner(
@@ -1272,22 +1330,32 @@ fn run_counterfactual_inner(
     overrides: &[Override],
     cfg: &CounterfactualCfg,
     mut hardware: Option<&mut dyn HardwareAdapter>,
+    budget: &mut crate::budget::ExpansionBudget,
 ) -> Result<Trace, EvalError> {
-    if cfg.base_rate_hz <= 0.0 {
+    crate::syntax::validate_scripts(&loaded.scripts)?;
+    if !cfg.base_rate_hz.is_finite() || cfg.base_rate_hz <= 0.0 {
         return Err(EvalError::UnsupportedConstruct {
             kind: format!(
-                "counterfactual base_rate_hz must be positive, got {}",
+                "counterfactual base_rate_hz must be finite and positive, got {}",
                 cfg.base_rate_hz
             ),
             at: 0,
         });
     }
     let base_rate_hz = cfg.base_rate_hz;
+    if !cfg.duration_s.is_finite() || cfg.duration_s < 0.0 {
+        return Err(EvalError::UnsupportedConstruct {
+            kind: "counterfactual duration_s must be finite and non-negative".into(),
+            at: 0,
+        });
+    }
     let duration_s = if cfg.duration_s > 0.0 {
         cfg.duration_s
     } else {
         log.duration_s()
     };
+
+    let ticks = tick_count(duration_s, base_rate_hz)?;
 
     // Build the downstream cone of the override channels: the only functions that
     // recompute. Fails loud when a (non-empty) override targets a channel no
@@ -1350,7 +1418,6 @@ fn run_counterfactual_inner(
         })
         .collect::<Result<_, EvalError>>()?;
 
-    let ticks = tick_count(duration_s, base_rate_hz);
     let mut env = Env::new();
     let mut state = StateStore::new();
     let mut trace = Trace::new();
@@ -1434,6 +1501,9 @@ fn run_counterfactual_inner(
                         },
                         serial: crate::expr::SerialRuntime::Shared(&mut serial),
                         can: crate::expr::CanRuntime::Shared(&mut can),
+                        budget: crate::budget::Budget::Shared(&mut *budget),
+                        source_origin: None,
+                        evaluation_depth: 0,
                     };
                     crate::expr::eval_with_runtime(&value_node, &mut ctx, &mut runtime)?
                 }
@@ -1485,6 +1555,9 @@ fn run_counterfactual_inner(
                 },
                 serial: crate::expr::SerialRuntime::Shared(&mut serial),
                 can: crate::expr::CanRuntime::Shared(&mut can),
+                budget: crate::budget::Budget::Shared(&mut *budget),
+                source_origin: None,
+                evaluation_depth: 0,
             };
             exec_script_with_runtime(&root, &mut ctx, &mut runtime)
                 .map_err(|e| e.in_script(&sched.script.name, Some(t)))?;
@@ -1583,14 +1656,44 @@ fn prepare_overrides(
                     value: value.clone(),
                 }),
                 Override::Expr { source, .. } => {
-                    let wrapped = format!("__cf__ = {source};\n");
+                    let wrapped = format!("__cf__ = {source}\n;\n");
                     // Validate at preparation time: a snippet that does not parse to
                     // an assignment with a value node fails loud now, not mid-run.
                     let cst = m1_core::parse(&wrapped);
+                    if let Some(diagnostic) = cst.syntax_diagnostics().first() {
+                        let start = diagnostic
+                            .byte_range
+                            .start
+                            .saturating_sub("__cf__ = ".len())
+                            .min(source.len());
+                        let end = diagnostic
+                            .byte_range
+                            .end
+                            .saturating_sub("__cf__ = ".len())
+                            .min(source.len());
+                        return Err(EvalError::UnsupportedConstruct {
+                            kind: format!(
+                                "syntax error in override {canon} at bytes {start}..{end}: {}",
+                                diagnostic.message
+                            ),
+                            at: start,
+                        });
+                    }
+                    crate::syntax::validate(&cst.root(), &format!("override {canon}")).map_err(
+                        |error| match error {
+                            EvalError::UnsupportedConstruct { kind, at } => {
+                                EvalError::UnsupportedConstruct {
+                                    kind,
+                                    at: at.saturating_sub("__cf__ = ".len()).min(source.len()),
+                                }
+                            }
+                            other => other,
+                        },
+                    )?;
                     if override_value_node(&cst).is_none() {
                         return Err(EvalError::UnsupportedConstruct {
                             kind: format!(
-                                "override expression {source:?} did not parse to an expression"
+                                "override {canon} must contain exactly one expression: {source:?}"
                             ),
                             at: 0,
                         });
@@ -1615,11 +1718,15 @@ fn prepare_overrides(
 /// a value (a fail-loud signal for the caller).
 fn override_value_node(cst: &m1_core::Cst) -> Option<m1_core::Node<'_>> {
     use m1_core::{Field, Kind};
-    cst.root()
-        .children()
-        .into_iter()
-        .find(|c| c.kind() == Kind::AssignmentStatement)
-        .and_then(|stmt| stmt.child_by_field(Field::Value))
+    let mut statements = cst
+        .root()
+        .child_nodes()
+        .filter(|node| !matches!(node.kind(), Kind::LineComment | Kind::BlockComment));
+    let statement = statements.next()?;
+    if statement.kind() != Kind::AssignmentStatement || statements.next().is_some() {
+        return None;
+    }
+    statement.child_by_field(Field::Value)
 }
 
 /// Topologically order `nodes` by the `edges` (`from` must precede `to`) using
@@ -1824,6 +1931,318 @@ const = "oops"
     fn trigger_fixture() -> Loaded {
         let dir = Path::new(env!("CARGO_MANIFEST_DIR")).join("tests/fixtures/triggers");
         load(&dir.join("Project.m1prj"), None).expect("trigger fixture loads")
+    }
+
+    #[test]
+    fn expansion_budget_spans_startup_functions_and_ticks() {
+        let mut loaded = multirate();
+        for script in &mut loaded.scripts {
+            script.cst = m1_core::parse("expand (i = 1 to 2) {}");
+        }
+        let mut scenario = Scenario::from_toml_str(
+            "mode = \"whole-project\"\nduration_s = 0.01\nbase_rate_hz = 100.0",
+        )
+        .unwrap();
+        let (plan, schedule) = build_whole_project_schedule(&loaded).unwrap();
+        assert_eq!(schedule.len(), 4);
+        assert_eq!(startup_schedule(&loaded, &scenario).len(), 1);
+        for (limit, succeeds) in [(9, false), (10, true)] {
+            let mut budget = crate::budget::ExpansionBudget {
+                iterations_left: limit,
+                ..Default::default()
+            };
+            let result = tick_loop(
+                &loaded,
+                &scenario,
+                &schedule,
+                100.0,
+                Some(&plan),
+                None,
+                &mut budget,
+            );
+            assert_eq!(result.is_ok(), succeeds, "{result:?}");
+            if let Err(error) = result {
+                assert!(error.to_string().contains("iteration budget"));
+            }
+        }
+        scenario.mode = RunMode::Function("MR.Fast Writer".into());
+        scenario.duration_s = 0.02;
+        let schedule = [ScheduledRated {
+            sched: resolve_function(&loaded, "MR.Fast Writer").unwrap(),
+            rate_hz: 100.0,
+        }];
+        for (limit, succeeds) in [(3, false), (4, true)] {
+            let mut budget = crate::budget::ExpansionBudget {
+                iterations_left: limit,
+                ..Default::default()
+            };
+            let result = tick_loop(
+                &loaded,
+                &scenario,
+                &schedule,
+                100.0,
+                None,
+                None,
+                &mut budget,
+            );
+            assert_eq!(result.is_ok(), succeeds, "{result:?}");
+        }
+    }
+
+    #[test]
+    fn expansion_budget_spans_counterfactual_overrides_and_inline_callees() {
+        let dir = Path::new(env!("CARGO_MANIFEST_DIR")).join("tests/fixtures/userfn");
+        let mut loaded = load(&dir.join("Project.m1prj"), None).unwrap();
+        for script in &mut loaded.scripts {
+            match script.name.as_str() {
+                "Caller.Update.m1scr" => {
+                    script.cst =
+                        m1_core::parse("expand (i = 1 to 1) { Output = Helper.Compute(Input); }")
+                }
+                "Helper.Compute.m1scr" => {
+                    script.cst = m1_core::parse("expand (j = 1 to 2) { Out = In.x * 2.0; }")
+                }
+                _ => {}
+            }
+        }
+        let log = Log::from_csv("time,Root.Caller.Input\n0,3\n0.01,3\n", "budget test").unwrap();
+        let overrides = [Override::parse("Root.Caller.Input=Helper.Compute(3.0)").unwrap()];
+        let cfg = CounterfactualCfg {
+            duration_s: 0.01,
+            base_rate_hz: 100.0,
+        };
+        for (limit, succeeds) in [(4, false), (5, true)] {
+            let mut budget = crate::budget::ExpansionBudget {
+                iterations_left: limit,
+                ..Default::default()
+            };
+            let result =
+                run_counterfactual_inner(&loaded, &log, &overrides, &cfg, None, &mut budget);
+            assert_eq!(result.is_ok(), succeeds, "{result:?}");
+            if let Err(error) = result {
+                assert!(error.to_string().contains("iteration budget"));
+            }
+        }
+    }
+
+    #[test]
+    fn expanded_callee_uses_its_own_source_and_restores_caller_mapping() {
+        let dir = Path::new(env!("CARGO_MANIFEST_DIR")).join("tests/fixtures/userfn");
+        let mut loaded = load(&dir.join("Project.m1prj"), None).unwrap();
+        let mut expected = BTreeSet::new();
+        for script in &mut loaded.scripts {
+            let source = match script.name.as_str() {
+                "Caller.Update.m1scr" => {
+                    "// é\nexpand (i = 9 to 10) { local X$(i) = i; Output = Helper.Compute(3.0); System.Ticks(); }"
+                }
+                "Helper.Compute.m1scr" => "expand (j = 1 to 1) { Out = Calculate.Max(In.x, 1.0); }",
+                _ => continue,
+            };
+            script.cst = m1_core::parse(source);
+            for node in script
+                .cst
+                .root()
+                .descendants()
+                .filter(|node| node.kind() == m1_core::Kind::CallExpression)
+            {
+                expected.insert((script.name.clone(), node.byte_range().start));
+            }
+        }
+        let scenario = Scenario::from_toml_str("mode = \"function\"\ntarget = \"Caller.Update\"\nduration_s = 0.01\nbase_rate_hz = 100.0").unwrap();
+        for _ in 0..2 {
+            let trace = run(&loaded, &scenario).unwrap();
+            assert_eq!(
+                trace.exprs.keys().cloned().collect::<BTreeSet<_>>(),
+                expected
+            );
+            assert_eq!(trace.channels["Root.Caller.Output"], [Value::m1_float(3.0)]);
+        }
+    }
+
+    #[test]
+    fn direct_loaded_sources_are_checked_before_analysis_or_execution() {
+        let mut loaded = mini();
+        let source = format!("Output = {}1.0{};", "(".repeat(2048), ")".repeat(2048));
+        loaded.scripts[0].cst = m1_core::parse(&source);
+        let report = crate::CoverageReport::analyse_loaded(&loaded);
+        assert!(
+            report
+                .unsupported
+                .iter()
+                .any(|item| item.name.contains("source nesting"))
+        );
+        let sets =
+            crate::summary::checked_io_sets(&loaded.scripts[0], &loaded.project, Some("Root.Demo"));
+        assert!(
+            sets.analysis_errors()
+                .any(|error| error.contains("source nesting"))
+        );
+        let scenario = Scenario::from_toml_str("mode = \"function\"\ntarget = \"Demo.Update\"\nduration_s = 0.01\nbase_rate_hz = 100.0").unwrap();
+        assert!(
+            run(&loaded, &scenario)
+                .unwrap_err()
+                .to_string()
+                .contains("source nesting")
+        );
+        assert!(
+            run_counterfactual(
+                &loaded,
+                &consistent_log(),
+                &[],
+                &CounterfactualCfg {
+                    duration_s: 0.01,
+                    base_rate_hz: 100.0
+                }
+            )
+            .unwrap_err()
+            .to_string()
+            .contains("source nesting")
+        );
+    }
+
+    #[test]
+    fn recursive_expanded_errors_restore_mapping_depth_and_locals() {
+        let dir = Path::new(env!("CARGO_MANIFEST_DIR")).join("tests/fixtures/userfn");
+        let mut loaded = load(&dir.join("Project.m1prj"), None).unwrap();
+        let source = format!(
+            "expand (i = 1 to 1) {{ {}{{ Out = Recur.Loop(In.n); }} }}",
+            "if (false) {} else ".repeat(100)
+        );
+        let script = loaded
+            .scripts
+            .iter_mut()
+            .find(|script| script.name == "Recur.Loop.m1scr")
+            .unwrap();
+        script.cst = m1_core::parse(&source);
+        let mut env = Env::new();
+        env.set_local("In.n", Value::m1_integer(1));
+        env.set_local("i", Value::m1_integer(99));
+        let mut state = StateStore::new();
+        let mut ctx = EvalCtx {
+            project: &loaded.project,
+            calib: &loaded.calib,
+            env: &mut env,
+            state: &mut state,
+            group: Some("Root.Recur"),
+            fn_symbol: Some("Root.Recur.Loop"),
+            script_name: "Recur.Loop.m1scr",
+            dt: 0.01,
+            scripts: &loaded.scripts,
+            signature_m1_types: Some(&loaded.signature_m1_types),
+            object_rules: Some(&loaded.object_rules),
+            depth: 0,
+            trace: None,
+        };
+        let mut runtime = EvalRuntime::from_public(0.01);
+        let root = m1_core::parse(&source);
+        let error = exec_script_with_runtime(&root.root(), &mut ctx, &mut runtime).unwrap_err();
+        assert!(error.to_string().contains("evaluation nesting"), "{error}");
+        assert!(error.to_string().contains("Recur.Loop.m1scr"));
+        assert_eq!(runtime.evaluation_depth, 0);
+        assert!(runtime.source_origin.is_none());
+        assert_eq!(env.get_local("i"), Some(&Value::m1_integer(99)));
+        assert_eq!(env.get_local("In.n"), Some(&Value::m1_integer(1)));
+    }
+
+    #[test]
+    fn recovered_syntax_and_trailing_statements_reject_overrides() {
+        let loaded = mini();
+        for source in [
+            "1.0; @@@",
+            "1.0; Output = 2.0",
+            "1.0;",
+            "1.0; {}",
+            "1.0; // swallowed suffix",
+        ] {
+            let overrides = [Override::Expr {
+                channel: "Root.Demo.Speed".into(),
+                source: source.into(),
+            }];
+            let error = match prepare_overrides(&overrides, &loaded, None, None) {
+                Ok(_) => panic!("accepted override {source:?}"),
+                Err(error) => error.to_string(),
+            };
+            assert!(
+                error.contains("override") && error.contains("Root.Demo.Speed"),
+                "{error}"
+            );
+        }
+        for source in [
+            "1.0",
+            "(1.0 + 2.0) /* comment */",
+            "1.0 / 0.0",
+            "1.0 // trailing comment",
+        ] {
+            let overrides = [Override::Expr {
+                channel: "Root.Demo.Speed".into(),
+                source: source.into(),
+            }];
+            assert!(
+                prepare_overrides(&overrides, &loaded, None, None).is_ok(),
+                "{source}"
+            );
+        }
+    }
+
+    #[test]
+    fn override_nesting_is_rejected_before_zero_tick_replay() {
+        let loaded = mini();
+        let log = Log::from_csv("time,Root.Demo.Speed\n0,1\n", "zero-duration").unwrap();
+        assert_eq!(log.duration_s(), 0.0);
+        let cfg = CounterfactualCfg {
+            duration_s: 0.0,
+            base_rate_hz: 100.0,
+        };
+        let valid = [Override::Expr {
+            channel: "Root.Demo.Speed".into(),
+            source: "1.0".into(),
+        }];
+        let trace = run_counterfactual(&loaded, &log, &valid, &cfg).unwrap();
+        assert!(trace.time.is_empty(), "the control must execute zero ticks");
+
+        let source = format!("true ? 1.0 : {}2.0{}", "(".repeat(32768), ")".repeat(32768));
+        let overrides = [Override::Expr {
+            channel: "Root.Demo.Speed".into(),
+            source,
+        }];
+        let error = run_counterfactual(&loaded, &log, &overrides, &cfg).unwrap_err();
+        assert!(error.to_string().contains("source nesting"), "{error}");
+        assert!(
+            error.to_string().contains("override Root.Demo.Speed"),
+            "{error}"
+        );
+        match error.root_cause() {
+            EvalError::UnsupportedConstruct { at, .. } => {
+                assert_eq!(*at, 1033, "depth diagnostics use user-source byte offsets");
+            }
+            other => panic!("expected a source-depth error, got {other:?}"),
+        }
+    }
+
+    #[test]
+    fn schedule_arithmetic_rejects_overflow() {
+        for rates in [[500.0, 200.0], [200.0, 500.0]] {
+            assert_eq!(lcm_rate_hz(rates), Some(1000.0));
+        }
+        assert_eq!(lcm_rate_hz([1_000_000.0]), Some(1_000_000.0));
+        assert_eq!(lcm_rate_hz([999_983.0, 999_979.0]), None);
+        for rate in [0.0, -1.0, f64::NAN, f64::INFINITY, 1e18] {
+            assert_eq!(lcm_rate_hz([500.0, rate]), None);
+            assert_eq!(lcm_rate_hz([rate, 500.0]), None);
+        }
+        let upper = u64::MAX as f64;
+        assert_eq!(millihertz(upper / 1000.0), None);
+        assert!(millihertz(upper.next_down() / 1000.0).is_some());
+        let huge = upper.next_down() / 1000.0;
+        assert_eq!(lcm_rate_hz([500.0, huge]), None);
+        assert_eq!(lcm_rate_hz([huge, 500.0]), None);
+        let divisor = exact_divisor(4_294_967.296, 0.001, None);
+        if usize::BITS >= 64 {
+            assert_eq!(divisor.unwrap() as u64, 1_u64 << 32);
+        } else {
+            assert!(divisor.is_err());
+        }
+        assert_eq!(millihertz(0.0001), None);
     }
 
     #[test]
@@ -2671,10 +3090,128 @@ const = 3.0
     }
 
     #[test]
+    fn scenario_rejects_non_finite_timing() {
+        for value in ["nan", "inf", "-inf"] {
+            for field in ["duration_s", "base_rate_hz"] {
+                let source = format!("mode = \"whole-project\"\n{field} = {value}\n");
+                assert!(Scenario::from_toml_str(&source).is_err(), "{source}");
+            }
+        }
+    }
+
+    #[test]
+    fn partial_tick_intervals_include_every_instant_before_end() {
+        let loaded = mini();
+        let log = consistent_log();
+        let cf = counterfactual();
+        for (duration, rate, count) in [
+            (0.01, 10.0, 1),
+            (0.14, 10.0, 2),
+            (0.3, 10.0, 3),
+            (0.07, 100.0, 7),
+            (0.1_f64.next_up(), 10.0, 2),
+            (0.1_f64.next_down(), 10.0, 1),
+        ] {
+            let source = format!(
+                r#"mode = "function"
+                target = "Demo.Update"
+                duration_s = {duration:?}
+                base_rate_hz = {rate:?}
+                [[inputs]]
+                channel = "Root.Demo.Speed"
+                const = 20.0"#
+            );
+            let scenario = Scenario::from_toml_str(&source).unwrap();
+            let expected: Vec<_> = (0..count).map(|i| i as f64 / rate).collect();
+            let trace = run(&loaded, &scenario).unwrap();
+            assert_eq!(trace.time, expected, "{duration} at {rate} Hz");
+            assert_eq!(trace.channels["Root.Demo.Output"].len(), count);
+            let cfg = CounterfactualCfg {
+                duration_s: duration,
+                base_rate_hz: rate,
+            };
+            let trace = run_counterfactual(&cf, &log, &[], &cfg).unwrap();
+            assert_eq!(trace.time, expected);
+        }
+    }
+
+    #[test]
+    fn tick_grid_bounds_and_float_boundaries() {
+        assert_eq!(tick_count(MAX_TICKS as f64, 1.0).unwrap(), MAX_TICKS);
+        assert!(tick_count(MAX_TICKS as f64 + 1.0, 1.0).is_err());
+        assert!(tick_count(f64::MAX, f64::MAX).is_err());
+        assert_eq!(tick_count(f64::from_bits(1), 1.0).unwrap(), 1);
+        for rate in [1.0, 3.0, 10.0, 100.0] {
+            for n in 1..100 {
+                let end = n as f64 / rate;
+                for duration in [end.next_down(), end, end.next_up()] {
+                    let expected = (0..=n + 1)
+                        .filter(|&i| (i as f64) / rate < duration)
+                        .count();
+                    assert_eq!(tick_count(duration, rate).unwrap(), expected);
+                }
+            }
+        }
+    }
+
+    #[test]
+    fn public_runners_reject_invalid_timing() {
+        struct NoCalls;
+        impl HardwareAdapter for NoCalls {
+            fn call(
+                &mut self,
+                _: &crate::hardware::HardwareCall,
+            ) -> Result<crate::hardware::AdapterReply, EvalError> {
+                panic!("invalid timing must fail before hardware calls")
+            }
+        }
+        let loaded = mini();
+        let log = consistent_log();
+        let mut scenario = Scenario::from_toml_str(
+            "mode = \"function\"\ntarget = \"Demo.Update\"\nduration_s = 0.1\nbase_rate_hz = 10.0",
+        )
+        .unwrap();
+        for duration in [-1.0, f64::NAN, f64::INFINITY, f64::NEG_INFINITY, f64::MAX] {
+            scenario.duration_s = duration;
+            assert!(run(&loaded, &scenario).is_err());
+            assert!(run_with_adapter(&loaded, &scenario, &mut NoCalls).is_err());
+            let cfg = CounterfactualCfg {
+                duration_s: duration,
+                base_rate_hz: 10.0,
+            };
+            assert!(run_counterfactual(&loaded, &log, &[], &cfg).is_err());
+            assert!(
+                run_counterfactual_with_adapter(&loaded, &log, &[], &cfg, &mut NoCalls).is_err()
+            );
+        }
+        scenario.duration_s = 0.1;
+        for rate in [-1.0, f64::NAN, f64::INFINITY, f64::NEG_INFINITY] {
+            scenario.base_rate_hz = rate;
+            for mode in [
+                RunMode::Function("Demo.Update".into()),
+                RunMode::Cone("Demo.Output".into()),
+                RunMode::WholeProject,
+            ] {
+                scenario.mode = mode;
+                assert!(run(&loaded, &scenario).is_err());
+                assert!(run_with_adapter(&loaded, &scenario, &mut NoCalls).is_err());
+            }
+            let cfg = CounterfactualCfg {
+                duration_s: 0.1,
+                base_rate_hz: rate,
+            };
+            assert!(run_counterfactual(&loaded, &log, &[], &cfg).is_err());
+            assert!(
+                run_counterfactual_with_adapter(&loaded, &log, &[], &cfg, &mut NoCalls).is_err()
+            );
+        }
+    }
+
+    #[test]
     fn tick_count_spans_half_open_interval() {
-        assert_eq!(tick_count(1.0, 100.0), 100);
-        assert_eq!(tick_count(0.5, 100.0), 50);
-        assert_eq!(tick_count(0.0, 100.0), 0);
+        assert_eq!(tick_count(1.0, 100.0).unwrap(), 100);
+        assert_eq!(tick_count(0.5, 100.0).unwrap(), 50);
+        assert_eq!(tick_count(0.0, 100.0).unwrap(), 0);
     }
 
     #[test]

@@ -55,9 +55,38 @@ until compared with captured M1 output. See the
 [README maturity contract](../README.md#maturity-contract) for the evidence
 labels and current status of each evaluator area.
 
+Loading rejects syntax errors in any discovered script, including scripts that
+the selected run would skip. Direct evaluation also checks the supplied subtree
+before execution. Counterfactual expression overrides must parse completely as
+one expression; recovered or trailing statements are rejected before replay.
+
 ## Scenario file
 
 The primary format is TOML; JSON of the same shape is also accepted.
+Durations and rates must be finite. Runs include each grid instant in
+`[0, duration_s)`, including tick zero for any positive duration. An offline
+run is limited to 1,000,000 base ticks and rejects larger requests before
+execution or trace allocation. This is an evaluator resource limit, not an
+M1 language limit. Channel count and script cost still affect memory and runtime.
+
+Expansion also has a run-wide budget of 100,000 loop-body iterations and 8 MiB
+of generated source. Startup, periodic functions, nested calls and
+counterfactual overrides share that budget. Direct expression or statement API
+calls each start a fresh budget. Oversized ranges fail before allocation, and
+generated text is charged before it is copied or parsed. These limits bound
+expansion work, not total process memory.
+
+Source trees are limited to 1,024 nested nodes. Active evaluation has a separate
+128-node limit because execution uses larger stack frames than source analysis.
+Active evaluation counts across inline function calls and expanded bodies, so
+combining recursion with nested expressions cannot bypass the limit. Coverage
+and schedule analysis reject over-deep source before recursive traversal.
+
+Expanded calls retain their original script byte offsets for traces and exact
+hardware overrides. Repeated iterations of one template occurrence share the
+evaluator's existing source-site state and last-recorded trace value per tick.
+Independent state per expanded instance has not been verified against M1
+execution; these tests do not establish that behavior.
 
 ```toml
 mode = "function"            # "function", "cone", or "whole-project"

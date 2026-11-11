@@ -217,6 +217,8 @@ pub(crate) fn call_with_runtime(
         .trace
         .as_deref()
         .and_then(|trace| trace.time.last().copied());
+    // The callee's CST uses its own original offsets, even for same-script recursion.
+    let caller_origin = runtime.source_origin.take();
     let exec_result = {
         let mut callee_ctx = EvalCtx {
             project: ctx.project,
@@ -236,6 +238,8 @@ pub(crate) fn call_with_runtime(
         exec_script_with_runtime(&callee_root, &mut callee_ctx, runtime)
             .map_err(|e| e.in_script(&callee_script_name, t))
     };
+
+    runtime.source_origin = caller_origin;
 
     // 4. Read the return value (the `Out` slot), then 5. restore the caller frame.
     let return_value = ctx.env.get_out().cloned();
@@ -349,9 +353,34 @@ mod tests {
                 hardware,
                 serial: crate::expr::SerialRuntime::fresh(),
                 can: crate::expr::CanRuntime::fresh(),
+                budget: crate::budget::Budget::default(),
+                source_origin: None,
+                evaluation_depth: 0,
             };
             call_with_runtime(callee, args, &mut ctx, &mut runtime)
         }
+    }
+
+    #[test]
+    fn recovered_syntax_in_callee_retains_its_context() {
+        let mut h = Harness::new();
+        let script = h
+            .loaded
+            .scripts
+            .iter_mut()
+            .find(|script| script.name == "Helper.Compute.m1scr")
+            .unwrap();
+        script.cst = m1_core::parse("Out = 7.0; @@@");
+        h.env.set_out(Value::m1_float(9.0));
+        let error = h
+            .call("Root.Helper.Compute", &[Value::m1_float(3.0)])
+            .unwrap_err()
+            .to_string();
+        assert!(
+            error.contains("syntax error") && error.contains("Helper.Compute.m1scr"),
+            "{error}"
+        );
+        assert_eq!(h.env.get_out(), Some(&Value::m1_float(9.0)));
     }
 
     #[test]
@@ -550,9 +579,9 @@ mod tests {
         );
         match err.root_cause() {
             EvalError::UnsupportedConstruct { kind, .. } => {
-                assert!(
-                    kind.contains("recursive"),
-                    "expected a recursion error, got {kind:?}"
+                assert_eq!(
+                    kind, "evaluation nesting exceeds 128 levels in Recur.Loop.m1scr",
+                    "the cumulative node guard must stop this call cycle first"
                 );
             }
             other => panic!("expected fail-loud recursion error, got {other:?}"),

@@ -412,6 +412,28 @@ mod tests {
     }
 
     #[test]
+    fn invalid_duration_fails_before_startup_hardware_calls() {
+        let engine = hardware_engine();
+        let mut scenario = Scenario::from_toml_str(
+            "mode = \"whole-project\"\nduration_s = 0.0\nbase_rate_hz = 100.0\n",
+        )
+        .unwrap();
+        let mut adapter = MetadataAdapter::default();
+        for duration in [f64::NAN, f64::INFINITY, -1.0, 10_000.0_f64.next_up()] {
+            scenario.duration_s = duration;
+            assert!(engine.run_with_adapter(&scenario, &mut adapter).is_err());
+            assert!(adapter.calls.is_empty());
+        }
+        scenario.duration_s = 0.0;
+        let trace = engine.run_with_adapter(&scenario, &mut adapter).unwrap();
+        assert!(trace.time.is_empty());
+        assert!(!adapter.calls.is_empty());
+        assert!(adapter.calls.iter().all(|call| {
+            call.site.script() == "Hardware.Init.m1scr" && call.time.phase == EvalPhase::Startup
+        }));
+    }
+
+    #[test]
     fn startup_hardware_calls_receive_startup_time_and_keep_provenance() {
         let engine = hardware_engine();
         let scenario = Scenario::from_toml_str(

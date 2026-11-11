@@ -94,6 +94,35 @@ pub(crate) struct EvalRuntime<'h> {
     pub(crate) hardware: Option<&'h mut dyn HardwareAdapter>,
     pub(crate) serial: SerialRuntime<'h>,
     pub(crate) can: CanRuntime<'h>,
+    pub(crate) budget: crate::budget::Budget<'h>,
+    pub(crate) source_origin: Option<Vec<usize>>,
+    pub(crate) evaluation_depth: usize,
+}
+
+// Runtime frames are larger than source-analysis frames. Keep this separate
+// from the core tree-depth limit; constrained-child tests cover a 2 MiB stack.
+const MAX_EVALUATION_DEPTH: usize = 128;
+
+impl EvalRuntime<'_> {
+    pub(crate) fn enter_node(&mut self, script: &str, at: usize) -> Result<(), EvalError> {
+        if self.evaluation_depth >= MAX_EVALUATION_DEPTH {
+            return Err(EvalError::UnsupportedConstruct {
+                kind: format!(
+                    "evaluation nesting exceeds {} levels in {script}",
+                    MAX_EVALUATION_DEPTH
+                ),
+                at: self.source_offset(at),
+            });
+        }
+        self.evaluation_depth += 1;
+        Ok(())
+    }
+
+    pub(crate) fn source_offset(&self, offset: usize) -> usize {
+        self.source_origin
+            .as_ref()
+            .map_or(offset, |origin| origin[offset])
+    }
 }
 
 /// A direct evaluator call owns an empty CAN adapter, while a runner borrows
@@ -160,12 +189,16 @@ impl EvalRuntime<'static> {
             hardware: None,
             serial: SerialRuntime::fresh(),
             can: CanRuntime::fresh(),
+            budget: crate::budget::Budget::default(),
+            source_origin: None,
+            evaluation_depth: 0,
         }
     }
 }
 
 /// Evaluate an expression node to a [`Value`].
 pub fn eval(node: &Node, ctx: &mut EvalCtx) -> Result<Value, EvalError> {
+    crate::syntax::validate(node, ctx.script_name)?;
     let mut runtime = EvalRuntime::from_public(ctx.dt);
     eval_with_runtime(node, ctx, &mut runtime)
 }
@@ -176,6 +209,7 @@ pub fn eval(node: &Node, ctx: &mut EvalCtx) -> Result<Value, EvalError> {
 /// across calls outside [`crate::runner`]. The long-standing [`eval`] wrapper
 /// remains source-compatible and represents periodic tick zero.
 pub fn eval_at_time(node: &Node, ctx: &mut EvalCtx, time: EvalTime) -> Result<Value, EvalError> {
+    crate::syntax::validate(node, ctx.script_name)?;
     let mut runtime = EvalRuntime::from_time(time);
     eval_with_runtime(node, ctx, &mut runtime)
 }
@@ -187,7 +221,8 @@ pub(crate) fn eval_with_runtime(
     ctx: &mut EvalCtx,
     runtime: &mut EvalRuntime<'_>,
 ) -> Result<Value, EvalError> {
-    match node.kind() {
+    runtime.enter_node(ctx.script_name, node.byte_range().start)?;
+    let result = match node.kind() {
         Kind::Number => eval_number(node),
         Kind::Boolean | Kind::True | Kind::False => eval_boolean(node),
         Kind::String => Ok(Value::Str(strip_quotes(node.text()).to_string())),
@@ -202,7 +237,9 @@ pub(crate) fn eval_with_runtime(
             kind: format!("{other:?}"),
             at: node.byte_range().start,
         }),
-    }
+    };
+    runtime.evaluation_depth -= 1;
+    result
 }
 
 /// Parse a `Number` literal into the right numeric [`Value`] variant, using the
@@ -1373,7 +1410,10 @@ fn eval_call(
 
     // The call site keys stateful operator state across ticks (M6): the script
     // name plus the byte offset of the whole call node.
-    let site = CallSite::of(ctx.script_name, node);
+    let site = CallSite::new(
+        ctx.script_name,
+        runtime.source_offset(node.byte_range().start),
+    );
 
     // Evaluate the arguments left to right.
     let mut args = Vec::new();
@@ -1520,6 +1560,32 @@ mod tests {
     }
 
     // ---- Task 8: literals, identifiers, parentheses ----
+
+    #[test]
+    fn recovered_syntax_in_untaken_expression_branch_is_rejected() {
+        let cst = parse("x = true ? 1 : (2 + );");
+        let expression = cst
+            .root()
+            .descendants()
+            .find(|node| node.kind() == Kind::TernaryExpression)
+            .unwrap();
+        assert!(
+            expression
+                .descendants()
+                .any(|node| node.is_error() || node.is_missing())
+        );
+        let mut h = Harness::new();
+        for result in [
+            eval(&expression, &mut h.ctx()),
+            eval_at_time(&expression, &mut h.ctx(), EvalTime::at_start(0.01)),
+        ] {
+            let error = result.unwrap_err().to_string();
+            assert!(
+                error.contains("syntax error") && error.contains("Demo.Update.m1scr"),
+                "{error}"
+            );
+        }
+    }
 
     #[test]
     fn number_literals_pick_the_right_variant() {

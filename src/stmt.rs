@@ -41,6 +41,7 @@ use m1_typecheck::types::declared_local_type;
 
 /// Execute one statement node, applying its effect to `ctx`.
 pub fn exec(node: &Node, ctx: &mut EvalCtx) -> Result<(), EvalError> {
+    crate::syntax::validate(node, ctx.script_name)?;
     let mut runtime = EvalRuntime::from_public(ctx.dt);
     exec_with_runtime(node, ctx, &mut runtime)
 }
@@ -54,6 +55,7 @@ pub fn exec_at_time(
     ctx: &mut EvalCtx,
     time: crate::hardware::EvalTime,
 ) -> Result<(), EvalError> {
+    crate::syntax::validate(node, ctx.script_name)?;
     let mut runtime = EvalRuntime::from_time(time);
     exec_with_runtime(node, ctx, &mut runtime)
 }
@@ -63,7 +65,8 @@ pub(crate) fn exec_with_runtime(
     ctx: &mut EvalCtx,
     runtime: &mut EvalRuntime<'_>,
 ) -> Result<(), EvalError> {
-    match node.kind() {
+    runtime.enter_node(ctx.script_name, node.byte_range().start)?;
+    let result = match node.kind() {
         Kind::AssignmentStatement => exec_assignment(node, ctx, runtime),
         Kind::ExpressionStatement => exec_expression_statement(node, ctx, runtime),
         Kind::LocalDeclaration => exec_local_declaration(node, ctx, runtime),
@@ -80,7 +83,9 @@ pub(crate) fn exec_with_runtime(
             kind: format!("statement {other:?}"),
             at: node.byte_range().start,
         }),
-    }
+    };
+    runtime.evaluation_depth -= 1;
+    result
 }
 
 /// Walk a `SourceFile` root, executing each top-level statement in source order.
@@ -108,6 +113,7 @@ pub(crate) fn exec_script_with_runtime(
     ctx: &mut EvalCtx,
     runtime: &mut EvalRuntime<'_>,
 ) -> Result<(), EvalError> {
+    crate::syntax::validate(root, ctx.script_name)?;
     for child in root.children() {
         if is_statement(child.kind()) {
             exec_with_runtime(&child, ctx, runtime)?;
@@ -472,8 +478,9 @@ fn exec_if(node: &Node, ctx: &mut EvalCtx, runtime: &mut EvalRuntime<'_>) -> Res
         // IfStatement (`else if … { … }`). Execute whichever it carries.
         for child in else_clause.children() {
             match child.kind() {
-                Kind::Block => return exec_block(&child, ctx, runtime),
-                Kind::IfStatement => return exec_if(&child, ctx, runtime),
+                Kind::Block | Kind::IfStatement => {
+                    return exec_with_runtime(&child, ctx, runtime);
+                }
                 _ => {}
             }
         }
@@ -618,34 +625,32 @@ fn exec_expand(
     let start = expand_bound(&eval_with_runtime(&start_node, ctx, runtime)?)?;
     let end = expand_bound(&eval_with_runtime(&end_node, ctx, runtime)?)?;
 
-    // The body source, with `$(VAR)` placeholders, taken verbatim from the CST.
-    let body_src = body.text().to_string();
-
-    // The expand range is inclusive of both ends (the manual's `Start to End`).
-    // Walk it in whichever direction the bounds imply so descending loops work.
-    let range: Vec<i32> = if start <= end {
-        (start..=end).collect()
-    } else {
-        (end..=start).rev().collect()
-    };
+    let at = runtime.source_offset(node.byte_range().start);
+    let count = u64::from(start.abs_diff(end)) + 1;
+    runtime
+        .budget
+        .as_mut()
+        .iterations(count, ctx.script_name, at)?;
+    let step = if start <= end { 1_i64 } else { -1_i64 };
 
     // Preserve any existing local that shadows the loop-variable name so we can
     // restore it after the loop (the loop variable is scoped to the expand body).
     let saved = ctx.env.get_local(&var_name).cloned();
 
-    for i in range {
-        // The loop variable is an integer local for the body: a bare `i` reads it,
-        // while `$(i)` splices its value textually into identifiers/paths
-        // (`Out$(i)` → `Out1`). Bind the local, then substitute the placeholders.
-        ctx.env.set_local(var_name.clone(), Value::m1_integer(i));
-        let substituted = substitute_interpolation(&body_src, &var_name, i);
-        // Re-parse the substituted block and execute its statements. The block is
-        // a `{ … }`; parsing it as a standalone source yields a `Block` (or a
-        // SourceFile wrapping one), whose statements we run.
-        let cst = m1_core::parse(&substituted);
-        let root = cst.root();
-        exec_expanded_root(&root, ctx, runtime)?;
-    }
+    let result = (|| {
+        for index in 0..count {
+            let i = (i64::from(start) + step * index as i64) as i32;
+            let (substituted, origin) =
+                substitute_interpolation(&body, &var_name, i, ctx.script_name, at, runtime)?;
+            ctx.env.set_local(var_name.clone(), Value::m1_integer(i));
+            let cst = m1_core::parse(&substituted);
+            let saved_origin = runtime.source_origin.replace(origin);
+            let result = exec_expanded_root(&cst.root(), ctx, runtime);
+            runtime.source_origin = saved_origin;
+            result?;
+        }
+        Ok(())
+    })();
 
     // Restore the prior local binding (or clear the loop var if there was none).
     match saved {
@@ -654,7 +659,7 @@ fn exec_expand(
             ctx.env.locals.remove(&var_name);
         }
     }
-    Ok(())
+    result
 }
 
 /// Execute the statements of a re-parsed expand-body. The re-parsed source is a
@@ -666,9 +671,9 @@ fn exec_expanded_root(
     ctx: &mut EvalCtx,
     runtime: &mut EvalRuntime<'_>,
 ) -> Result<(), EvalError> {
+    crate::syntax::validate_mapped(root, ctx.script_name, runtime.source_origin.as_deref())?;
     for child in root.children() {
         match child.kind() {
-            Kind::Block => exec_block(&child, ctx, runtime)?,
             k if is_statement(k) => exec_with_runtime(&child, ctx, runtime)?,
             _ => {}
         }
@@ -680,9 +685,42 @@ fn exec_expanded_root(
 /// M1's expand interpolation splices the loop value into identifiers/paths
 /// (`Output$(i)` → `Output1`), so we replace the exact `$(VAR)` token text. Only
 /// the named loop variable is substituted; other `$(...)` are left untouched.
-fn substitute_interpolation(src: &str, var: &str, value: i32) -> String {
+fn substitute_interpolation(
+    body: &Node,
+    var: &str,
+    value: i32,
+    script: &str,
+    at: usize,
+    runtime: &mut EvalRuntime<'_>,
+) -> Result<(String, Vec<usize>), EvalError> {
+    let src = body.text();
     let needle = format!("$({var})");
-    src.replace(&needle, &value.to_string())
+    let replacement = value.to_string();
+    let count = src.matches(&needle).count();
+    let length = count
+        .checked_mul(needle.len())
+        .and_then(|removed| src.len().checked_sub(removed))
+        .and_then(|remaining| count.checked_mul(replacement.len())?.checked_add(remaining));
+    runtime.budget.as_mut().source_bytes(length, script, at)?;
+    let length = length.expect("the source budget rejects length overflow");
+    let mut output = String::with_capacity(length);
+    let mut origin = Vec::with_capacity(length + 1);
+    let base = body.byte_range().start;
+    let mut previous = 0;
+    for (offset, matched) in src.match_indices(&needle) {
+        output.push_str(&src[previous..offset]);
+        origin.extend((previous..offset).map(|i| runtime.source_offset(base + i)));
+        output.push_str(&replacement);
+        origin.extend(std::iter::repeat_n(
+            runtime.source_offset(base + offset),
+            replacement.len(),
+        ));
+        previous = offset + matched.len();
+    }
+    output.push_str(&src[previous..]);
+    // Include the final byte boundary for missing-token and end-of-range diagnostics.
+    origin.extend((previous..=src.len()).map(|i| runtime.source_offset(base + i)));
+    Ok((output, origin))
 }
 
 fn expand_bound(value: &Value) -> Result<i32, EvalError> {
@@ -1114,7 +1152,131 @@ mod tests {
         );
     }
 
+    #[test]
+    fn expanded_calls_keep_distinct_original_source_sites() {
+        let src = "expand (i = 1 to 1) {\n Output = Integral.Normal(1.0, -1000.0, 1000.0, false, 0.0);\n}\nexpand (j = 1 to 1) {\n Speed  = Integral.Normal(1.0, -1000.0, 1000.0, false, 0.0);\n}";
+        let cst = parse(src);
+        let expected: Vec<_> = cst
+            .root()
+            .descendants()
+            .filter(|n| n.kind() == Kind::CallExpression)
+            .map(|n| ("Demo.Update.m1scr".to_string(), n.byte_range().start))
+            .collect();
+        let mut h = Harness::new();
+        for tick in 0..3 {
+            h.trace.push_tick(tick as f64 * 0.01);
+            h.run(src).unwrap();
+            assert_eq!(h.env.get("Root.Demo.Output"), h.env.get("Root.Demo.Speed"));
+        }
+        assert_eq!(h.trace.exprs.keys().cloned().collect::<Vec<_>>(), expected);
+    }
+
     // ---- Task 21: local / static local ----
+
+    #[test]
+    fn expand_restores_loop_local_on_error() {
+        let mut h = Harness::new();
+        h.env.set_local("i", Value::m1_integer(99));
+        assert!(h.run("expand (i = 1 to 1) { Output = Missing; }").is_err());
+        assert_eq!(h.env.get_local("i"), Some(&Value::m1_integer(99)));
+    }
+
+    #[test]
+    fn expansion_budgets_cover_siblings_nested_loops_and_cleanup() {
+        for source in [
+            "expand (i = 1 to 2) {} expand (j = 1 to 2) {}",
+            "expand (i = 1 to 2) { expand (j = 1 to 1) {} }",
+        ] {
+            for (limit, succeeds) in [(3, false), (4, true)] {
+                let mut h = Harness::new();
+                h.env.set_local("i", Value::m1_integer(99));
+                h.env.set_local("j", Value::m1_integer(88));
+                let mut runtime = EvalRuntime::from_public(0.01);
+                runtime.budget.as_mut().iterations_left = limit;
+                let cst = parse(source);
+                let result = exec_script_with_runtime(&cst.root(), &mut h.ctx(), &mut runtime);
+                assert_eq!(result.is_ok(), succeeds, "{source}: {result:?}");
+                if let Err(error) = result {
+                    assert!(error.to_string().contains("iteration budget"));
+                }
+                assert_eq!(h.env.get_local("i"), Some(&Value::m1_integer(99)));
+                assert_eq!(h.env.get_local("j"), Some(&Value::m1_integer(88)));
+                assert!(runtime.source_origin.is_none());
+            }
+        }
+    }
+
+    #[test]
+    fn expansion_source_bytes_are_charged_before_allocating_or_executing() {
+        let source = "expand (i = 9 to 10) { local X$(i) = i; }";
+        let total = "{ local X9 = i; }".len() + "{ local X10 = i; }".len();
+        for (limit, succeeds) in [(total - 1, false), (total, true)] {
+            let mut h = Harness::new();
+            let mut runtime = EvalRuntime::from_public(0.01);
+            runtime.budget.as_mut().bytes_left = limit;
+            let cst = parse(source);
+            let result = exec_script_with_runtime(&cst.root(), &mut h.ctx(), &mut runtime);
+            assert_eq!(result.is_ok(), succeeds);
+            if let Err(error) = result {
+                assert!(error.to_string().contains("generated-source budget"));
+            }
+            assert_eq!(h.env.get_local("X9"), Some(&Value::m1_integer(9)));
+            assert_eq!(h.env.get_local("X10").is_some(), succeeds);
+            assert!(h.env.get_local("i").is_none());
+            assert!(runtime.source_origin.is_none());
+        }
+    }
+
+    #[test]
+    fn expanded_nested_calls_keep_byte_offsets_after_substitution() {
+        for (start, end) in [(9, 10), (10, 9), (2147483647, 2147483647)] {
+            let source = format!(
+                "// é🚘\nexpand (i = {start} to {end}) {{ local X$(i) = i; expand (j = 1 to 1) {{ Output = System.Ticks(); }} }}"
+            );
+            let cst = parse(&source);
+            let call = cst
+                .root()
+                .descendants()
+                .find(|n| n.kind() == Kind::CallExpression)
+                .unwrap();
+            let site = crate::CallSite::of("Demo.Update.m1scr", &call);
+            let mut h = Harness::new();
+            h.env
+                .set_io_override("System.Ticks", Value::m1_unsigned(99));
+            h.env
+                .set_io_override_at("System.Ticks", site.clone(), Value::m1_unsigned(42));
+            h.trace.push_tick(0.0);
+            h.run(&source).unwrap();
+            assert_eq!(h.env.get("Root.Demo.Output"), Some(&Value::m1_float(42.0)));
+            assert_eq!(
+                h.trace.exprs.keys().cloned().collect::<Vec<_>>(),
+                vec![(site.0.clone(), site.1)]
+            );
+            assert!(h.trace.hardware.iter().all(|record| record.site == site
+                && record.source == crate::HardwareValueSource::ScenarioExact));
+        }
+    }
+
+    #[test]
+    fn expanded_syntax_error_maps_to_original_source_and_restores_state() {
+        let source = "// é\nexpand (i = -1 to -1) { local X$(i) = 1; }";
+        let cst = parse(source);
+        assert!(cst.syntax_diagnostics().is_empty());
+        let mut h = Harness::new();
+        h.env.set_local("i", Value::m1_integer(99));
+        let mut runtime = EvalRuntime::from_public(0.01);
+        let error = exec_script_with_runtime(&cst.root(), &mut h.ctx(), &mut runtime).unwrap_err();
+        let EvalError::UnsupportedConstruct { at, kind } = error else {
+            panic!("{error:?}")
+        };
+        assert!(kind.contains("syntax error"));
+        assert!(
+            at >= source.find('{').unwrap() && at <= source.len(),
+            "{at}: {kind}"
+        );
+        assert!(runtime.source_origin.is_none());
+        assert_eq!(h.env.get_local("i"), Some(&Value::m1_integer(99)));
+    }
 
     #[test]
     fn local_declaration_initialises() {
@@ -1200,6 +1362,92 @@ mod tests {
     }
 
     // ---- Task 22: whole-script execution ----
+
+    #[test]
+    fn recovered_syntax_rejected_before_direct_execution() {
+        for source in [
+            "Output = 1.0; @@@",
+            "Output = 1.0; if (false) { @@@ }",
+            "Output = 1.0; local <Integer> = 1;",
+            "Output = 1.0",
+        ] {
+            for entry in 0..4 {
+                let source = if entry < 2 {
+                    source.to_string()
+                } else {
+                    format!("{{ {source} }}")
+                };
+                let cst = parse(&source);
+                assert!(!cst.syntax_diagnostics().is_empty());
+                let root = cst.root();
+                let mut h = Harness::new();
+                h.env.set("Root.Demo.Output", Value::m1_float(7.0));
+                let result = match entry {
+                    0 => exec_script(&root, &mut h.ctx()),
+                    1 => exec_script_at_time(&root, &mut h.ctx(), crate::EvalTime::at_start(0.01)),
+                    _ => {
+                        let block = root
+                            .child_nodes()
+                            .find(|n| n.kind() == Kind::Block)
+                            .unwrap();
+                        if entry == 2 {
+                            exec(&block, &mut h.ctx())
+                        } else {
+                            exec_at_time(&block, &mut h.ctx(), crate::EvalTime::at_start(0.01))
+                        }
+                    }
+                };
+                let error = result
+                    .expect_err("recovered syntax must not execute")
+                    .to_string();
+                assert!(
+                    error.contains("syntax error") && error.contains("Demo.Update.m1scr"),
+                    "{error}"
+                );
+                assert_eq!(h.env.get("Root.Demo.Output"), Some(&Value::m1_float(7.0)));
+            }
+        }
+    }
+
+    #[test]
+    fn recovered_syntax_rejected_before_startup_calls() {
+        struct NoCalls;
+        impl crate::HardwareAdapter for NoCalls {
+            fn call(&mut self, _: &crate::HardwareCall) -> Result<crate::AdapterReply, EvalError> {
+                panic!("syntax must be checked before a hardware call")
+            }
+        }
+        let cst = parse("System.Ticks(); @@@");
+        let mut h = Harness::new();
+        let mut adapter = NoCalls;
+        let mut runtime = EvalRuntime {
+            time: crate::EvalTime::startup(0.01),
+            hardware: Some(&mut adapter),
+            serial: crate::expr::SerialRuntime::fresh(),
+            can: crate::expr::CanRuntime::fresh(),
+            budget: crate::budget::Budget::default(),
+            source_origin: None,
+            evaluation_depth: 0,
+        };
+        assert!(exec_script_with_runtime(&cst.root(), &mut h.ctx(), &mut runtime).is_err());
+    }
+
+    #[test]
+    fn recovered_syntax_rejected_in_expanded_root() {
+        let cst = parse("{ Output = 1.0; @@@ }");
+        let mut h = Harness::new();
+        let mut runtime = EvalRuntime::from_public(0.01);
+        assert!(exec_expanded_root(&cst.root(), &mut h.ctx(), &mut runtime).is_err());
+        assert_eq!(h.env.get("Root.Demo.Output"), None);
+    }
+
+    #[test]
+    fn syntax_preflight_accepts_comments_blocks_and_empty_statements() {
+        let cst = parse("// comment\n; { /* comment */ Output = 1.0; ; } ;");
+        let mut h = Harness::new();
+        exec_script(&cst.root(), &mut h.ctx()).unwrap();
+        assert_eq!(h.env.get("Root.Demo.Output"), Some(&Value::m1_float(1.0)));
+    }
 
     #[test]
     fn exec_script_runs_the_fixture_end_to_end() {

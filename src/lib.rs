@@ -44,6 +44,8 @@ pub use trace::{
 
 pub use m1_can::{CanDbcSource, CanFrameFormat, CanRuntimeModel, runtime_model_loaded};
 
+mod budget;
+mod syntax;
 mod virtual_can;
 mod virtual_serial;
 

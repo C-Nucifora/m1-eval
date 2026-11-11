@@ -84,6 +84,8 @@ impl DerefMut for CheckedIoSets {
 /// `group` is the enclosing group's canonical path (for group-relative name
 /// resolution); the function symbol the script backs is looked up from the
 /// project by the script's file name, so `In.*` references canonicalise too.
+/// Invalid or over-deep source yields empty sets; schedule planning reports the
+/// associated analysis error instead of using an incomplete dependency graph.
 pub fn io_sets(script: &ParsedScript, project: &Project, group: Option<&str>) -> IoSets {
     checked_io_sets(script, project, group).sets
 }
@@ -93,6 +95,11 @@ pub(crate) fn checked_io_sets(
     project: &Project,
     group: Option<&str>,
 ) -> CheckedIoSets {
+    if let Err(error) = crate::syntax::validate(&script.cst.root(), &script.name) {
+        let mut sets = CheckedIoSets::default();
+        sets.analysis_errors.insert(error.to_string());
+        return sets;
+    }
     let fn_symbol = project.function_symbol_for_script(&script.name);
     let mut walker = Walker {
         project,

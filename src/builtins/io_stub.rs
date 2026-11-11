@@ -652,6 +652,9 @@ mod tests {
                 hardware,
                 serial: crate::expr::SerialRuntime::fresh(),
                 can: crate::expr::CanRuntime::fresh(),
+                budget: crate::budget::Budget::default(),
+                source_origin: None,
+                evaluation_depth: 0,
             };
             crate::builtins::dispatch_with_runtime(
                 object,

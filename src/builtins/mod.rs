@@ -1552,6 +1552,9 @@ mod tests {
                 hardware: Some(adapter),
                 serial: crate::expr::SerialRuntime::fresh(),
                 can: crate::expr::CanRuntime::fresh(),
+                budget: crate::budget::Budget::default(),
+                source_origin: None,
+                evaluation_depth: 0,
             };
             dispatch_with_runtime(object, method, args, site, &mut ctx, &mut runtime)
         }
@@ -2522,6 +2525,9 @@ mod tests {
                 hardware,
                 serial: crate::expr::SerialRuntime::fresh(),
                 can: crate::expr::CanRuntime::fresh(),
+                budget: crate::budget::Budget::default(),
+                source_origin: None,
+                evaluation_depth: 0,
             };
             dispatch_with_runtime(object, method, args, site, &mut ctx, &mut runtime)
         }
