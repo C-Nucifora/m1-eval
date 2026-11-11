@@ -22,7 +22,7 @@ use crate::value::M1ScalarKind;
 use m1_can::{CanDbcSource, CanRuntimeModel, runtime_model_loaded};
 use m1_typecheck::Project;
 use m1_typecheck::parsed::{ParsedScript, parse_all};
-use std::collections::HashMap;
+use std::collections::{HashMap, HashSet};
 use std::path::{Path, PathBuf};
 
 /// Exact numeric storage families declared by project function signatures.
@@ -233,6 +233,32 @@ fn collect_extension_paths(
     extension: &str,
     out: &mut Vec<PathBuf>,
 ) -> Result<(), EvalError> {
+    collect_extension_paths_rec(dir, extension, out, &mut HashSet::new())
+}
+
+fn collect_extension_paths_rec(
+    dir: &Path,
+    extension: &str,
+    out: &mut Vec<PathBuf>,
+    ancestors: &mut HashSet<PathBuf>,
+) -> Result<(), EvalError> {
+    let canonical =
+        std::fs::canonicalize(dir).map_err(|error| EvalError::UnsupportedConstruct {
+            kind: format!(
+                "cannot resolve project directory {}: {error}",
+                dir.display()
+            ),
+            at: 0,
+        })?;
+    if !ancestors.insert(canonical.clone()) {
+        return Err(EvalError::UnsupportedConstruct {
+            kind: format!(
+                "directory cycle while discovering project files at {}",
+                dir.display()
+            ),
+            at: 0,
+        });
+    }
     let entries = std::fs::read_dir(dir).map_err(|error| EvalError::UnsupportedConstruct {
         kind: format!("cannot read project directory {}: {error}", dir.display()),
         at: 0,
@@ -246,15 +272,17 @@ fn collect_extension_paths(
             at: 0,
         })?;
         let path = entry.path();
-        let file_type = entry
-            .file_type()
-            .map_err(|error| EvalError::UnsupportedConstruct {
+        // Follow linked scripts and source directories just like ordinary files.
+        // Canonical ancestor paths above reject directory cycles without
+        // discarding distinct project-relative names for the same directory.
+        let metadata =
+            std::fs::metadata(&path).map_err(|error| EvalError::UnsupportedConstruct {
                 kind: format!("cannot inspect project path {}: {error}", path.display()),
                 at: 0,
             })?;
-        if file_type.is_dir() {
-            collect_extension_paths(&path, extension, out)?;
-        } else if file_type.is_file()
+        if metadata.is_dir() {
+            collect_extension_paths_rec(&path, extension, out, ancestors)?;
+        } else if metadata.is_file()
             && path
                 .extension()
                 .and_then(|value| value.to_str())
@@ -263,6 +291,7 @@ fn collect_extension_paths(
             out.push(path);
         }
     }
+    ancestors.remove(&canonical);
     Ok(())
 }
 
@@ -391,6 +420,65 @@ mod tests {
 
     fn virtual_can_dir() -> std::path::PathBuf {
         std::path::Path::new(env!("CARGO_MANIFEST_DIR")).join("tests/fixtures/virtual_can")
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn loads_scripts_through_file_and_directory_symlinks() {
+        use std::os::unix::fs::symlink;
+
+        for link_directory in [false, true] {
+            let temp = tempfile::tempdir().unwrap();
+            let project_dir = temp.path().join("project");
+            let external = temp.path().join("external");
+            std::fs::create_dir_all(&project_dir).unwrap();
+            std::fs::create_dir_all(&external).unwrap();
+            let project = project_dir.join("Project.m1prj");
+            std::fs::copy(mini_dir().join("Project.m1prj"), &project).unwrap();
+            let script = external.join("Demo.Update.m1scr");
+            std::fs::copy(mini_dir().join("Scripts/Demo.Update.m1scr"), &script).unwrap();
+            if link_directory {
+                symlink(&external, project_dir.join("Scripts")).unwrap();
+            } else {
+                symlink(&script, project_dir.join("Demo.Update.m1scr")).unwrap();
+            }
+
+            let loaded = load(&project, None).expect("linked project script should load");
+            assert_eq!(loaded.scripts.len(), 1);
+            assert_eq!(loaded.scripts[0].name, "Demo.Update.m1scr");
+            assert_eq!(
+                loaded.scripts[0].cst.source(),
+                std::fs::read_to_string(&script).unwrap()
+            );
+        }
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn rejects_directory_symlink_cycles_with_the_link_path() {
+        let temp = tempfile::tempdir().unwrap();
+        let scripts = temp.path().join("Scripts");
+        std::fs::create_dir(&scripts).unwrap();
+        let link = scripts.join("loop");
+        std::os::unix::fs::symlink(temp.path(), &link).unwrap();
+
+        let error = collect_scripts(temp.path()).expect_err("directory cycle must fail");
+        let message = error.to_string();
+        assert!(message.contains("directory cycle"), "{message}");
+        assert!(message.contains(link.to_str().unwrap()), "{message}");
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn rejects_dangling_script_symlinks_with_the_link_path() {
+        let temp = tempfile::tempdir().unwrap();
+        let link = temp.path().join("Demo.Update.m1scr");
+        std::os::unix::fs::symlink(temp.path().join("missing.m1scr"), &link).unwrap();
+
+        let error = collect_scripts(temp.path()).expect_err("unreadable script link must fail");
+        let message = error.to_string();
+        assert!(message.contains("cannot inspect project path"), "{message}");
+        assert!(message.contains(link.to_str().unwrap()), "{message}");
     }
 
     #[test]
