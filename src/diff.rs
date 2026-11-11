@@ -41,10 +41,10 @@ pub struct ChannelDiff {
     /// The maximum absolute delta over the grid (0.0 for an empty grid),
     /// over the ticks where both sides are finite.
     pub max_abs_delta: f64,
-    /// Ticks where exactly one side is non-finite (finite↔NaN/±Inf) — the most
-    /// alarming kind of divergence, counted rather than silently dropped.
+    /// Unequal pairs involving a non-finite value. NaN matches NaN; infinities
+    /// match only when they have the same sign.
     pub non_finite_mismatches: usize,
-    /// Whether `max_abs_delta` exceeds the diff's `eps` OR any finite↔non-finite
+    /// Whether `max_abs_delta` exceeds the diff's `eps` or a non-finite
     /// mismatch occurred.
     pub changed: bool,
 }
@@ -87,7 +87,7 @@ impl Diff {
 
     /// Compare a counterfactual `trace` against the logged ground truth `log` over
     /// `trace.time`, flagging a channel `changed` when its maximum absolute delta
-    /// exceeds `eps`.
+    /// exceeds `eps` or a non-finite mismatch occurs.
     ///
     /// A channel is included only when it appears in the trace as a fully-numeric
     /// column AND a matching log series exists (matched by exact path, the
@@ -138,7 +138,10 @@ impl Diff {
             let n = logged.len().min(counterfactual.len());
             let delta: Vec<f64> = (0..n).map(|i| counterfactual[i] - logged[i]).collect();
             let non_finite_mismatches = (0..n)
-                .filter(|&i| logged[i].is_finite() != counterfactual[i].is_finite())
+                .filter(|&i| {
+                    let (a, b) = (logged[i], counterfactual[i]);
+                    (!a.is_finite() || !b.is_finite()) && !(a == b || (a.is_nan() && b.is_nan()))
+                })
                 .count();
             let max_abs_delta = delta
                 .iter()
@@ -173,7 +176,7 @@ impl Diff {
     }
 
     /// The channel paths whose counterfactual value diverged from the log by more
-    /// than `eps` (sorted). Empty for a no-op override — the load-bearing invariant.
+    /// than `eps` or has a non-finite mismatch (sorted). Empty for a no-op override.
     pub fn changed_channels(&self) -> Vec<&str> {
         self.channels
             .iter()
@@ -458,6 +461,40 @@ mod tests {
         let trace = trace_with(&[("Root.CF.Sensor", &[3.0])], &[0.0]);
         let diff = Diff::between(&log, &trace);
         assert_eq!(diff.channels["Root.CF.Sensor"].delta, vec![2.0]);
+    }
+
+    #[test]
+    fn non_finite_categories_are_compared() {
+        for (a, b, changed) in [
+            (f32::INFINITY, f32::NEG_INFINITY, true),
+            (f32::INFINITY, f32::NAN, true),
+            (f32::NEG_INFINITY, f32::NAN, true),
+            (f32::INFINITY, f32::INFINITY, false),
+            (f32::NEG_INFINITY, f32::NEG_INFINITY, false),
+            (f32::NAN, f32::NAN, false),
+            (1.0, f32::INFINITY, true),
+            (1.0, f32::NAN, true),
+            (0.0, -0.0, false),
+        ] {
+            for (logged, actual) in [(a, b), (b, a)] {
+                let log = Log {
+                    channels: vec![InputSeries {
+                        channel: "Value".into(),
+                        kind: InputKind::Const(Value::m1_float(logged)),
+                    }],
+                    meta: crate::log::LogMeta::default(),
+                };
+                let trace = trace_with(&[("Value", &[actual as f64])], &[0.0]);
+                let diff = Diff::between(&log, &trace);
+                let value = &diff.channels["Value"];
+                assert_eq!(value.changed, changed, "{logged:?} -> {actual:?}");
+                assert_eq!(value.non_finite_mismatches, usize::from(changed));
+                assert_eq!(!diff.changed_channels().is_empty(), changed);
+                let json: serde_json::Value = serde_json::from_str(&diff.to_json()).unwrap();
+                assert_eq!(json["channels"]["Value"]["changed"], changed);
+                assert_eq!(diff.to_csv().lines().count(), 2);
+            }
+        }
     }
 
     #[test]
