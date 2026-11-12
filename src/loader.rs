@@ -22,7 +22,7 @@ use crate::value::M1ScalarKind;
 use m1_can::{CanDbcSource, CanRuntimeModel, runtime_model_loaded};
 use m1_typecheck::Project;
 use m1_typecheck::parsed::{ParsedScript, parse_all};
-use std::collections::HashMap;
+use std::collections::{HashMap, HashSet};
 use std::path::{Path, PathBuf};
 
 /// Exact numeric storage families declared by project function signatures.
@@ -111,11 +111,22 @@ pub fn load(project_path: &Path, cfg_path: Option<&Path>) -> Result<Loaded, Eval
 
     // Discover scripts relative to the project file's directory (mirrors m1-doc).
     let project_dir = project_path.parent().unwrap_or_else(|| Path::new("."));
-    let pairs = collect_scripts(project_dir);
+    let pairs = collect_scripts(project_dir)?;
 
     // Parse each discovered script exactly once; the CSTs are shared with the
     // return-type inference pass and reused by the evaluator each tick.
     let scripts = parse_all(&pairs);
+    for script in &scripts {
+        if let Some(diagnostic) = script.cst.syntax_diagnostics().first() {
+            return Err(EvalError::UnsupportedConstruct {
+                kind: format!(
+                    "script {:?} has invalid syntax: {}",
+                    script.name, diagnostic.message
+                ),
+                at: diagnostic.byte_range.start,
+            });
+        }
+    }
 
     // Infer user-function return types from the script bodies before the
     // evaluator runs, so call sites and `Out =` reads see concrete types.
@@ -222,6 +233,32 @@ fn collect_extension_paths(
     extension: &str,
     out: &mut Vec<PathBuf>,
 ) -> Result<(), EvalError> {
+    collect_extension_paths_rec(dir, extension, out, &mut HashSet::new())
+}
+
+fn collect_extension_paths_rec(
+    dir: &Path,
+    extension: &str,
+    out: &mut Vec<PathBuf>,
+    ancestors: &mut HashSet<PathBuf>,
+) -> Result<(), EvalError> {
+    let canonical =
+        std::fs::canonicalize(dir).map_err(|error| EvalError::UnsupportedConstruct {
+            kind: format!(
+                "cannot resolve project directory {}: {error}",
+                dir.display()
+            ),
+            at: 0,
+        })?;
+    if !ancestors.insert(canonical.clone()) {
+        return Err(EvalError::UnsupportedConstruct {
+            kind: format!(
+                "directory cycle while discovering project files at {}",
+                dir.display()
+            ),
+            at: 0,
+        });
+    }
     let entries = std::fs::read_dir(dir).map_err(|error| EvalError::UnsupportedConstruct {
         kind: format!("cannot read project directory {}: {error}", dir.display()),
         at: 0,
@@ -235,15 +272,17 @@ fn collect_extension_paths(
             at: 0,
         })?;
         let path = entry.path();
-        let file_type = entry
-            .file_type()
-            .map_err(|error| EvalError::UnsupportedConstruct {
+        // Follow linked scripts and source directories just like ordinary files.
+        // Canonical ancestor paths above reject directory cycles without
+        // discarding distinct project-relative names for the same directory.
+        let metadata =
+            std::fs::metadata(&path).map_err(|error| EvalError::UnsupportedConstruct {
                 kind: format!("cannot inspect project path {}: {error}", path.display()),
                 at: 0,
             })?;
-        if file_type.is_dir() {
-            collect_extension_paths(&path, extension, out)?;
-        } else if file_type.is_file()
+        if metadata.is_dir() {
+            collect_extension_paths_rec(&path, extension, out, ancestors)?;
+        } else if metadata.is_file()
             && path
                 .extension()
                 .and_then(|value| value.to_str())
@@ -252,6 +291,7 @@ fn collect_extension_paths(
             out.push(path);
         }
     }
+    ancestors.remove(&canonical);
     Ok(())
 }
 
@@ -329,36 +369,43 @@ fn load_err(e: m1_typecheck::project::LoadError) -> EvalError {
 
 /// Collect every `.m1scr` under `dir` (recursively) as `(basename, source)`
 /// pairs. Sources are lossy-UTF-8 decoded. Mirrors `m1-doc/src/loader.rs`.
-fn collect_scripts(dir: &Path) -> Vec<(String, String)> {
+fn collect_scripts(dir: &Path) -> Result<Vec<(String, String)>, EvalError> {
+    let mut paths = Vec::new();
+    collect_extension_paths(dir, "m1scr", &mut paths)?;
+    paths.sort();
+    let mut names = HashMap::new();
     let mut out = Vec::new();
-    collect_scripts_rec(dir, &mut out);
-    // Deterministic order: sort by basename so the tick loop and traces are
-    // reproducible regardless of filesystem enumeration order.
-    out.sort_by(|a, b| a.0.cmp(&b.0));
-    out
-}
-
-fn collect_scripts_rec(dir: &Path, out: &mut Vec<(String, String)>) {
-    let Ok(entries) = std::fs::read_dir(dir) else {
-        return;
-    };
-    for entry in entries.flatten() {
-        let path = entry.path();
-        if path.is_dir() {
-            collect_scripts_rec(&path, out);
-        } else if path.extension().and_then(|e| e.to_str()) == Some("m1scr") {
-            let Some(name) = path
-                .file_name()
-                .and_then(|n| n.to_str())
-                .map(str::to_string)
-            else {
-                continue;
-            };
-            let bytes = std::fs::read(&path).unwrap_or_default();
-            let source = String::from_utf8_lossy(&bytes).into_owned();
-            out.push((name, source));
+    for path in paths {
+        // Preserve the script extension rule used by conformance manifests.
+        if path.extension().and_then(|extension| extension.to_str()) != Some("m1scr") {
+            continue;
         }
+        let name = path
+            .file_name()
+            .and_then(|name| name.to_str())
+            .ok_or_else(|| EvalError::UnsupportedConstruct {
+                kind: format!("script path {} is not valid UTF-8", path.display()),
+                at: 0,
+            })?
+            .to_string();
+        if let Some(first) = names.insert(name.clone(), path.clone()) {
+            return Err(EvalError::UnsupportedConstruct {
+                kind: format!(
+                    "duplicate script basename {name:?}: {} and {}",
+                    first.display(),
+                    path.display()
+                ),
+                at: 0,
+            });
+        }
+        let bytes = std::fs::read(&path).map_err(|error| EvalError::UnsupportedConstruct {
+            kind: format!("cannot read script {}: {error}", path.display()),
+            at: 0,
+        })?;
+        out.push((name, String::from_utf8_lossy(&bytes).into_owned()));
     }
+    out.sort_by(|a, b| a.0.cmp(&b.0));
+    Ok(out)
 }
 
 #[cfg(test)]
@@ -373,6 +420,65 @@ mod tests {
 
     fn virtual_can_dir() -> std::path::PathBuf {
         std::path::Path::new(env!("CARGO_MANIFEST_DIR")).join("tests/fixtures/virtual_can")
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn loads_scripts_through_file_and_directory_symlinks() {
+        use std::os::unix::fs::symlink;
+
+        for link_directory in [false, true] {
+            let temp = tempfile::tempdir().unwrap();
+            let project_dir = temp.path().join("project");
+            let external = temp.path().join("external");
+            std::fs::create_dir_all(&project_dir).unwrap();
+            std::fs::create_dir_all(&external).unwrap();
+            let project = project_dir.join("Project.m1prj");
+            std::fs::copy(mini_dir().join("Project.m1prj"), &project).unwrap();
+            let script = external.join("Demo.Update.m1scr");
+            std::fs::copy(mini_dir().join("Scripts/Demo.Update.m1scr"), &script).unwrap();
+            if link_directory {
+                symlink(&external, project_dir.join("Scripts")).unwrap();
+            } else {
+                symlink(&script, project_dir.join("Demo.Update.m1scr")).unwrap();
+            }
+
+            let loaded = load(&project, None).expect("linked project script should load");
+            assert_eq!(loaded.scripts.len(), 1);
+            assert_eq!(loaded.scripts[0].name, "Demo.Update.m1scr");
+            assert_eq!(
+                loaded.scripts[0].cst.source(),
+                std::fs::read_to_string(&script).unwrap()
+            );
+        }
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn rejects_directory_symlink_cycles_with_the_link_path() {
+        let temp = tempfile::tempdir().unwrap();
+        let scripts = temp.path().join("Scripts");
+        std::fs::create_dir(&scripts).unwrap();
+        let link = scripts.join("loop");
+        std::os::unix::fs::symlink(temp.path(), &link).unwrap();
+
+        let error = collect_scripts(temp.path()).expect_err("directory cycle must fail");
+        let message = error.to_string();
+        assert!(message.contains("directory cycle"), "{message}");
+        assert!(message.contains(link.to_str().unwrap()), "{message}");
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn rejects_dangling_script_symlinks_with_the_link_path() {
+        let temp = tempfile::tempdir().unwrap();
+        let link = temp.path().join("Demo.Update.m1scr");
+        std::os::unix::fs::symlink(temp.path().join("missing.m1scr"), &link).unwrap();
+
+        let error = collect_scripts(temp.path()).expect_err("unreadable script link must fail");
+        let message = error.to_string();
+        assert!(message.contains("cannot inspect project path"), "{message}");
+        assert!(message.contains(link.to_str().unwrap()), "{message}");
     }
 
     #[test]

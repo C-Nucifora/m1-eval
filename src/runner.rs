@@ -139,12 +139,12 @@ fn run_inner(
 /// `base_rate_hz` is required (the scenario parser already enforces this; this is
 /// a defensive belt-and-braces check).
 fn require_base_rate(scenario: &Scenario) -> Result<f64, EvalError> {
-    if scenario.base_rate_hz > 0.0 {
+    if scenario.base_rate_hz.is_finite() && scenario.base_rate_hz > 0.0 {
         Ok(scenario.base_rate_hz)
     } else {
         Err(EvalError::UnsupportedConstruct {
             kind: format!(
-                "base_rate_hz must be positive, got {}",
+                "base_rate_hz must be finite and positive, got {}",
                 scenario.base_rate_hz
             ),
             at: 0,
@@ -160,8 +160,8 @@ fn require_base_rate(scenario: &Scenario) -> Result<f64, EvalError> {
 /// yield a 1000 Hz base, never a rounded 2.5-tick period. An empty schedule
 /// with no pinned base has no rate to derive — fail loud.
 fn resolve_base_rate(scenario: &Scenario, schedule: &[ScheduledRated]) -> Result<f64, EvalError> {
-    if scenario.base_rate_hz > 0.0 {
-        return Ok(scenario.base_rate_hz);
+    if scenario.base_rate_hz != 0.0 {
+        return require_base_rate(scenario);
     }
     if schedule.is_empty() {
         return Err(EvalError::UnsupportedConstruct {
@@ -447,6 +447,7 @@ fn tick_loop(
     schedule_plan: Option<&SchedulePlan>,
     mut hardware: Option<&mut dyn HardwareAdapter>,
 ) -> Result<Trace, EvalError> {
+    validate_tick_grid(scenario.duration_s, base_rate_hz)?;
     let ticks = tick_count(scenario.duration_s, base_rate_hz);
 
     // Precompute each function's rate divisor (how many base ticks between runs)
@@ -912,6 +913,25 @@ fn hold_trace_channels(env: &Env, trace: &mut Trace) {
     }
 }
 
+fn validate_tick_grid(duration_s: f64, base_rate_hz: f64) -> Result<(), EvalError> {
+    let ticks = duration_s * base_rate_hz;
+    if !duration_s.is_finite()
+        || duration_s < 0.0
+        || !base_rate_hz.is_finite()
+        || base_rate_hz <= 0.0
+        || !ticks.is_finite()
+        || ticks.round() >= usize::MAX as f64
+    {
+        return Err(EvalError::UnsupportedConstruct {
+            kind: format!(
+                "invalid tick grid: duration_s={duration_s}, base_rate_hz={base_rate_hz}"
+            ),
+            at: 0,
+        });
+    }
+    Ok(())
+}
+
 /// The number of ticks spanning `[0, duration_s)` at `base_rate_hz`. A
 /// half-second run at 100 Hz is 50 ticks (t = 0.00 .. 0.49). Rounds the product
 /// to the nearest integer first to absorb float error (e.g. `0.5 * 100`), so a
@@ -1273,11 +1293,20 @@ fn run_counterfactual_inner(
     cfg: &CounterfactualCfg,
     mut hardware: Option<&mut dyn HardwareAdapter>,
 ) -> Result<Trace, EvalError> {
-    if cfg.base_rate_hz <= 0.0 {
+    if !cfg.base_rate_hz.is_finite() || cfg.base_rate_hz <= 0.0 {
         return Err(EvalError::UnsupportedConstruct {
             kind: format!(
-                "counterfactual base_rate_hz must be positive, got {}",
+                "counterfactual base_rate_hz must be finite and positive, got {}",
                 cfg.base_rate_hz
+            ),
+            at: 0,
+        });
+    }
+    if !cfg.duration_s.is_finite() || cfg.duration_s < 0.0 {
+        return Err(EvalError::UnsupportedConstruct {
+            kind: format!(
+                "counterfactual duration_s must be finite and non-negative, got {}",
+                cfg.duration_s
             ),
             at: 0,
         });
@@ -1350,6 +1379,7 @@ fn run_counterfactual_inner(
         })
         .collect::<Result<_, EvalError>>()?;
 
+    validate_tick_grid(duration_s, base_rate_hz)?;
     let ticks = tick_count(duration_s, base_rate_hz);
     let mut env = Env::new();
     let mut state = StateStore::new();
