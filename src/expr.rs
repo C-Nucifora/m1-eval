@@ -206,7 +206,7 @@ pub(crate) fn eval_with_runtime(
 }
 
 /// Parse a `Number` literal into the right numeric [`Value`] variant, using the
-/// language's own literal-typing rule so `0xFF`/`7u` are unsigned, `2.5`/`1e3`
+/// language's own literal-typing rule so `0xFF`/`7u` are unsigned, `2.5`/`1.0e3`
 /// floats, and `7` an integer.
 fn eval_number(node: &Node) -> Result<Value, EvalError> {
     let text = node.text().trim();
@@ -1528,7 +1528,7 @@ mod tests {
         assert_eq!(rhs_value("7", &mut h).unwrap(), Value::m1_integer(7));
         assert_eq!(rhs_value("0xFF", &mut h).unwrap(), Value::m1_unsigned(255));
         assert_eq!(rhs_value("10u", &mut h).unwrap(), Value::m1_unsigned(10));
-        assert_eq!(rhs_value("1e3", &mut h).unwrap(), Value::m1_float(1000.0));
+        assert_eq!(rhs_value("1.0e3", &mut h).unwrap(), Value::m1_float(1000.0));
     }
 
     #[test]
@@ -1849,9 +1849,13 @@ mod tests {
             rhs_value("16777216.0 + 1.0", &mut h).unwrap(),
             Value::m1_float(16_777_216.0)
         );
-        assert_eq!(rhs_value("1e-50", &mut h).unwrap(), Value::m1_float(0.0));
-        assert!(rhs_value("1e39", &mut h).is_err());
-        assert!(rhs_value("1e9999", &mut h).is_err());
+        assert_eq!(rhs_value("1.0e-50", &mut h).unwrap(), Value::m1_float(0.0));
+        for literal in ["1.0e39", "1.0e9999"] {
+            assert!(matches!(
+                rhs_value(literal, &mut h),
+                Err(EvalError::TypeError { .. })
+            ));
+        }
     }
 
     #[test]
