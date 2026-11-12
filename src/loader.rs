@@ -2,8 +2,8 @@
 //! Project + calibration loader.
 //!
 //! Mirrors the discovery/loading pattern in `m1-doc/src/loader.rs`: recursively
-//! collect every `*.m1scr` under the project directory as `(basename, source)`
-//! pairs, build the `m1-typecheck` [`Project`], infer user-function return types
+//! discover `*.m1scr` under the project directory and select the project's
+//! declared filenames, build the `m1-typecheck` [`Project`], infer return types
 //! from the script bodies, then read the calibration *values* from the optional
 //! `.m1cfg`.
 //!
@@ -22,7 +22,8 @@ use crate::value::M1ScalarKind;
 use m1_can::{CanDbcSource, CanRuntimeModel, runtime_model_loaded};
 use m1_typecheck::Project;
 use m1_typecheck::parsed::{ParsedScript, parse_all};
-use std::collections::HashMap;
+use m1_typecheck::symbols::SymbolKind;
+use std::collections::{BTreeSet, HashMap};
 use std::path::{Path, PathBuf};
 
 /// Exact numeric storage families declared by project function signatures.
@@ -66,7 +67,7 @@ impl SignatureM1Types {
 pub struct Loaded {
     /// The `m1-typecheck` project (symbols + resolution model).
     pub project: Project,
-    /// Every discovered `*.m1scr`, parsed once (name + owned CST).
+    /// Project-selected scripts, parsed once (project filename + owned CST).
     pub scripts: Vec<ParsedScript>,
     /// Exact DBC layout and bus bindings built from the same project, parsed
     /// scripts, and caller-owned `.m1dbc` byte snapshot as this load.
@@ -97,8 +98,8 @@ pub struct Loaded {
 /// types) and once into our [`Calibration`] value reader (for the actual
 /// numbers).
 ///
-/// Fails loud: any `m1-typecheck` `LoadError` or `.m1cfg` read/parse error is
-/// mapped onto an [`EvalError`] rather than swallowed.
+/// Fails loud: project, script discovery/read, and `.m1cfg` read/parse errors
+/// are mapped onto an [`EvalError`] rather than swallowed.
 pub fn load(project_path: &Path, cfg_path: Option<&Path>) -> Result<Loaded, EvalError> {
     let mut project = Project::load(project_path).map_err(load_err)?;
 
@@ -111,7 +112,8 @@ pub fn load(project_path: &Path, cfg_path: Option<&Path>) -> Result<Loaded, Eval
 
     // Discover scripts relative to the project file's directory (mirrors m1-doc).
     let project_dir = project_path.parent().unwrap_or_else(|| Path::new("."));
-    let pairs = collect_scripts(project_dir);
+    let sources = collect_scripts(project_dir)?;
+    let pairs = select_scripts(&project, project_dir, &sources)?;
 
     // Parse each discovered script exactly once; the CSTs are shared with the
     // return-type inference pass and reused by the evaluator each tick.
@@ -328,38 +330,113 @@ fn load_err(e: m1_typecheck::project::LoadError) -> EvalError {
     }
 }
 
-/// Collect every `.m1scr` under `dir` (recursively) as `(basename, source)`
-/// pairs. Sources are lossy-UTF-8 decoded. Mirrors `m1-doc/src/loader.rs`.
-fn collect_scripts(dir: &Path) -> Vec<(String, String)> {
+/// Collect physical script paths and decoded source without losing identity.
+fn collect_scripts(dir: &Path) -> Result<Vec<(PathBuf, String)>, EvalError> {
     let mut out = Vec::new();
-    collect_scripts_rec(dir, &mut out);
-    // Deterministic order: sort by basename so the tick loop and traces are
-    // reproducible regardless of filesystem enumeration order.
+    collect_scripts_rec(dir, &mut out)?;
+    // Stable paths also make ambiguity errors independent of directory order.
     out.sort_by(|a, b| a.0.cmp(&b.0));
-    out
+    Ok(out)
 }
 
-fn collect_scripts_rec(dir: &Path, out: &mut Vec<(String, String)>) {
-    let Ok(entries) = std::fs::read_dir(dir) else {
-        return;
-    };
-    for entry in entries.flatten() {
-        let path = entry.path();
-        if path.is_dir() {
-            collect_scripts_rec(&path, out);
-        } else if path.extension().and_then(|e| e.to_str()) == Some("m1scr") {
-            let Some(name) = path
-                .file_name()
-                .and_then(|n| n.to_str())
-                .map(str::to_string)
-            else {
-                continue;
-            };
-            let bytes = std::fs::read(&path).unwrap_or_default();
-            let source = String::from_utf8_lossy(&bytes).into_owned();
-            out.push((name, source));
+/// Preserve the project's key for function lookup, inference and CAN bindings.
+fn select_scripts(
+    project: &Project,
+    dir: &Path,
+    sources: &[(PathBuf, String)],
+) -> Result<Vec<(String, String)>, EvalError> {
+    let names: BTreeSet<String> = project
+        .symbols()
+        .iter()
+        .filter(|symbol| matches!(symbol.kind, SymbolKind::Function | SymbolKind::Method))
+        .filter_map(|symbol| {
+            symbol.filename.clone().or_else(|| {
+                symbol
+                    .path
+                    .strip_prefix("Root.")
+                    .map(|stem| format!("{stem}.m1scr"))
+            })
+        })
+        .collect();
+    let mut pairs = Vec::new();
+    let mut selected_paths = BTreeSet::new();
+    for name in names {
+        if project.function_symbol_for_script(&name).is_none() {
+            continue;
+        }
+        let relative = dir.join(name.replace('\\', "/"));
+        let matches: Vec<_> = sources
+            .iter()
+            .filter(|(path, _)| {
+                if name.contains(['/', '\\']) {
+                    *path == relative
+                } else {
+                    path.file_name().and_then(|part| part.to_str()) == Some(name.as_str())
+                }
+            })
+            .collect();
+        if matches.len() > 1 {
+            return Err(EvalError::UnsupportedConstruct {
+                kind: format!(
+                    "ambiguous script {name}: {}",
+                    matches
+                        .iter()
+                        .map(|(path, _)| path.display().to_string())
+                        .collect::<Vec<_>>()
+                        .join(", ")
+                ),
+                at: 0,
+            });
+        }
+        if let Some((path, source)) = matches.first() {
+            selected_paths.insert(path.clone());
+            pairs.push((name, source.clone()));
         }
     }
+    // Unselected files still participate in the existing syntax preflight.
+    let unused: Vec<_> = sources
+        .iter()
+        .filter(|(path, _)| !selected_paths.contains(path))
+        .map(|(path, source)| (path.display().to_string(), source.clone()))
+        .collect();
+    crate::syntax::validate_scripts(&parse_all(&unused))?;
+    Ok(pairs)
+}
+
+fn collect_scripts_rec(dir: &Path, out: &mut Vec<(PathBuf, String)>) -> Result<(), EvalError> {
+    let entries = std::fs::read_dir(dir).map_err(|error| EvalError::UnsupportedConstruct {
+        kind: format!("cannot read project directory {}: {error}", dir.display()),
+        at: 0,
+    })?;
+    for entry in entries {
+        let entry = entry.map_err(|error| EvalError::UnsupportedConstruct {
+            kind: format!(
+                "cannot enumerate project directory {}: {error}",
+                dir.display()
+            ),
+            at: 0,
+        })?;
+        let path = entry.path();
+        let metadata =
+            std::fs::metadata(&path).map_err(|error| EvalError::UnsupportedConstruct {
+                kind: format!("cannot inspect project path {}: {error}", path.display()),
+                at: 0,
+            })?;
+        if metadata.is_dir() {
+            collect_scripts_rec(&path, out)?;
+        } else if path.extension().and_then(|e| e.to_str()) == Some("m1scr") {
+            let Some(_) = path.file_name().and_then(|n| n.to_str()) else {
+                continue;
+            };
+            let bytes = std::fs::read(&path).map_err(|error| EvalError::UnsupportedConstruct {
+                kind: format!("cannot read script {}: {error}", path.display()),
+                at: 0,
+            })?;
+            let source = String::from_utf8_lossy(&bytes).into_owned();
+            out.push((path, source));
+        }
+    }
+    Ok(())
 }
 
 #[cfg(test)]
@@ -374,6 +451,95 @@ mod tests {
 
     fn virtual_can_dir() -> std::path::PathBuf {
         std::path::Path::new(env!("CARGO_MANIFEST_DIR")).join("tests/fixtures/virtual_can")
+    }
+
+    #[test]
+    fn script_discovery_reports_missing_and_non_directory_paths() {
+        let temp = tempfile::tempdir().unwrap();
+        let file = temp.path().join("not-a-directory");
+        std::fs::write(&file, "").unwrap();
+        for path in [temp.path().join("missing"), file] {
+            let error = collect_scripts(&path).expect_err("discovery must fail");
+            let message = error.to_string();
+            assert!(
+                message.contains("cannot read project directory"),
+                "{message}"
+            );
+            assert!(message.contains(path.to_str().unwrap()), "{message}");
+        }
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn failed_script_read_rejects_loading_with_its_path() {
+        let temp = tempfile::tempdir().unwrap();
+        let project = temp.path().join("Project.m1prj");
+        std::fs::copy(mini_dir().join("Project.m1prj"), &project).unwrap();
+        let script = temp.path().join("Demo.Update.m1scr");
+        // A socket has metadata but cannot be read as source, even as root.
+        let _socket = std::os::unix::net::UnixListener::bind(&script).unwrap();
+        let error = match load(&project, None) {
+            Ok(_) => panic!("failed script reads must reject loading"),
+            Err(error) => error.to_string(),
+        };
+        assert!(error.contains("cannot read script"), "{error}");
+        assert!(error.contains(script.to_str().unwrap()), "{error}");
+    }
+
+    #[test]
+    fn readable_empty_script_loads_as_empty_source() {
+        let temp = tempfile::tempdir().unwrap();
+        let project = temp.path().join("Project.m1prj");
+        std::fs::copy(mini_dir().join("Project.m1prj"), &project).unwrap();
+        std::fs::write(temp.path().join("Demo.Update.m1scr"), "").unwrap();
+        let loaded = load(&project, None).expect("readable empty scripts are valid");
+        assert_eq!(loaded.scripts.len(), 1);
+        assert_eq!(loaded.scripts[0].name, "Demo.Update.m1scr");
+        assert_eq!(loaded.scripts[0].cst.source(), "");
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn loads_scripts_through_readable_file_and_directory_symlinks() {
+        use std::os::unix::fs::symlink;
+
+        for link_directory in [false, true] {
+            let temp = tempfile::tempdir().unwrap();
+            let project_dir = temp.path().join("project");
+            let external = temp.path().join("external");
+            std::fs::create_dir(&project_dir).unwrap();
+            std::fs::create_dir(&external).unwrap();
+            let project = project_dir.join("Project.m1prj");
+            std::fs::copy(mini_dir().join("Project.m1prj"), &project).unwrap();
+            let script = external.join("Demo.Update.m1scr");
+            let source = "Output = 1.0;";
+            std::fs::write(&script, source).unwrap();
+            if link_directory {
+                symlink(&external, project_dir.join("Scripts")).unwrap();
+            } else {
+                symlink(&script, project_dir.join("Demo.Update.m1scr")).unwrap();
+            }
+            let loaded = load(&project, None).expect("readable source links load");
+            assert_eq!(loaded.scripts.len(), 1);
+            assert_eq!(loaded.scripts[0].name, "Demo.Update.m1scr");
+            assert_eq!(loaded.scripts[0].cst.source(), source);
+        }
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn dangling_script_link_rejects_loading_with_its_path() {
+        let temp = tempfile::tempdir().unwrap();
+        let project = temp.path().join("Project.m1prj");
+        std::fs::copy(mini_dir().join("Project.m1prj"), &project).unwrap();
+        let script = temp.path().join("Demo.Update.m1scr");
+        std::os::unix::fs::symlink(temp.path().join("missing"), &script).unwrap();
+        let error = match load(&project, None) {
+            Ok(_) => panic!("unreadable script links must reject loading"),
+            Err(error) => error.to_string(),
+        };
+        assert!(error.contains("cannot inspect project path"), "{error}");
+        assert!(error.contains(script.to_str().unwrap()), "{error}");
     }
 
     #[test]

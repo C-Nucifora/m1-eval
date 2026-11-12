@@ -12,6 +12,15 @@ It is built primarily as a **Rust library** (consumed by `m1-visualiser`, and
 later `m1-lsp`), with a thin CLI on top. The same engine drives a per-channel and
 per-expression value `Trace` that the visualiser overlays on a dependency graph.
 
+Script selection follows the project's `Filename` attributes. An explicit
+relative path selects that source under the project directory, with either slash
+spelling. A bare filename must be unique among discovered scripts; duplicate matches
+fail with the candidate paths. Functions without `Filename` use the existing
+`Root.Group.Function` to `Group.Function.m1scr` convention. Unselected backup
+scripts do not replace declared sources or become additional executable bodies.
+All discovered scripts remain subject to read and syntax checks, including unused
+sources.
+
 ## Maturity contract
 
 These states describe evidence for compatibility with M1, not how much Rust test

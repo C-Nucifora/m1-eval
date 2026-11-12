@@ -179,6 +179,34 @@ fn csv_out_is_inferred_from_extension() {
     );
 }
 
+#[cfg(unix)]
+#[test]
+fn failed_script_read_is_eval_error_without_a_trace() {
+    let tmp = tempfile::tempdir().unwrap();
+    let project = tmp.path().join("Project.m1prj");
+    std::fs::copy(mini_dir().join("Project.m1prj"), &project).unwrap();
+    let script = tmp.path().join("Demo.Update.m1scr");
+    let _socket = std::os::unix::net::UnixListener::bind(&script).unwrap();
+    let scenario = write_scenario(tmp.path(), SCENARIO);
+    let trace = tmp.path().join("trace.json");
+    let result = Command::cargo_bin("m1-eval")
+        .unwrap()
+        .arg("--project")
+        .arg(&project)
+        .arg("--scenario")
+        .arg(&scenario)
+        .arg("--out")
+        .arg(&trace)
+        .assert()
+        .code(1);
+    let output = result.get_output();
+    let error = String::from_utf8_lossy(&output.stderr);
+    assert!(error.contains("cannot read script"), "{error}");
+    assert!(error.contains(script.to_str().unwrap()), "{error}");
+    assert!(output.stdout.is_empty());
+    assert!(!trace.exists());
+}
+
 #[test]
 fn coverage_prints_report() {
     let mini = mini_dir();
