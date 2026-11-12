@@ -384,14 +384,14 @@ checksum = "32a66949e030da00e8c7d4434b251670a91556f4144941d37452769c25d58a53"
 
 [[package]]
 name = "m1-can"
-version = "0.2.5"
-source = "git+https://github.com/nedlane/m1-can.git?tag=v0.2.5#b69d74ff7130367a5b3456209b8864a95b5cf23c"
+version = "0.2.6"
+source = "git+https://github.com/nedlane/m1-can.git?tag=v0.2.6#6c8a3c8f95f06bab6312239becc4b2bbde710584"
 dependencies = [
  "can-dbc",
  "clap",
- "m1-core 0.15.0",
+ "m1-core",
  "m1-typecheck",
- "m1-workspace 0.14.1",
+ "m1-workspace",
  "roxmltree",
  "schemars",
  "serde",
@@ -401,31 +401,22 @@ dependencies = [
 
 [[package]]
 name = "m1-core"
-version = "0.15.0"
-source = "git+https://github.com/C-Nucifora/m1-core.git?tag=v0.15.0#1fe6f9ad4d6a0479c5cfeb770270fab0f89e8f89"
-dependencies = [
- "tree-sitter",
- "tree-sitter-m1 0.8.0",
-]
-
-[[package]]
-name = "m1-core"
 version = "0.15.1"
 source = "git+https://github.com/C-Nucifora/m1-core.git?tag=v0.15.1#e581c96c4c220a2eca1c04b41befc009d8c4264f"
 dependencies = [
  "tree-sitter",
- "tree-sitter-m1 0.8.1",
+ "tree-sitter-m1",
 ]
 
 [[package]]
 name = "m1-eval"
-version = "0.6.1"
+version = "0.6.2"
 dependencies = [
  "assert_cmd",
  "clap",
  "insta",
  "m1-can",
- "m1-core 0.15.1",
+ "m1-core",
  "m1-typecheck",
  "motec-i2",
  "roxmltree",
@@ -438,26 +429,27 @@ dependencies = [
 ]
 
 [[package]]
-name = "m1-typecheck"
-version = "0.51.0"
-source = "git+https://github.com/C-Nucifora/m1-typecheck.git?tag=v0.51.0#e79bd0e4686cae078b1f96a728f2f94affc3ede4"
+name = "m1-project"
+version = "0.16.0"
+source = "git+https://github.com/nedlane/m1-project.git?tag=v0.16.0#ad3016ce14fda28b43f83997dc7cc3cbf5a9b1fb"
 dependencies = [
  "clap",
- "m1-core 0.15.0",
- "m1-workspace 0.13.0",
+ "m1-workspace",
  "roxmltree",
- "serde",
- "serde_json",
- "toml",
 ]
 
 [[package]]
-name = "m1-workspace"
-version = "0.13.0"
-source = "git+https://github.com/nedlane/m1-workspace.git?tag=v0.13.0#cf1b5b862d255cc4ecb89a7b708016bd9a9f33db"
+name = "m1-typecheck"
+version = "0.52.0"
+source = "git+https://github.com/C-Nucifora/m1-typecheck.git?tag=v0.52.0#d63f2cc39ad04586ae2ad2fcc8e244f24cb6f8d0"
 dependencies = [
+ "clap",
+ "m1-core",
+ "m1-project",
+ "m1-workspace",
+ "roxmltree",
  "serde",
- "serde_ignored",
+ "serde_json",
  "toml",
 ]
 
@@ -946,15 +938,6 @@ name = "tree-sitter-language"
 version = "0.1.7"
 source = "registry+https://github.com/rust-lang/crates.io-index"
 checksum = "009994f150cc0cd50ff54917d5bc8bffe8cad10ca10d81c34da2ec421ae61782"
-
-[[package]]
-name = "tree-sitter-m1"
-version = "0.8.0"
-source = "git+https://github.com/C-Nucifora/tree-sitter-m1.git?tag=v0.8.0#e9dbd45be91c0771105637924a2c5c87ae17c1fb"
-dependencies = [
- "cc",
- "tree-sitter-language",
-]
 
 [[package]]
 name = "tree-sitter-m1"
